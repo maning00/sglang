@@ -13,13 +13,23 @@ import triton
 import triton.testing
 from sgl_kernel import dsv3_router_gemm
 
+try:
+    from flashinfer.dsv3_ops import mm_M1_16_K7168_N256 as FI_MM  # type: ignore
+except Exception:
+    FI_MM = None
+
+_SM_MAJOR = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+SUPPORT_FI = (FI_MM is not None) and (_SM_MAJOR >= 10)
+
 # CI environment uses simplified parameters
 if IS_CI:
     num_tokens_vals = [1]  # Only test 1 value in CI
     line_vals = ["sgl-kernel-256"]  # Only test one implementation in CI
 else:
     num_tokens_vals = [i + 1 for i in range(16)]  # Test 1-16 in full mode
-    line_vals = ["torch-256", "sgl-kernel-256", "torch-384", "sgl-kernel-384"]
+    line_vals = ["torch-256", "sgl-kernel-256", "torch-384", "sgl-kernel-384"] + (
+        ["flashinfer-256"] if SUPPORT_FI else []
+    )
 
 
 @triton.testing.perf_report(
@@ -30,17 +40,21 @@ else:
         line_arg="impl",
         line_vals=line_vals,
         line_names=(
-            [
-                "torch-256",
-                "dsv3_router_gemm-256",
-                "torch-384",
-                "dsv3_router_gemm-384",
-            ]
+            (
+                [
+                    "torch-256",
+                    "dsv3_router_gemm-256",
+                    "torch-384",
+                    "dsv3_router_gemm-384",
+                ]
+                + (["flashinfer-256"] if SUPPORT_FI else [])
+            )
             if not IS_CI
             else ["dsv3_router_gemm-256"]
         ),
         styles=(
             [("blue", "-"), ("orange", "-"), ("green", "-"), ("red", "-")]
+            + ([("purple", "-")] if SUPPORT_FI else [])
             if not IS_CI
             else [("orange", "-")]
         ),
@@ -75,6 +89,18 @@ def benchmark_bf16_output(num_tokens, impl):
         def runner():
             dsv3_router_gemm(mat_a, mat_b, out_dtype=torch.bfloat16)
 
+    elif impl == "flashinfer-256":
+        if not SUPPORT_FI:
+            raise RuntimeError(
+                "flashinfer-256 impl requested but FlashInfer is not available or SM<100"
+            )
+        out_fp32 = torch.empty((M, N), dtype=torch.float32, device="cuda")
+
+        def runner():
+            # FlashInfer expects B as (K, N) column-major → use view mat_b.t()
+            FI_MM(mat_a, mat_b.t(), out_fp32, launch_with_pdl=False)  # type: ignore
+            _ = out_fp32.to(torch.bfloat16)
+
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(runner, quantiles=quantiles)
 
     def tflops(t_ms):
@@ -92,17 +118,21 @@ def benchmark_bf16_output(num_tokens, impl):
         line_arg="impl",
         line_vals=line_vals,
         line_names=(
-            [
-                "torch-256",
-                "dsv3_router_gemm-256",
-                "torch-384",
-                "dsv3_router_gemm-384",
-            ]
+            (
+                [
+                    "torch-256",
+                    "dsv3_router_gemm-256",
+                    "torch-384",
+                    "dsv3_router_gemm-384",
+                ]
+                + (["flashinfer-256"] if SUPPORT_FI else [])
+            )
             if not IS_CI
             else ["dsv3_router_gemm-256"]
         ),
         styles=(
             [("blue", "-"), ("orange", "-"), ("green", "-"), ("red", "-")]
+            + ([("purple", "-")] if SUPPORT_FI else [])
             if not IS_CI
             else [("orange", "-")]
         ),
@@ -136,6 +166,16 @@ def benchmark_float_output(num_tokens, impl):
 
         def runner():
             dsv3_router_gemm(mat_a, mat_b, out_dtype=torch.float32)
+
+    elif impl == "flashinfer-256":
+        if not SUPPORT_FI:
+            raise RuntimeError(
+                "flashinfer-256 impl requested but FlashInfer is not available or SM<100"
+            )
+        out_fp32 = torch.empty((M, N), dtype=torch.float32, device="cuda")
+
+        def runner():
+            FI_MM(mat_a, mat_b.t(), out_fp32, launch_with_pdl=False)  # type: ignore
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(runner, quantiles=quantiles)
 
