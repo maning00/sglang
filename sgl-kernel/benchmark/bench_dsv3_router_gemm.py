@@ -67,7 +67,7 @@ def benchmark_bf16_output(num_tokens, impl):
     # M: num_tokens, K: hidden_dim, N: num_experts
     M, K = num_tokens, 7168
 
-    if impl == "torch-256" or impl == "sgl-kernel-256":
+    if impl in ("torch-256", "sgl-kernel-256", "flashinfer-256"):
         N = 256
     elif impl == "torch-384" or impl == "sgl-kernel-384":
         N = 384
@@ -145,7 +145,7 @@ def benchmark_float_output(num_tokens, impl):
     # M: num_tokens, K: hidden_dim, N: num_experts
     M, K = num_tokens, 7168
 
-    if impl == "torch-256" or impl == "sgl-kernel-256":
+    if impl in ("torch-256", "sgl-kernel-256", "flashinfer-256"):
         N = 256
     elif impl == "torch-384" or impl == "sgl-kernel-384":
         N = 384
