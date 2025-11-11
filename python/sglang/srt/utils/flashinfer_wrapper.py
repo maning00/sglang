@@ -22,7 +22,7 @@ def has_flashinfer() -> bool:
     device_types="cuda",
 )
 def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
-    *,
+    output: torch.Tensor,
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -50,7 +50,6 @@ def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
     tile_tokens_dim: Optional[int],
     routing_method_type: int,
     do_finalize: bool,
-    output: torch.Tensor,
     tune_max_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     """Runtime implementation that calls FlashInfer TRTLLM MoE.
@@ -101,7 +100,7 @@ def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
 
 @torch.library.register_fake("sglang::trtllm_fp4_block_scale_moe")
 def trtllm_fp4_block_scale_moe_fake(  # type: ignore[no-redef]
-    *,
+    output: torch.Tensor,
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -129,7 +128,6 @@ def trtllm_fp4_block_scale_moe_fake(  # type: ignore[no-redef]
     tile_tokens_dim: Optional[int],
     routing_method_type: int,
     do_finalize: bool,
-    output: torch.Tensor,
     tune_max_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     # Use provided output tensor as the fake return; this preserves shape/dtype/device.
