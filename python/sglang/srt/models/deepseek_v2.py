@@ -20,6 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+from contextlib import nullcontext
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -2961,7 +2962,12 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            ctx = (
+                nullcontext()
+                if is_in_piecewise_cuda_graph()
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
