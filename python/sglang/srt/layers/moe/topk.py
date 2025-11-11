@@ -110,17 +110,29 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        return topk_output.format == TopKOutputFormat.STANDARD
+        fmt = topk_output.format
+        return getattr(fmt, "value", fmt) == TopKOutputFormat.STANDARD.value
 
     @staticmethod
     def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
-        return topk_output.format == TopKOutputFormat.TRITON_KERNEL
+        fmt = topk_output.format
+        return getattr(fmt, "value", fmt) == TopKOutputFormat.TRITON_KERNEL.value
 
     @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
-        return topk_output.format == TopKOutputFormat.BYPASSED
+        # Short-circuit during piecewise CUDA graph capture to avoid Dynamo enum tracing
+        try:
+            from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+                is_in_piecewise_cuda_graph,
+            )
+        except Exception:
+            is_in_piecewise_cuda_graph = lambda: False  # noqa: E731
+        if is_in_piecewise_cuda_graph():
+            return True
+        fmt = topk_output.format
+        return getattr(fmt, "value", fmt) == TopKOutputFormat.BYPASSED.value
 
 
 class TopKOutputFormat(Enum):
