@@ -43,6 +43,9 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -1019,20 +1022,25 @@ class FlashInferFP4MoE(FusedMoE):
         Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, global_scale_float32)
         """
 
-        # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
-        # Only the block scales are computed at runtime
-        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
-            hidden_states,
-            self.w13_input_scale_quant,
-            16,  # sf_vec_size
-            False,  # use_ue8m0
-            False,  # is_sf_swizzled_layout
-        )
+        # During piecewise CUDA graph capture, avoid FlashInfer JIT build by using sgl-kernel FP4 quant
+        if is_in_piecewise_cuda_graph():
+            from sgl_kernel.gemm import scaled_fp4_quant
 
-        hs_fp4 = hs_fp4_bytes.reshape(
-            hidden_states.shape[0], hidden_states.shape[1] // 2
-        )
-        hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
+            hs_fp4, hs_sf = scaled_fp4_quant(hidden_states, self.w13_input_scale_quant)
+        else:
+            # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
+            # Only the block scales are computed at runtime
+            hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+                hidden_states,
+                self.w13_input_scale_quant,
+                16,  # sf_vec_size
+                False,  # use_ue8m0
+                False,  # is_sf_swizzled_layout
+            )
+            hs_fp4 = hs_fp4_bytes.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 2
+            )
+            hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
 
         return hs_fp4, hs_sf
 
