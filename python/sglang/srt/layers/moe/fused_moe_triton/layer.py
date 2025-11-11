@@ -1079,8 +1079,7 @@ class FlashInferFP4MoE(FusedMoE):
             torch.ops.sglang, "trtllm_fp4_block_scale_moe"
         )
         if use_custom_op:
-            result = torch.ops.sglang.trtllm_fp4_block_scale_moe(
-                symm_output,
+            result_tmp = torch.ops.sglang.trtllm_fp4_block_scale_moe(
                 router_logits,
                 topk_config.correction_bias.to(hidden_states.dtype),
                 hs_fp4,
@@ -1114,6 +1113,8 @@ class FlashInferFP4MoE(FusedMoE):
                 True,
                 int(num_tokens),
             )
+            symm_output.copy_(result_tmp)
+            result = symm_output
         else:
             from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 

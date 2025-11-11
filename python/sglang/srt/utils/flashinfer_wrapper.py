@@ -18,11 +18,9 @@ def has_flashinfer() -> bool:
 
 @torch.library.custom_op(
     "sglang::trtllm_fp4_block_scale_moe",
-    mutates_args=["output"],
     device_types="cuda",
 )
 def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
-    output: torch.Tensor,
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -91,7 +89,6 @@ def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
         tile_tokens_dim=tile_tokens_dim,
         routing_method_type=routing_method_type,
         do_finalize=do_finalize,
-        output=output,
         tune_max_num_tokens=tune_max_num_tokens,
     )
     # FlashInfer returns (output, maybe_workspace, ...)
@@ -100,7 +97,6 @@ def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
 
 @torch.library.register_fake("sglang::trtllm_fp4_block_scale_moe")
 def trtllm_fp4_block_scale_moe_fake(  # type: ignore[no-redef]
-    output: torch.Tensor,
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -130,5 +126,13 @@ def trtllm_fp4_block_scale_moe_fake(  # type: ignore[no-redef]
     do_finalize: bool,
     tune_max_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
-    # Use provided output tensor as the fake return; this preserves shape/dtype/device.
-    return output
+    # Infer output shape: (num_tokens, hidden_size)
+    num_tokens = hidden_states.shape[0]
+    hidden_size = (
+        hidden_states.shape[-1] * 2
+        if hidden_states.dtype == torch.uint8
+        else hidden_states.shape[-1]
+    )
+    return torch.empty(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device=hidden_states.device
+    )
