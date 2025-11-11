@@ -1067,39 +1067,88 @@ class FlashInferFP4MoE(FusedMoE):
             symm_output = torch.empty(
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
             )
-        result = torch.ops.sglang.trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits,
-            routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
-            hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
-            gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
-            gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
-                torch.float8_e4m3fn
-            ),
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
-            gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
-                torch.float8_e4m3fn
-            ),
-            gemm2_bias=None,
-            output1_scale_scalar=self.g1_scale_c.data,
-            output1_scale_gate_scalar=self.g1_alphas.data,
-            output2_scale_scalar=self.g2_alphas.data,
-            num_experts=self.num_experts,
-            top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.moe_ep_rank * self.num_local_experts,
-            local_num_experts=self.num_local_experts,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-            tile_tokens_dim=None,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
-            do_finalize=True,
-            output=symm_output,
+        # Ensure the custom op is registered; fall back to flashinfer direct call if missing
+        if not hasattr(torch.ops, "sglang") or not hasattr(
+            torch.ops.sglang, "trtllm_fp4_block_scale_moe"
+        ):
+            try:
+                import sglang.srt.utils.flashinfer_wrapper  # noqa: F401
+            except Exception:
+                pass
+        use_custom_op = hasattr(torch.ops, "sglang") and hasattr(
+            torch.ops.sglang, "trtllm_fp4_block_scale_moe"
         )
+        if use_custom_op:
+            result = torch.ops.sglang.trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
+                hidden_states=hs_fp4,
+                hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+                gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
+                gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
+                gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm2_bias=None,
+                output1_scale_scalar=self.g1_scale_c.data,
+                output1_scale_gate_scalar=self.g1_alphas.data,
+                output2_scale_scalar=self.g2_alphas.data,
+                num_experts=self.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.moe_ep_rank * self.num_local_experts,
+                local_num_experts=self.num_local_experts,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+                tile_tokens_dim=None,
+                routing_method_type=RoutingMethodType.DeepSeekV3,
+                do_finalize=True,
+                output=symm_output,
+            )
+        else:
+            from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+
+            result = trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
+                hidden_states=hs_fp4,
+                hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+                gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
+                gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
+                gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm2_bias=None,
+                output1_scale_scalar=self.g1_scale_c.data,
+                output1_scale_gate_scalar=self.g1_alphas.data,
+                output2_scale_scalar=self.g2_alphas.data,
+                num_experts=self.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.moe_ep_rank * self.num_local_experts,
+                local_num_experts=self.num_local_experts,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+                tile_tokens_dim=None,
+                routing_method_type=RoutingMethodType.DeepSeekV3,
+                do_finalize=True,
+                output=symm_output,
+            )[0]
 
         return result
