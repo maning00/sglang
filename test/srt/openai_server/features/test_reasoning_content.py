@@ -118,7 +118,9 @@ class TestReasoningContentAPI(CustomTestCase):
                         reasoning_tokens = (
                             chunk.usage.completion_tokens_details.reasoning_tokens
                         )
-                        assert reasoning_tokens is None or reasoning_tokens >= 0
+                        assert (
+                            reasoning_tokens is not None and reasoning_tokens > 0
+                        ), f"Expected reasoning_tokens > 0, got {reasoning_tokens}"
 
         assert len(reasoning_content) > 0
         assert len(content) > 0
@@ -213,7 +215,9 @@ class TestReasoningContentAPI(CustomTestCase):
                 reasoning_tokens = (
                     response.usage.completion_tokens_details.reasoning_tokens
                 )
-                assert reasoning_tokens is None or reasoning_tokens >= 0
+                assert (
+                    reasoning_tokens is not None and reasoning_tokens > 0
+                ), f"Expected reasoning_tokens > 0, got {reasoning_tokens}"
 
     def test_reasoning_tokens_in_usage(self):
         # Test that reasoning_tokens field exists in usage for reasoning models
@@ -241,14 +245,18 @@ class TestReasoningContentAPI(CustomTestCase):
             response.usage, "completion_tokens_details"
         ), "completion_tokens_details should exist"
 
-        if response.usage.completion_tokens_details:
-            assert hasattr(
-                response.usage.completion_tokens_details, "reasoning_tokens"
-            ), "reasoning_tokens field should exist in completion_tokens_details"
+        assert (
+            response.usage.completion_tokens_details is not None
+        ), "completion_tokens_details should not be None"
 
-            reasoning_tokens = response.usage.completion_tokens_details.reasoning_tokens
-            if reasoning_tokens is not None:
-                assert reasoning_tokens >= 0, "reasoning_tokens should be >= 0"
+        assert hasattr(
+            response.usage.completion_tokens_details, "reasoning_tokens"
+        ), "reasoning_tokens field should exist in completion_tokens_details"
+
+        reasoning_tokens = response.usage.completion_tokens_details.reasoning_tokens
+        assert (
+            reasoning_tokens is not None and reasoning_tokens > 0
+        ), f"Expected reasoning_tokens > 0 with reasoning parser enabled, got {reasoning_tokens}"
 
 
 class TestReasoningContentWithoutParser(CustomTestCase):

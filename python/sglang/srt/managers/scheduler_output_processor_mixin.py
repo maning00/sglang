@@ -836,8 +836,8 @@ class SchedulerOutputProcessorMixin:
                         think_end_pos = output_ids_.index(self.tokenizer.think_end_id)
                         reasoning_count = think_end_pos
                     except ValueError:
-                        # think_end_id not found, no reasoning tokens yet
-                        reasoning_count = len(output_ids_)
+                        # think_end_id not found - reasoning may be disabled or not yet emitted
+                        reasoning_count = 0
                 reasoning_tokens.append(reasoning_count)
 
                 retraction_counts.append(req.retraction_count)
