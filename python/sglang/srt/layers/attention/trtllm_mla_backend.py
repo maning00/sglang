@@ -29,6 +29,10 @@ from sglang.srt.utils.common import cached_triton_kernel
 if is_flashinfer_available():
     import flashinfer
 
+from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+    is_in_piecewise_cuda_graph,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1040,7 +1044,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
-        if forward_batch.attn_attend_prefix_cache:
+        if forward_batch.attn_attend_prefix_cache and not is_in_piecewise_cuda_graph():
             # MHA for chunked prefix kv cache when running model with MLA
             assert forward_batch.prefix_chunk_idx is not None
             assert forward_batch.prefix_chunk_cu_seq_lens is not None
