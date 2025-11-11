@@ -19,7 +19,7 @@ import math
 import time
 from abc import ABC
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
@@ -66,21 +66,17 @@ class ExpertDistributionRecorder(ABC):
         else:
             return _ExpertDistributionRecorderNoop()
 
-    @contextmanager
     def with_current_layer(self, layer_idx):
-        yield
+        return nullcontext()
 
-    @contextmanager
     def with_debug_name(self, debug_name):
-        yield
+        return nullcontext()
 
-    @contextmanager
     def disable_this_region(self):
-        yield
+        return nullcontext()
 
-    @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
-        yield
+        return nullcontext()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
