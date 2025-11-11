@@ -19,6 +19,7 @@ def has_flashinfer() -> bool:
 @torch.library.custom_op(
     "sglang::trtllm_fp4_block_scale_moe",
     device_types="cuda",
+    mutates_args=[],
 )
 def trtllm_fp4_block_scale_moe(  # type: ignore[no-redef]
     routing_logits: torch.Tensor,
