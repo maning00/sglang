@@ -59,6 +59,9 @@ pub struct MinimaxM2Parser {
     /// Whether we're waiting for </minimax:tool_call> after </invoke>
     waiting_for_tool_call_end: bool,
 
+    /// Whether we're inside thinking tags
+    in_thinking: bool,
+
     /// Token configuration
     tool_call_start_token: &'static str,
     tool_call_end_token: &'static str,
@@ -92,6 +95,7 @@ impl MinimaxM2Parser {
             in_tool_call: false,
             function_name_sent: false,
             waiting_for_tool_call_end: false,
+            in_thinking: false,
             tool_call_start_token: "<minimax:tool_call>",
             tool_call_end_token: "</minimax:tool_call>",
             invoke_start_prefix: r#"<invoke name=""#,
@@ -173,11 +177,30 @@ impl MinimaxM2Parser {
         }
     }
 
+    /// Check if a position is inside thinking tags
+    fn is_in_thinking_tags(&self, text: &str, position: usize) -> bool {
+        // Find all thinking tag pairs
+        let think_pattern = Regex::new(r"(?s)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
+
+        for mat in think_pattern.find_iter(text) {
+            if position >= mat.start() && position < mat.end() {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Parse all tool calls from text (shared logic for complete and incremental parsing)
     fn parse_tool_calls_from_text(&self, text: &str) -> ParserResult<Vec<ToolCall>> {
         let mut tools = Vec::new();
 
         for mat in self.tool_call_extractor.find_iter(text) {
+            // Skip tool calls inside thinking tags
+            if self.is_in_thinking_tags(text, mat.start()) {
+                continue;
+            }
+
             match self.parse_tool_call(mat.as_str()) {
                 Ok(Some(tool)) => tools.push(tool),
                 Ok(None) => continue,
@@ -328,17 +351,39 @@ impl ToolParser for MinimaxM2Parser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Find where tool calls begin
-        let idx = text.find(self.tool_call_start_token).unwrap();
-        let normal_text = text[..idx].to_string();
-
-        // Parse all tool calls using shared helper
+        // Parse all tool calls using shared helper (filters out ones in thinking tags)
         let tools = self.parse_tool_calls_from_text(text)?;
 
-        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        // If no tools were successfully parsed, return entire text as fallback
         if tools.is_empty() {
             return Ok((text.to_string(), vec![]));
         }
+
+        // Find the position of the first successfully extracted tool call
+        // We need to match the extracted tools with their positions in text
+        let mut first_valid_tool_pos = None;
+        for mat in self.tool_call_extractor.find_iter(text) {
+            // Skip tool calls inside thinking tags
+            if self.is_in_thinking_tags(text, mat.start()) {
+                continue;
+            }
+
+            // Check if this tool call was successfully extracted
+            // by trying to parse it
+            if let Ok(Some(_)) = self.parse_tool_call(mat.as_str()) {
+                first_valid_tool_pos = Some(mat.start());
+                break;
+            }
+        }
+
+        // Determine what text to return as normal_text
+        let normal_text = if let Some(pos) = first_valid_tool_pos {
+            // Return text up to the first valid tool call
+            text[..pos].to_string()
+        } else {
+            // No valid tool calls found, return entire text
+            text.to_string()
+        };
 
         Ok((normal_text, tools))
     }
@@ -356,6 +401,65 @@ impl ToolParser for MinimaxM2Parser {
         let tool_indices = helpers::get_tool_indices(tools);
 
         loop {
+            // Check for thinking tags first
+            // Handle <think> or <thinking> start
+            if !self.in_thinking {
+                if let Some(think_start) = self.buffer.find("<think") {
+                    // Check if it's <think> or <thinking>
+                    let remaining = &self.buffer[think_start..];
+                    let is_thinking = remaining.starts_with("<thinking>");
+                    let is_think = remaining.starts_with("<think>");
+
+                    if is_think || is_thinking {
+                        // Include everything up to and including the thinking tag
+                        let tag = if is_thinking { "<thinking>" } else { "<think>" };
+                        normal_text.push_str(&self.buffer[..think_start + tag.len()]);
+                        self.buffer = self.buffer[think_start + tag.len()..].to_string();
+                        self.in_thinking = true;
+                        continue;
+                    }
+                }
+            }
+
+            // Handle </think> or </thinking> end
+            if self.in_thinking {
+                // Look for closing thinking tags
+                if let Some(end_pos) = self.buffer.find("</think") {
+                    // Check if it's </think> or </thinking>
+                    let remaining = &self.buffer[end_pos..];
+                    let end_tag = if remaining.starts_with("</thinking>") {
+                        "</thinking>"
+                    } else if remaining.starts_with("</think>") {
+                        "</think>"
+                    } else {
+                        // Partial closing tag, wait for more but return what we have so far
+                        normal_text.push_str(&self.buffer[..end_pos]);
+                        self.buffer = self.buffer[end_pos..].to_string();
+                        break;
+                    };
+
+                    // Include everything up to and including the closing tag
+                    let end_idx = end_pos + end_tag.len();
+                    normal_text.push_str(&self.buffer[..end_idx]);
+
+                    // Update buffer with remaining text after closing tag
+                    self.buffer = self.buffer[end_idx..].to_string();
+                    self.in_thinking = false;
+
+                    // Process any remaining content immediately as normal text
+                    if !self.buffer.is_empty() {
+                        // Since we're out of thinking mode, any remaining text is normal
+                        normal_text.push_str(&self.buffer);
+                        self.buffer.clear();
+                    }
+                    break;
+                } else {
+                    // Still inside thinking, pass everything as normal text
+                    normal_text.push_str(&self.buffer);
+                    self.buffer.clear();
+                    break;
+                }
+            }
             // If we're waiting for the tool call end tag, check for it first
             if self.waiting_for_tool_call_end {
                 if let Some(end_pos) = self.buffer.find(self.tool_call_end_token) {
@@ -553,5 +657,6 @@ impl ToolParser for MinimaxM2Parser {
         self.in_tool_call = false;
         self.function_name_sent = false;
         self.waiting_for_tool_call_end = false;
+        self.in_thinking = false;
     }
 }

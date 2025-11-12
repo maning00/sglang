@@ -709,3 +709,191 @@ async fn test_minimax_whitespace_handling() {
     assert!(args["newlines"].as_str().unwrap().contains("Line 2"));
     assert_eq!(args["tabs"], "\ttab\tseparated\t");
 }
+
+#[tokio::test]
+async fn test_minimax_thinking_tags_ignored() {
+    // Test that tool calls inside thinking tags are completely ignored
+    let parser = MinimaxM2Parser::new();
+
+    // Test with <think> tags
+    let input = r#"Let me think about this.
+<think>
+I need to check the weather
+<minimax:tool_call>
+<invoke name="get_weather">
+<parameter name="city">Paris</parameter>
+</invoke>
+</minimax:tool_call>
+Actually, let me reconsider
+</think>
+I'll just provide you with general information instead."#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+    // Tool calls inside thinking tags should be ignored
+    assert_eq!(
+        tools.len(),
+        0,
+        "Tool calls inside <think> tags should be ignored"
+    );
+
+    // All content including thinking tags should be treated as normal text
+    assert!(normal_text.contains("Let me think about this."));
+    assert!(normal_text.contains("<think>"));
+    assert!(normal_text.contains("I need to check the weather"));
+    assert!(normal_text.contains("<minimax:tool_call>"));
+    assert!(normal_text.contains("I'll just provide you with general information instead."));
+}
+
+#[tokio::test]
+async fn test_minimax_thinking_tags_with_valid_tools() {
+    // Test mixing thinking tags with valid tool calls outside
+    let parser = MinimaxM2Parser::new();
+
+    let input = r#"<thinking>
+I should check the weather in London first
+<minimax:tool_call>
+<invoke name="get_weather">
+<parameter name="city">London</parameter>
+</invoke>
+</minimax:tool_call>
+</thinking>
+Actually, let me check Paris instead.
+<minimax:tool_call>
+<invoke name="get_weather">
+<parameter name="city">Paris</parameter>
+</invoke>
+</minimax:tool_call>
+The weather in Paris is..."#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+    // Only tool call outside thinking tags should be extracted
+    assert_eq!(
+        tools.len(),
+        1,
+        "Only tool calls outside thinking tags should be extracted"
+    );
+    assert_eq!(tools[0].function.name, "get_weather");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["city"], "Paris");
+
+    // Content before the valid tool call (including thinking section) should be in normal text
+    assert!(normal_text.contains("<thinking>"));
+    assert!(normal_text.contains("London"));
+    assert!(normal_text.contains("</thinking>"));
+    assert!(normal_text.contains("Actually, let me check Paris instead."));
+}
+
+#[tokio::test]
+async fn test_minimax_no_tools() {
+    // Test input with no tool calls at all
+    let parser = MinimaxM2Parser::new();
+
+    let input = r#"This is just a normal response without any tool calls.
+I can provide information directly without using any tools.
+Even if I mention function names like get_weather or search,
+they are not actual tool calls unless properly formatted."#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+    // No tools should be extracted
+    assert_eq!(
+        tools.len(),
+        0,
+        "Should not extract any tools from plain text"
+    );
+
+    // All content should be returned as normal text
+    assert_eq!(
+        normal_text, input,
+        "All content should be returned as normal text when no tools present"
+    );
+}
+
+#[tokio::test]
+async fn test_minimax_invalid_json_in_parameters() {
+    // Test handling of invalid JSON in parameter values
+    let parser = MinimaxM2Parser::new();
+
+    let input = r#"<minimax:tool_call>
+<invoke name="process">
+<parameter name="valid">{"key": "value"}</parameter>
+<parameter name="invalid">{invalid json: no quotes}</parameter>
+<parameter name="broken">[1, 2, unclosed</parameter>
+<parameter name="mixed">Some text {"partial": json} more text</parameter>
+</invoke>
+</minimax:tool_call>"#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+    // Tool should still be extracted despite invalid JSON in parameters
+    assert_eq!(
+        tools.len(),
+        1,
+        "Should extract tool even with invalid JSON in parameters"
+    );
+    assert_eq!(tools[0].function.name, "process");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+
+    // Parameters are stored as strings, not parsed as JSON
+    // Even invalid JSON should be preserved as string values
+    assert!(args["valid"].is_string());
+    assert_eq!(args["valid"], r#"{"key": "value"}"#);
+
+    assert!(args["invalid"].is_string());
+    assert_eq!(args["invalid"], "{invalid json: no quotes}");
+
+    assert!(args["broken"].is_string());
+    assert_eq!(args["broken"], "[1, 2, unclosed");
+
+    assert!(args["mixed"].is_string());
+    assert_eq!(args["mixed"], r#"Some text {"partial": json} more text"#);
+
+    assert_eq!(normal_text, "");
+}
+
+#[tokio::test]
+async fn test_minimax_streaming_thinking_tags() {
+    // Test thinking tags handling during streaming
+    let mut parser = MinimaxM2Parser::new();
+    let tools = create_test_tools();
+
+    let chunks = vec![
+        "<think>Let me ",
+        "check the weather <minimax:",
+        "tool_call><invoke name=\"get_weather\">",
+        "<parameter name=\"city\">",
+        "Tokyo</parameter></invoke>",
+        "</minimax:tool_call>",
+        "</think> Actually, no tools needed.",
+    ];
+
+    let mut all_text = String::new();
+    let mut found_tool = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        all_text.push_str(&result.normal_text);
+
+        // Check if any tool calls were incorrectly extracted
+        for call in result.calls {
+            if call.name.is_some() || !call.parameters.is_empty() {
+                found_tool = true;
+            }
+        }
+    }
+
+    // No tool should be extracted from within thinking tags
+    assert!(
+        !found_tool,
+        "Should not extract tools from within thinking tags during streaming"
+    );
+
+    // All content should be treated as normal text
+    assert!(all_text.contains("<think>"));
+    assert!(all_text.contains("Tokyo"));
+    assert!(all_text.contains("</think>"));
+}
