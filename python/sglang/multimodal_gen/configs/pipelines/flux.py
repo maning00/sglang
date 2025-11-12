@@ -82,7 +82,7 @@ class FluxPipelineConfig(PipelineConfig):
         shape = (batch_size, num_channels_latents, height, width)
         return shape
 
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         height = 2 * (
             batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
         )

@@ -102,15 +102,15 @@ class QwenImagePipelineConfig(PipelineConfig):
         return self.vae_config.arch_config.vae_scale_factor
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
-        height = 2 * (
-            batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
-        )
-        width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        height = 2 * (batch.height // (vae_scale_factor * 2))
+
+        width = 2 * (batch.width // (vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
-        shape = (batch_size, num_channels_latents, height, width)
+        shape = (batch_size, 1, num_channels_latents, height, width)
         return shape
 
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         height = 2 * (
             batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
         )
@@ -121,7 +121,34 @@ class QwenImagePipelineConfig(PipelineConfig):
 
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
-        img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
+        img_freqs_full, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
+
+        # If using SP and rows divide evenly, shard RoPE by rows to match latent sharding
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_sp_parallel_rank,
+            get_sp_world_size,
+        )
+
+        sp_world_size = get_sp_world_size()
+        if sp_world_size > 1:
+            # Expect a single image shape list: [(frame=1, H2, W2)]
+            if isinstance(img_shapes, list) and len(img_shapes) > 0:
+                first = img_shapes[0]
+                if isinstance(first, list):
+                    first = first[0]
+            else:
+                first = img_shapes
+            _, h2, w2 = first
+            if h2 > 0 and (h2 % sp_world_size == 0):
+                rank = get_sp_parallel_rank()
+                local_rows = h2 // sp_world_size
+                start_token = rank * local_rows * w2
+                end_token = (rank + 1) * local_rows * w2
+                img_freqs = img_freqs_full[start_token:end_token]
+            else:
+                img_freqs = img_freqs_full
+        else:
+            img_freqs = img_freqs_full
 
         img_cos, img_sin = (
             img_freqs.real.to(dtype=dtype),
@@ -255,15 +282,6 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
                 img_shapes, txt_seq_lens, rotary_emb, device, dtype
             ),
         }
-
-    def prepare_latent_shape(self, batch, batch_size, num_frames):
-        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
-        height = 2 * (batch.height // (vae_scale_factor * 2))
-
-        width = 2 * (batch.width // (vae_scale_factor * 2))
-        num_channels_latents = self.dit_config.arch_config.in_channels // 4
-        shape = (batch_size, 1, num_channels_latents, height, width)
-        return shape
 
     def preprocess_image(self, image, image_processor):
         image_size = image[0].size if isinstance(image, list) else image.size

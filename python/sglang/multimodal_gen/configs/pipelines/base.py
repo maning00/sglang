@@ -160,7 +160,7 @@ class PipelineConfig:
         return shape
 
     # called after latents are prepared
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         return latents
 
     def get_pos_prompt_embeds(self, batch):
