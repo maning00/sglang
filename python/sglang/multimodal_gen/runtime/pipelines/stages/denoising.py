@@ -528,8 +528,12 @@ class DenoisingStage(PipelineStage):
             batch.did_sp_shard_latents = False
             return
 
+        # Store original shape for un-padding later
+        if batch.latents is not None:
+            batch.original_latent_shape = batch.latents.shape
+
         def _shard_tensor(
-            tensor: torch.Tensor | None,
+            tensor: torch.Tensor | None, pad: bool = False
         ) -> tuple[torch.Tensor | None, bool]:
             if tensor is None:
                 return None, False
@@ -545,6 +549,12 @@ class DenoisingStage(PipelineStage):
             elif tensor.dim() == 4:
                 # For image models, shard along the height dimension.
                 height = tensor.shape[2]
+                if pad and height % sp_world_size != 0:
+                    pad_h = (sp_world_size - height % sp_world_size) % sp_world_size
+                    # Pad H on the bottom. Pad format is (left, right, top, bottom).
+                    tensor = torch.nn.functional.pad(tensor, (0, 0, 0, pad_h))
+
+                height = tensor.shape[2]
                 if height > 0 and height % sp_world_size == 0:
                     sharded_tensor = rearrange(
                         tensor, "b c (n h) w -> b c n h w", n=sp_world_size
@@ -555,7 +565,7 @@ class DenoisingStage(PipelineStage):
             # For unsharded tensors, return as is.
             return tensor, False
 
-        batch.latents, did_shard = _shard_tensor(batch.latents)
+        batch.latents, did_shard = _shard_tensor(batch.latents, pad=True)
         batch.did_sp_shard_latents = did_shard
 
         # image_latent is sharded independently, but the decision to all-gather later
@@ -571,13 +581,40 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
         if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            latents = sequence_model_parallel_all_gather(latents, dim=2)
+            # All-gather latents
+            gather_dim = (
+                2 if latents.dim() == 5 else 2
+            )  # Time for video, Height for image
+            latents = sequence_model_parallel_all_gather(latents, dim=gather_dim)
             if trajectory_tensor is not None:
-                # trajectory_tensor shape: [b, num_steps, c, t_local, h, w] -> gather on dim 3
+                # trajectory_tensor shape: [b, num_steps, c, t_local, h, w] -> gather on dim 3 (t)
+                # or [b, num_steps, c, h_local, w] -> gather on dim 3 (h)
+                gather_dim_traj = (
+                    3 if trajectory_tensor.dim() == 6 else 3
+                )  # T for video, H for image
                 trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
                 trajectory_tensor = sequence_model_parallel_all_gather(
-                    trajectory_tensor, dim=3
+                    trajectory_tensor, dim=gather_dim_traj
                 )
+
+            # Un-pad if necessary
+            if hasattr(batch, "original_latent_shape"):
+                orig_shape = batch.original_latent_shape
+                if latents.shape != orig_shape:
+                    if latents.dim() == 4:  # Image
+                        orig_h = orig_shape[2]
+                        latents = latents[:, :, :orig_h, :]
+                    # No un-padding needed for video time dimension currently
+
+                if trajectory_tensor is not None and trajectory_tensor.shape != (
+                    trajectory_tensor.shape[0],
+                    trajectory_tensor.shape[1],
+                    *orig_shape[1:],
+                ):
+                    if trajectory_tensor.dim() == 5:  # Image
+                        orig_h = orig_shape[2]
+                        trajectory_tensor = trajectory_tensor[:, :, :, :orig_h, :]
+
         return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
