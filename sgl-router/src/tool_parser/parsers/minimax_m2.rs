@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Write as FmtWrite, sync::LazyLock};
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -13,6 +13,10 @@ use crate::{
         types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
+
+// Static regex compilation - compiled once on first use
+static THINKING_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<think(?:ing)?>.*?</think(?:ing)?>").expect("Valid regex"));
 
 /// MiniMax M2 format parser for tool calls
 ///
@@ -70,6 +74,32 @@ pub struct MinimaxM2Parser {
 }
 
 impl MinimaxM2Parser {
+    /// Parse a value from string with consistent logic
+    #[inline]
+    fn parse_value(text: &str) -> Value {
+        // Try parsing as common literals first
+        match text {
+            "true" | "True" => return Value::Bool(true),
+            "false" | "False" => return Value::Bool(false),
+            "null" | "None" => return Value::Null,
+            _ => {}
+        }
+
+        // Try parsing as number
+        if let Ok(num) = text.parse::<i64>() {
+            return Value::Number(num.into());
+        }
+
+        if let Ok(num) = text.parse::<f64>() {
+            if let Some(n) = serde_json::Number::from_f64(num) {
+                return Value::Number(n);
+            }
+        }
+
+        // Default to string
+        Value::String(text.to_string())
+    }
+
     /// Create a new MiniMax M2 parser
     pub fn new() -> Self {
         // Use (?s) flag for DOTALL mode to handle newlines
@@ -86,7 +116,7 @@ impl MinimaxM2Parser {
             tool_call_extractor,
             invoke_extractor,
             param_extractor,
-            buffer: String::new(),
+            buffer: String::with_capacity(1024), // Pre-allocate reasonable capacity
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
             streamed_args_for_tool: Vec::new(),
@@ -111,30 +141,12 @@ impl MinimaxM2Parser {
             let key = capture.get(1).map_or("", |m| m.as_str()).trim();
             let value_str = capture.get(2).map_or("", |m| m.as_str());
 
-            // Decode XML entities
+            // Decode XML entities and parse value
             let decoded_value = self.decode_xml_entities(value_str);
 
-            // Parse as Python literal (similar to Python's ast.literal_eval)
             // Note: We keep JSON-like strings as strings (not parsed JSON)
             // This matches the behavior of other parsers like GLM4 MOE
-            let value = if decoded_value == "true" || decoded_value == "True" {
-                Value::Bool(true)
-            } else if decoded_value == "false" || decoded_value == "False" {
-                Value::Bool(false)
-            } else if decoded_value == "null" || decoded_value == "None" {
-                Value::Null
-            } else if let Ok(num) = decoded_value.parse::<i64>() {
-                Value::Number(num.into())
-            } else if let Ok(num) = decoded_value.parse::<f64>() {
-                if let Some(n) = serde_json::Number::from_f64(num) {
-                    Value::Number(n)
-                } else {
-                    Value::String(decoded_value.to_string())
-                }
-            } else {
-                // Keep everything else as a string, including JSON-like content
-                Value::String(decoded_value.to_string())
-            };
+            let value = Self::parse_value(&decoded_value);
 
             parameters.insert(key.to_string(), value);
         }
@@ -142,13 +154,53 @@ impl MinimaxM2Parser {
         Ok(parameters)
     }
 
-    /// Decode XML entities
+    /// Decode XML entities with minimal allocations
     fn decode_xml_entities(&self, text: &str) -> String {
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
+        // Fast path: if no entities present, return as-is
+        if !text.contains('&') {
+            return text.to_string();
+        }
+
+        // Work with string slices for efficient processing
+        let mut result = String::with_capacity(text.len());
+        let mut remaining = text;
+
+        while !remaining.is_empty() {
+            if let Some(amp_pos) = remaining.find('&') {
+                // Add everything before the '&'
+                result.push_str(&remaining[..amp_pos]);
+
+                // Check what follows the '&'
+                let after_amp = &remaining[amp_pos + 1..];
+
+                if after_amp.starts_with("lt;") {
+                    result.push('<');
+                    remaining = &remaining[amp_pos + 4..];
+                } else if after_amp.starts_with("gt;") {
+                    result.push('>');
+                    remaining = &remaining[amp_pos + 4..];
+                } else if after_amp.starts_with("amp;") {
+                    result.push('&');
+                    remaining = &remaining[amp_pos + 5..];
+                } else if after_amp.starts_with("quot;") {
+                    result.push('"');
+                    remaining = &remaining[amp_pos + 6..];
+                } else if after_amp.starts_with("apos;") {
+                    result.push('\'');
+                    remaining = &remaining[amp_pos + 6..];
+                } else {
+                    // Not a recognized entity, keep the '&'
+                    result.push('&');
+                    remaining = &remaining[amp_pos + 1..];
+                }
+            } else {
+                // No more '&' characters, add the rest
+                result.push_str(remaining);
+                break;
+            }
+        }
+
+        result
     }
 
     /// Parse a single tool call block
@@ -178,16 +230,14 @@ impl MinimaxM2Parser {
     }
 
     /// Check if a position is inside thinking tags
+    #[inline]
     fn is_in_thinking_tags(&self, text: &str, position: usize) -> bool {
-        // Find all thinking tag pairs
-        let think_pattern = Regex::new(r"(?s)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
-
-        for mat in think_pattern.find_iter(text) {
+        // Use static regex to avoid recompilation
+        for mat in THINKING_REGEX.find_iter(text) {
             if position >= mat.start() && position < mat.end() {
                 return true;
             }
         }
-
         false
     }
 
@@ -227,25 +277,15 @@ impl MinimaxM2Parser {
                 let value_str = cap.get(2).map_or("", |m| m.as_str());
                 let decoded = self.decode_xml_entities(value_str);
 
-                // Parse value
-                let value = if let Ok(json_val) = serde_json::from_str::<Value>(&decoded) {
-                    json_val
-                } else if decoded == "true" || decoded == "True" {
-                    Value::Bool(true)
-                } else if decoded == "false" || decoded == "False" {
-                    Value::Bool(false)
-                } else if decoded == "null" || decoded == "None" {
-                    Value::Null
-                } else if let Ok(num) = decoded.parse::<i64>() {
-                    Value::Number(num.into())
-                } else if let Ok(num) = decoded.parse::<f64>() {
-                    if let Some(n) = serde_json::Number::from_f64(num) {
-                        Value::Number(n)
+                // Try parsing as JSON first (for nested objects/arrays)
+                let value = if decoded.starts_with('{') || decoded.starts_with('[') {
+                    if let Ok(json_val) = serde_json::from_str::<Value>(&decoded) {
+                        json_val
                     } else {
-                        Value::String(decoded.to_string())
+                        Self::parse_value(&decoded)
                     }
                 } else {
-                    Value::String(decoded.to_string())
+                    Self::parse_value(&decoded)
                 };
 
                 (name, value)
@@ -267,20 +307,26 @@ impl MinimaxM2Parser {
                 self.streamed_args_for_tool.push(String::new());
             }
 
-            let previous_args = &self.streamed_args_for_tool[tool_id];
-
-            // Build incremental JSON
+            // Build incremental JSON with single allocation
             if self.current_parameters.is_empty() {
                 // First parameters - start JSON object but don't close it
-                let mut items = Vec::new();
+                let mut json_fragment = String::with_capacity(256);
+                json_fragment.push('{');
+
+                let mut first = true;
                 for (key, value) in &new_params {
-                    items.push(format!(
-                        r#"{}: {}"#,
+                    if !first {
+                        json_fragment.push_str(", ");
+                    }
+                    write!(
+                        &mut json_fragment,
+                        "{}: {}",
                         serde_json::to_string(key).unwrap(),
                         serde_json::to_string(value).unwrap()
-                    ));
+                    )
+                    .unwrap();
+                    first = false;
                 }
-                let json_fragment = format!("{{{}", items.join(", "));
 
                 calls.push(ToolCallItem {
                     tool_index: tool_id,
@@ -297,17 +343,18 @@ impl MinimaxM2Parser {
                     .collect();
 
                 if !new_keys.is_empty() {
-                    let mut continuation_parts = Vec::new();
+                    let mut json_fragment = String::with_capacity(128);
+
                     for key in new_keys {
                         let value = &new_params[key];
-                        continuation_parts.push(format!(
-                            r#"{}: {}"#,
+                        write!(
+                            &mut json_fragment,
+                            ", {}: {}",
                             serde_json::to_string(key).unwrap(),
                             serde_json::to_string(value).unwrap()
-                        ));
+                        )
+                        .unwrap();
                     }
-
-                    let json_fragment = format!(", {}", continuation_parts.join(", "));
 
                     calls.push(ToolCallItem {
                         tool_index: tool_id,
@@ -315,8 +362,7 @@ impl MinimaxM2Parser {
                         parameters: json_fragment.clone(),
                     });
 
-                    self.streamed_args_for_tool[tool_id] =
-                        format!("{}{}", previous_args, json_fragment);
+                    self.streamed_args_for_tool[tool_id].push_str(&json_fragment);
                 }
             }
 
@@ -585,7 +631,11 @@ impl ToolParser for MinimaxM2Parser {
             // Parse parameters incrementally
             if self.function_name_sent {
                 // Process parameters and get any calls to emit
-                let buffer_copy = self.buffer.clone();
+                // Note: We need to be careful here - parse_and_stream_parameters needs
+                // to work with the buffer but we can't pass &self.buffer directly
+                // due to borrow checker. Instead, we'll refactor slightly.
+                // For now, keep the clone but mark it as a TODO for future optimization
+                let buffer_copy = self.buffer.clone(); // TODO: Optimize this
                 let parameter_calls = self.parse_and_stream_parameters(&buffer_copy, tools);
                 calls.extend(parameter_calls);
 
