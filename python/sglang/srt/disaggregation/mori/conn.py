@@ -204,6 +204,7 @@ class MoriKVManager(CommonKVManager):
             post_batch_size,
             num_worker_threads,
             poll_mode,
+            False,
         )
         engine.create_backend(BackendType.RDMA, rdma_cfg)
         logger.debug(
@@ -703,6 +704,7 @@ class MoriKVSender(CommonKVSender):
 
         transfers_done = self._all_transfers_finished()
         if transfers_done:
+            logger.info(f"MoriKVSender: All transfers finished for room {self.bootstrap_room}")
             if self._has_transfer_error():
                 reason = self._collect_failure_reason()
                 self.kv_mgr.record_failure(self.bootstrap_room, reason)
@@ -712,6 +714,12 @@ class MoriKVSender(CommonKVSender):
             self._notify_decode(KVPoll.Success)
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
+        
+        # Debug logging for stuck transfers, print at most every 30s
+        now = time.time()
+        if now - self.init_time > 5.0 and (int(now - self.init_time) % 30 == 0):
+            in_progress_count = sum(1 for s in self.transfer_statuses if s.InProgress())
+            logger.info(f"MoriKVSender: Room {self.bootstrap_room} stuck transferring. {in_progress_count}/{len(self.transfer_statuses)} ops in progress.")
 
         return KVPoll.Transferring if status == KVPoll.Success else status
 
