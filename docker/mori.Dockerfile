@@ -154,8 +154,7 @@ ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH="1dec9e80b8d8d0b86180dc5cb3202528145cddc7"
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-# ARG MORI_COMMIT="ionic_new_950_1128"
-ARG MORI_COMMIT="84a2881d46bce5161f2c5ece346df8d747b03361"
+ARG MORI_COMMIT="main"
 
 ARG MOONCAKE_REPO="https://github.com/Duyi-Wang/Mooncake.git"
 ARG MOONCAKE_COMMIT="amd_mori"
