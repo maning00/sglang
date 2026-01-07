@@ -1,10 +1,19 @@
 #pragma once
 
-#include <cuda.h>
 #include <iostream>
+#include <vector>
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(USE_ROCM)
+#define VTENSOR_USE_HIP 1
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+#else
+#define VTENSOR_USE_HIP 0
+#include <cuda.h>
+#endif
+
 #include <torch/extension.h>
 #include <torch/torch.h>
-#include <vector>
 
 #define LOGE(format, ...)                                                      \
   fprintf(stdout, "L%d:" format "\n", __LINE__, ##__VA_ARGS__);                \
@@ -25,6 +34,25 @@
 
 #define ROUND_UP(x, n) (((x) + ((n) - 1)) / (n) * (n))
 
+#if VTENSOR_USE_HIP
+
+#define DRV_CALL(call)                                                         \
+  {                                                                            \
+    hipError_t result = (call);                                                \
+    if (hipSuccess != result) {                                                \
+      const char *errMsg = hipGetErrorString(result);                          \
+      ASSERT(0, "Error when exec " #call " %s-%d code:%d err:%s",              \
+             __FUNCTION__, __LINE__, result, errMsg);                          \
+    }                                                                          \
+  }
+
+using VmmMemHandle = hipMemGenericAllocationHandle_t;
+using VmmDevicePtr = hipDeviceptr_t;
+using VmmResult = hipError_t;
+#define VMM_SUCCESS hipSuccess
+
+#else
+
 #define DRV_CALL(call)                                                         \
   {                                                                            \
     CUresult result = (call);                                                  \
@@ -36,6 +64,13 @@
     }                                                                          \
   }
 
+using VmmMemHandle = CUmemGenericAllocationHandle;
+using VmmDevicePtr = CUdeviceptr;
+using VmmResult = CUresult;
+#define VMM_SUCCESS CUDA_SUCCESS
+
+#endif // VTENSOR_USE_HIP
+
 class PhyBlock {
 public:
   PhyBlock(int device_id, size_t block_size);
@@ -43,8 +78,8 @@ public:
 
   size_t block_size;
   int device_id;
-  CUmemGenericAllocationHandle alloc_handle;
-  CUresult status;
+  VmmMemHandle alloc_handle;
+  VmmResult status;
 };
 
 class VmmTensor {
@@ -71,8 +106,8 @@ private:
   torch::Tensor offset_tensor;
 
   std::unique_ptr<PhyBlock> u_p_block;
-  CUdeviceptr v_ptr;
-  CUdeviceptr offset_v_ptr = 0;
+  VmmDevicePtr v_ptr;
+  VmmDevicePtr offset_v_ptr = 0;
   size_t offset_size = 0;
 };
 
@@ -98,4 +133,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "init_unique_phy_blocks");
   m.def("release_shared_phy_blocks", &release_shared_phy_blocks,
         "release_shared_phy_blocks");
+
+#if VTENSOR_USE_HIP
+  m.attr("backend") = "hip";
+#else
+  m.attr("backend") = "cuda";
+#endif
 }
