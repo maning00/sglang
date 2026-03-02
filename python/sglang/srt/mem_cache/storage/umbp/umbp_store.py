@@ -35,9 +35,10 @@ def _import_umbp_client():
         # Navigate from sglang/python/sglang/srt/mem_cache/storage/umbp/ up to KVManager/
         _this_dir = os.path.dirname(os.path.abspath(__file__))
         # Try common locations
+        # _this_dir = .../sglang/python/sglang/srt/mem_cache/storage/umbp/
+        # 7 levels up lands at KVManager/, then umbp/build
         candidates = [
-            os.path.normpath(os.path.join(_this_dir, "..", "..", "..", "..", "..", "..", "..", "..", "umbp", "build")),
-            os.path.normpath(os.path.join(_this_dir, "..", "..", "..", "..", "..", "..", "umbp", "build")),
+            os.path.normpath(os.path.join(_this_dir, *(['..'] * 7), "umbp", "build")),
         ]
         # Also check UMBP_BUILD_DIR env var
         if os.environ.get("UMBP_BUILD_DIR"):

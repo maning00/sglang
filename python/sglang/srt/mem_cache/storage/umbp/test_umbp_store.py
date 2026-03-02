@@ -10,8 +10,10 @@ from typing import List, Optional
 from unittest.mock import MagicMock
 
 # Add UMBP build dir to path
+# __file__ is at .../sglang/python/sglang/srt/mem_cache/storage/umbp/test_umbp_store.py
+# 7 levels up = KVManager/, then umbp/build
 umbp_build = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "..", "..", "umbp", "build")
+    os.path.join(os.path.dirname(__file__), *(['..'] * 7), "umbp", "build")
 )
 if os.path.isdir(umbp_build):
     sys.path.insert(0, umbp_build)
