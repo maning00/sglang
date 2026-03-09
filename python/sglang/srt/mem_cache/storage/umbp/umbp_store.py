@@ -28,8 +28,12 @@ def _import_umbp_client():
     try:
         # Try direct import first (if installed or in sys.path)
         from _umbp_core import UMBPClient, UMBPConfig
+        try:
+            from _umbp_core import UMBPRole
+        except ImportError:
+            UMBPRole = None
 
-        return UMBPClient, UMBPConfig
+        return UMBPClient, UMBPConfig, UMBPRole
     except ImportError:
         # Fall back to looking in the build directory
         # Navigate from sglang/python/sglang/srt/mem_cache/storage/umbp/ up to KVManager/
@@ -59,8 +63,12 @@ def _import_umbp_client():
             )
         sys.path.insert(0, umbp_build)
         from _umbp_core import UMBPClient, UMBPConfig
+        try:
+            from _umbp_core import UMBPRole
+        except ImportError:
+            UMBPRole = None
 
-        return UMBPClient, UMBPConfig
+        return UMBPClient, UMBPConfig, UMBPRole
 
 
 class UMBPStore(HiCacheStorage):
@@ -74,7 +82,7 @@ class UMBPStore(HiCacheStorage):
         storage_config: HiCacheStorageConfig = None,
         mem_pool_host: HostKVCache = None,
     ):
-        UMBPClient, UMBPConfig = _import_umbp_client()
+        UMBPClient, UMBPConfig, UMBPRole = _import_umbp_client()
 
         cfg = UMBPConfig()
 
@@ -91,7 +99,6 @@ class UMBPStore(HiCacheStorage):
         if "auto_promote_on_read" in extra:
             cfg.auto_promote_on_read = bool(extra["auto_promote_on_read"])
 
-        self.client = UMBPClient(cfg)
         self.storage_config = storage_config
 
         # TP/PP rank info for key suffix generation
@@ -105,6 +112,31 @@ class UMBPStore(HiCacheStorage):
             self.local_rank = 0
             self.pp_rank = 0
             self.pp_size = 1
+
+        # MLA + TP > 1: shared SSD mode
+        self.is_mla_follower = False
+        tp_size = getattr(storage_config, "tp_size", 1) if storage_config else 1
+        if self.is_mla_backend and tp_size > 1:
+            cfg.ssd_enabled = True
+            if self.local_rank == 0:
+                # Leader: copy every DRAM write to shared SSD.
+                if UMBPRole is not None and hasattr(cfg, "role"):
+                    cfg.role = UMBPRole.SharedSSDLeader
+                cfg.force_ssd_copy_on_write = True
+            else:
+                # Follower: read-only, SSD filesystem fallback.
+                if UMBPRole is not None and hasattr(cfg, "role"):
+                    cfg.role = UMBPRole.SharedSSDFollower
+                cfg.follower_mode = True
+                self.is_mla_follower = True
+            logger.info(
+                "UMBPStore MLA+TP>1: rank=%d, role=%s, shared_ssd=%s",
+                self.local_rank,
+                "leader" if self.local_rank == 0 else "follower",
+                cfg.ssd_storage_dir,
+            )
+
+        self.client = UMBPClient(cfg)
 
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:
@@ -245,6 +277,11 @@ class UMBPStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Follower never writes (CacheController also sets backup_skip, but guard here too)
+        if self.is_mla_follower:
+            page_count = len(host_indices) // self.mem_pool_host.page_size
+            return [True] * page_count
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
             keys, host_indices
         )
@@ -346,6 +383,8 @@ class UMBPStore(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        if self.is_mla_follower:
+            return True
         if target_location is None or target_sizes is None:
             return False
         return self.client.put_from_ptr(key, target_location, target_sizes)
@@ -359,6 +398,8 @@ class UMBPStore(HiCacheStorage):
     ) -> bool:
         if not keys:
             return False
+        if self.is_mla_follower:
+            return True
         assert len(keys) == len(target_locations) == len(target_sizes)
         results = self.client.batch_put_from_ptr(
             keys, list(target_locations), list(target_sizes)
