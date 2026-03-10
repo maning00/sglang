@@ -260,7 +260,7 @@ class HostKVCache(abc.ABC):
         if need_size > self.available_size():
             return None
 
-        select_index = self.free_slots[:need_size]
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
 
         return select_index
