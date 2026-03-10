@@ -260,7 +260,9 @@ class HostKVCache(abc.ABC):
         if need_size > self.available_size():
             return None
 
-        select_index = self.free_slots[:need_size]
+        # Clone to detach from parent storage -- prevents the entire free_slots
+        # tensor from being kept alive by this small view (memory leak).
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
 
         return select_index
@@ -583,7 +585,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=False,  # temporary buffer, no need to pin,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
@@ -1002,7 +1004,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             ),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=False,  # temporary buffer, no need to pin,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
