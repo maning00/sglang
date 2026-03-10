@@ -2,21 +2,9 @@
 """Unit tests for UMBPStore with mocked HostKVCache."""
 
 import ctypes
-import os
-import sys
-import tempfile
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 from unittest.mock import MagicMock
-
-# Add UMBP build dir to path
-# __file__ is at .../sglang/python/sglang/srt/mem_cache/storage/umbp/test_umbp_store.py
-# 7 levels up = KVManager/, then umbp/build
-umbp_build = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), *(['..'] * 7), "umbp", "build")
-)
-if os.path.isdir(umbp_build):
-    sys.path.insert(0, umbp_build)
 
 
 @dataclass
@@ -56,7 +44,9 @@ class MockHostKVCache:
         pages = list(range(0, len(indices), self.page_size))
 
         for page_start in pages:
-            page_idx = indices[page_start] if hasattr(indices, '__getitem__') else page_start
+            page_idx = (
+                indices[page_start] if hasattr(indices, "__getitem__") else page_start
+            )
             # K pointer
             k_ptr = self._buffer_ptr + page_idx * 2 * self.element_size
             # V pointer
@@ -102,7 +92,7 @@ def test_basic_set_get():
     store.register_mem_pool_host(mem_pool)
 
     # Fill page 0 with data
-    mem_pool.fill_page(0, ord('A'), ord('B'))
+    mem_pool.fill_page(0, ord("A"), ord("B"))
 
     # Set: store page 0 data
     keys = ["hash_page_0"]
@@ -122,8 +112,8 @@ def test_basic_set_get():
     # Verify data restored
     k_data = mem_pool.read_page_k(0)
     v_data = mem_pool.read_page_v(0)
-    assert k_data == bytes([ord('A')] * 512), "K data mismatch"
-    assert v_data == bytes([ord('B')] * 512), "V data mismatch"
+    assert k_data == bytes([ord("A")] * 512), "K data mismatch"
+    assert v_data == bytes([ord("B")] * 512), "V data mismatch"
 
     print("PASSED")
 
@@ -142,7 +132,7 @@ def test_batch_set_get_multiple_pages():
 
     # Fill pages with distinct data
     for i in range(4):
-        mem_pool.fill_page(i, ord('A') + i, ord('a') + i)
+        mem_pool.fill_page(i, ord("A") + i, ord("a") + i)
 
     keys = [f"hash_{i}" for i in range(4)]
     indices = make_indices([0, 1, 2, 3])
@@ -163,8 +153,8 @@ def test_batch_set_get_multiple_pages():
     for i in range(4):
         k = mem_pool.read_page_k(i)
         v = mem_pool.read_page_v(i)
-        assert k[0] == ord('A') + i, f"Page {i} K mismatch"
-        assert v[0] == ord('a') + i, f"Page {i} V mismatch"
+        assert k[0] == ord("A") + i, f"Page {i} K mismatch"
+        assert v[0] == ord("a") + i, f"Page {i} V mismatch"
 
     print("PASSED")
 
@@ -183,7 +173,7 @@ def test_batch_exists():
 
     # Store first 2 pages
     for i in range(2):
-        mem_pool.fill_page(i, ord('X'), ord('Y'))
+        mem_pool.fill_page(i, ord("X"), ord("Y"))
 
     keys_to_set = [f"exists_{i}" for i in range(2)]
     indices = make_indices([0, 1])
@@ -209,7 +199,7 @@ def test_dedup_on_set():
     mem_pool = MockHostKVCache(num_pages=2, page_size=1, element_size=256)
     store.register_mem_pool_host(mem_pool)
 
-    mem_pool.fill_page(0, ord('A'), ord('B'))
+    mem_pool.fill_page(0, ord("A"), ord("B"))
 
     # Set once
     keys = ["dedup_key"]
@@ -217,7 +207,7 @@ def test_dedup_on_set():
     store.batch_set_v1(keys, indices)
 
     # Set again — should succeed (dedup)
-    mem_pool.fill_page(0, ord('X'), ord('Y'))  # Different data
+    mem_pool.fill_page(0, ord("X"), ord("Y"))  # Different data
     result = store.batch_set_v1(keys, indices)
     assert result[0] is True
 
@@ -225,7 +215,7 @@ def test_dedup_on_set():
     mem_pool.fill_page(0, 0, 0)
     store.batch_get_v1(keys, indices)
     k = mem_pool.read_page_k(0)
-    assert k[0] == ord('A'), f"Expected original data 'A', got {chr(k[0])}"
+    assert k[0] == ord("A"), f"Expected original data 'A', got {chr(k[0])}"
 
     print("PASSED")
 
@@ -242,7 +232,7 @@ def test_clear():
     mem_pool = MockHostKVCache(num_pages=2, page_size=1, element_size=256)
     store.register_mem_pool_host(mem_pool)
 
-    mem_pool.fill_page(0, ord('C'), ord('D'))
+    mem_pool.fill_page(0, ord("C"), ord("D"))
     store.batch_set_v1(["clear_key"], make_indices([0]))
 
     assert store.exists("clear_key_0_k")
@@ -262,16 +252,18 @@ def test_legacy_interface():
     store = UMBPStore(config)
 
     # Direct set/get/exists via legacy interface
-    data = (ctypes.c_char * 256)(*([b'Z'] * 256))
+    data = (ctypes.c_char * 256)(*([b"Z"] * 256))
     ptr = ctypes.addressof(data)
 
     assert store.set("legacy_key", target_location=ptr, target_sizes=256)
     assert store.exists("legacy_key")
 
     buf = (ctypes.c_char * 256)()
-    result = store.get("legacy_key", target_location=ctypes.addressof(buf), target_sizes=256)
+    result = store.get(
+        "legacy_key", target_location=ctypes.addressof(buf), target_sizes=256
+    )
     assert result is not None
-    assert buf[0] == b'Z'
+    assert buf[0] == b"Z"
 
     print("PASSED")
 

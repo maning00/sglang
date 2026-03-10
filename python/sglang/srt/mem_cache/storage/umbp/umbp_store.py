@@ -7,8 +7,6 @@ Follows the same pattern as MooncakeStore:
 """
 
 import logging
-import os
-import sys
 from typing import Any, List, Optional
 
 import torch
@@ -24,51 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 def _import_umbp_client():
-    """Import UMBPClient from the compiled C++ module."""
-    try:
-        # Try direct import first (if installed or in sys.path)
-        from _umbp_core import UMBPClient, UMBPConfig
-        try:
-            from _umbp_core import UMBPRole
-        except ImportError:
-            UMBPRole = None
+    """Import UMBPClient from mori.umbp (requires mori built with BUILD_UMBP=ON)."""
+    from mori.umbp import UMBPClient, UMBPConfig, UMBPRole
 
-        return UMBPClient, UMBPConfig, UMBPRole
-    except ImportError:
-        # Fall back to looking in the build directory
-        # Navigate from sglang/python/sglang/srt/mem_cache/storage/umbp/ up to KVManager/
-        _this_dir = os.path.dirname(os.path.abspath(__file__))
-        # Try common locations
-        # _this_dir = .../sglang/python/sglang/srt/mem_cache/storage/umbp/
-        # 7 levels up lands at KVManager/, then umbp/build
-        candidates = [
-            os.path.normpath(os.path.join(_this_dir, *(['..'] * 7), "umbp", "build")),
-        ]
-        # Also check UMBP_BUILD_DIR env var
-        if os.environ.get("UMBP_BUILD_DIR"):
-            candidates.insert(0, os.environ["UMBP_BUILD_DIR"])
-
-        umbp_build = None
-        for candidate in candidates:
-            if os.path.isdir(candidate):
-                umbp_build = candidate
-                break
-
-        if umbp_build is None:
-            raise ImportError(
-                "Cannot import _umbp_core. Build the UMBP C++ module first: "
-                "cd umbp && mkdir build && cd build && "
-                "cmake .. -Dpybind11_DIR=$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())') "
-                "&& make -j"
-            )
-        sys.path.insert(0, umbp_build)
-        from _umbp_core import UMBPClient, UMBPConfig
-        try:
-            from _umbp_core import UMBPRole
-        except ImportError:
-            UMBPRole = None
-
-        return UMBPClient, UMBPConfig, UMBPRole
+    return UMBPClient, UMBPConfig, UMBPRole
 
 
 class UMBPStore(HiCacheStorage):
@@ -148,15 +105,11 @@ class UMBPStore(HiCacheStorage):
 
         self.split_factor = 0
         if storage_config and storage_config.should_split_heads:
-            self.split_factor = (
-                storage_config.tp_lcm_size // storage_config.tp_size
-            )
+            self.split_factor = storage_config.tp_lcm_size // storage_config.tp_size
             base_rank = self.local_rank * self.split_factor
             target_ranks = [base_rank + i for i in range(self.split_factor)]
             if self.enable_pp:
-                self.mha_suffix = [
-                    f"{rank}_{self.pp_rank}" for rank in target_ranks
-                ]
+                self.mha_suffix = [f"{rank}_{self.pp_rank}" for rank in target_ranks]
             else:
                 self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
@@ -254,9 +207,7 @@ class UMBPStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
-            keys, host_indices
-        )
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         # Normalize sizes to list of per-key sizes
         if isinstance(buffer_sizes, int):
@@ -266,9 +217,7 @@ class UMBPStore(HiCacheStorage):
         else:
             sizes = list(buffer_sizes)
 
-        get_results = self.client.batch_get_into_ptr(
-            key_strs, list(buffer_ptrs), sizes
-        )
+        get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
         return self._batch_postprocess(get_results)
 
     def batch_set_v1(
@@ -282,9 +231,7 @@ class UMBPStore(HiCacheStorage):
             page_count = len(host_indices) // self.mem_pool_host.page_size
             return [True] * page_count
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
-            keys, host_indices
-        )
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         if isinstance(buffer_sizes, int):
             sizes = [buffer_sizes] * len(key_strs)
