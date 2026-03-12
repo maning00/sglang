@@ -55,6 +55,10 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd_capacity_bytes = int(extra["ssd_capacity_bytes"])
         if "auto_promote_on_read" in extra:
             cfg.auto_promote_on_read = bool(extra["auto_promote_on_read"])
+        if "eviction_policy" in extra:
+            cfg.eviction_policy = str(extra["eviction_policy"])
+        if "eviction_candidate_window" in extra:
+            cfg.eviction_candidate_window = int(extra["eviction_candidate_window"])
 
         self.storage_config = storage_config
 
@@ -220,6 +224,37 @@ class UMBPStore(HiCacheStorage):
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
         return self._batch_postprocess(get_results)
 
+    def _compute_expanded_depths(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> List[int]:
+        """Compute per-expanded-key depth values from prefix_keys metadata.
+
+        depth = len(prefix_keys) + page_index_within_node.
+        All key variants of the same page (K, V, multi-rank) share the same depth.
+        Returns an empty list if no metadata is available (caller falls back to plain LRU).
+        """
+        prefix_keys = getattr(extra_info, "prefix_keys", None) if extra_info else None
+        if prefix_keys is None:
+            return []
+
+        prefix_len = len(prefix_keys)
+        depths_per_page = [prefix_len + i for i in range(len(keys))]
+
+        # Expand to match the key_strs layout produced by _batch_preprocess.
+        expanded = []
+        for d in depths_per_page:
+            if self.is_mla_backend:
+                expanded.append(d)  # MLA: 1 key per page
+            elif self.storage_config and self.storage_config.should_split_heads:
+                # split heads: 2 keys per split rank, split_factor ranks per page
+                for _ in range(self.split_factor):
+                    expanded.append(d)
+                    expanded.append(d)
+            else:
+                expanded.append(d)  # K
+                expanded.append(d)  # V
+        return expanded
+
     def batch_set_v1(
         self,
         keys: List[str],
@@ -240,12 +275,16 @@ class UMBPStore(HiCacheStorage):
         else:
             sizes = list(buffer_sizes)
 
+        # Compute depths before dedup so we can pass them for non-existing keys.
+        expanded_depths = self._compute_expanded_depths(keys, extra_info)
+
         # Dedup: skip already-existing keys
         exist_results = self.client.batch_exists(key_strs)
 
         set_keys = []
         set_ptrs = []
         set_sizes = []
+        set_depths = []
         set_indices = []
         final_results = [False] * len(key_strs)
 
@@ -256,10 +295,18 @@ class UMBPStore(HiCacheStorage):
                 set_keys.append(key_strs[i])
                 set_ptrs.append(buffer_ptrs[i])
                 set_sizes.append(sizes[i])
+                set_depths.append(expanded_depths[i] if expanded_depths else -1)
                 set_indices.append(i)
 
         if set_keys:
-            put_results = self.client.batch_put_from_ptr(set_keys, set_ptrs, set_sizes)
+            if expanded_depths:
+                put_results = self.client.batch_put_from_ptr_with_depth(
+                    set_keys, set_ptrs, set_sizes, set_depths
+                )
+            else:
+                put_results = self.client.batch_put_from_ptr(
+                    set_keys, set_ptrs, set_sizes
+                )
             for idx, result in zip(set_indices, put_results):
                 final_results[idx] = result
 
