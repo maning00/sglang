@@ -97,6 +97,24 @@ class UMBPStore(HiCacheStorage):
                 cfg.ssd_storage_dir,
             )
 
+        try:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_dp_rank,
+                is_dp_attention_enabled,
+            )
+
+            if is_dp_attention_enabled():
+                dp_rank = get_attention_dp_rank()
+                if dp_rank > 0 and cfg.ssd_enabled:
+                    cfg.ssd_storage_dir = f"{cfg.ssd_storage_dir}/dp{dp_rank}"
+                    logger.info(
+                        "UMBPStore DP isolation: dp_rank=%d, ssd_dir=%s",
+                        dp_rank,
+                        cfg.ssd_storage_dir,
+                    )
+        except (ImportError, AssertionError):
+            pass
+
         self.client = UMBPClient(cfg)
 
         self.enable_pp = self.pp_size > 1

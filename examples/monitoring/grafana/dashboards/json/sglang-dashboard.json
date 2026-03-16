@@ -1040,7 +1040,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L3 预取与回写 token 速率 (tokens/s)。",
+      "description": "L3 存储层预取与回写 token 速率：预取 (L3→Host DRAM)，回写 (Host DRAM→L3)。",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1079,7 +1079,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:prefetched_tokens_total[$__rate_interval])",
           "instant": false,
-          "legendFormat": "预取 (L3→GPU) tokens/s",
+          "legendFormat": "预取 (L3→Host) tokens/s",
           "range": true,
           "refId": "A"
         },
@@ -1088,12 +1088,12 @@
           "editorMode": "code",
           "expr": "rate(sglang:backuped_tokens_total[$__rate_interval])",
           "instant": false,
-          "legendFormat": "回写 (GPU→L3) tokens/s",
+          "legendFormat": "回写 (Host→L3) tokens/s",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "HiCache L3 预取 / 回写速率",
+      "title": "HiCache L3 预取 / 回写速率 (Host↔Storage)",
       "type": "timeseries"
     },
     {
@@ -1101,7 +1101,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L3 淘汰与加载回 GPU 的 token 速率。",
+      "description": "L1 (GPU) KV cache 淘汰速率（无 HiCache 时丢弃，有 HiCache 时写入 L2），以及从 L2 (Host) 加载回 GPU 的速率。",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1140,7 +1140,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:evicted_tokens_total[$__rate_interval])",
           "instant": false,
-          "legendFormat": "淘汰 tokens/s",
+          "legendFormat": "L1 淘汰 tokens/s",
           "range": true,
           "refId": "A"
         },
@@ -1149,12 +1149,12 @@
           "editorMode": "code",
           "expr": "rate(sglang:load_back_tokens_total[$__rate_interval])",
           "instant": false,
-          "legendFormat": "加载回 GPU tokens/s",
+          "legendFormat": "L2→L1 加载回 GPU tokens/s",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "HiCache L3 淘汰 / 加载回 GPU 速率",
+      "title": "HiCache L1↔L2 淘汰 / 加载回 GPU 速率",
       "type": "timeseries"
     },
     {
