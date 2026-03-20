@@ -5,10 +5,10 @@ services:
     container_name: prometheus
     network_mode: host
     user: root
+    restart: unless-stopped
     volumes:
       - ./prometheus.yaml:/etc/prometheus/prometheus.yml
-    tmpfs:
-      - /prometheus
+      - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -32,3 +32,5 @@ services:
     depends_on:
       - prometheus
 
+volumes:
+  prometheus-data:
