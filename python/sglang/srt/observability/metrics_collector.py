@@ -1379,10 +1379,26 @@ class StorageMetricsCollector:
             documentation="Number of prefetched prompt tokens.",
             labelnames=labels.keys(),
         )
+        self.prefetched_bytes_total = Counter(
+            name="sglang:prefetched_bytes_total",
+            documentation=(
+                "Logical KV cache bytes prefetched from storage to host "
+                "(aligned with prefetched tokens)."
+            ),
+            labelnames=labels.keys(),
+        )
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
+            labelnames=labels.keys(),
+        )
+        self.backuped_bytes_total = Counter(
+            name="sglang:backuped_bytes_total",
+            documentation=(
+                "Logical KV cache bytes backuped from host to storage "
+                "(aligned with backuped tokens)."
+            ),
             labelnames=labels.keys(),
         )
 
@@ -1436,9 +1452,17 @@ class StorageMetricsCollector:
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 
+    def log_prefetched_bytes(self, prefetched_bytes: int):
+        if prefetched_bytes > 0:
+            self.prefetched_bytes_total.labels(**self.labels).inc(prefetched_bytes)
+
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_backuped_bytes(self, backuped_bytes: int):
+        if backuped_bytes > 0:
+            self.backuped_bytes_total.labels(**self.labels).inc(backuped_bytes)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -1542,6 +1566,14 @@ class RadixCacheMetricsCollector:
             documentation="The number of tokens evicted from GPU to CPU.",
             labelnames=labels.keys(),
         )
+        self.eviction_num_bytes = Counter(
+            name="sglang:evicted_bytes_total",
+            documentation=(
+                "Logical KV cache bytes evicted from GPU to host "
+                "(aligned with evicted tokens)."
+            ),
+            labelnames=labels.keys(),
+        )
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
@@ -1555,15 +1587,82 @@ class RadixCacheMetricsCollector:
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
+        self.load_back_num_bytes = Counter(
+            name="sglang:load_back_bytes_total",
+            documentation=(
+                "Logical KV cache bytes loaded from host to GPU "
+                "(aligned with load-back tokens)."
+            ),
+            labelnames=labels.keys(),
+        )
+        bucket_bandwidth_gb_s = [
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+            10,
+            20,
+            40,
+            60,
+            80,
+            100,
+            120,
+            160,
+            200,
+            240,
+            320,
+            400,
+            512,
+            640,
+            768,
+            896,
+            1024,
+            1280,
+            1536,
+            1792,
+            2048,
+        ]
+        self.eviction_bandwidth_gb_s = Histogram(
+            name="sglang:eviction_bandwidth_gb_s",
+            documentation=(
+                "Per-eviction logical KV bandwidth in GB/s "
+                "(evicted logical bytes / eviction duration)."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth_gb_s,
+        )
+        self.load_back_bandwidth_gb_s = Histogram(
+            name="sglang:load_back_bandwidth_gb_s",
+            documentation=(
+                "Per-load-back logical KV bandwidth in GB/s "
+                "(loaded logical bytes / load-back duration)."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth_gb_s,
+        )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
+    def increment_eviction_num_bytes(self, num_bytes: int) -> None:
+        self.eviction_num_bytes.labels(**self.labels).inc(num_bytes)
+
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_load_back_num_bytes(self, num_bytes: int) -> None:
+        self.load_back_num_bytes.labels(**self.labels).inc(num_bytes)
 
     def observe_eviction_duration(self, duration_seconds: float) -> None:
         self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_eviction_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
+        self.eviction_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
+
+    def observe_load_back_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
+        self.load_back_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)

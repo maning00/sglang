@@ -2,6 +2,7 @@
 """Unit tests for UMBPStore with mocked HostKVCache."""
 
 import ctypes
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock
@@ -268,6 +269,37 @@ def test_legacy_interface():
     print("PASSED")
 
 
+def test_segmented_layout_basic():
+    print("test_segmented_layout_basic... ", end="")
+    from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+
+    with tempfile.TemporaryDirectory(prefix="umbp_segmented_") as ssd_dir:
+        config = MockStorageConfig(
+            extra_config={
+                "dram_capacity_bytes": 1024 * 1024,
+                "ssd_enabled": True,
+                "ssd_storage_dir": ssd_dir,
+                "ssd_capacity_bytes": 16 * 1024 * 1024,
+            }
+        )
+        store = UMBPStore(config)
+
+        mem_pool = MockHostKVCache(num_pages=2, page_size=1, element_size=256)
+        store.register_mem_pool_host(mem_pool)
+        mem_pool.fill_page(0, ord("M"), ord("N"))
+
+        keys = ["seg_hash_0"]
+        indices = make_indices([0])
+        assert store.batch_set_v1(keys, indices) == [True]
+        mem_pool.fill_page(0, 0, 0)
+        assert store.batch_get_v1(keys, indices) == [True]
+        assert mem_pool.read_page_k(0)[0] == ord("M")
+        assert mem_pool.read_page_v(0)[0] == ord("N")
+        store.clear()
+
+    print("PASSED")
+
+
 if __name__ == "__main__":
     print("=== UMBPStore Tests ===")
     test_basic_set_get()
@@ -276,4 +308,5 @@ if __name__ == "__main__":
     test_dedup_on_set()
     test_clear()
     test_legacy_interface()
+    test_segmented_layout_basic()
     print("All UMBPStore tests passed!")

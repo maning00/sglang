@@ -23,9 +23,15 @@ logger = logging.getLogger(__name__)
 
 def _import_umbp_client():
     """Import UMBPClient from mori.umbp (requires mori built with BUILD_UMBP=ON)."""
-    from mori.umbp import UMBPClient, UMBPConfig, UMBPRole
+    import mori.umbp as umbp_mod
 
-    return UMBPClient, UMBPConfig, UMBPRole
+    UMBPClient = umbp_mod.UMBPClient
+    UMBPConfig = umbp_mod.UMBPConfig
+    UMBPRole = umbp_mod.UMBPRole
+    UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
+    UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
+
+    return UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode
 
 
 class UMBPStore(HiCacheStorage):
@@ -39,26 +45,56 @@ class UMBPStore(HiCacheStorage):
         storage_config: HiCacheStorageConfig = None,
         mem_pool_host: HostKVCache = None,
     ):
-        UMBPClient, UMBPConfig, UMBPRole = _import_umbp_client()
+        UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode = (
+            _import_umbp_client()
+        )
 
         cfg = UMBPConfig()
 
         # Load settings from extra_config if available
         extra = getattr(storage_config, "extra_config", None) or {}
         if "dram_capacity_bytes" in extra:
-            cfg.dram_capacity_bytes = int(extra["dram_capacity_bytes"])
+            cfg.dram.capacity_bytes = int(extra["dram_capacity_bytes"])
         if "ssd_enabled" in extra:
-            cfg.ssd_enabled = bool(extra["ssd_enabled"])
+            cfg.ssd.enabled = bool(extra["ssd_enabled"])
         if "ssd_storage_dir" in extra:
-            cfg.ssd_storage_dir = str(extra["ssd_storage_dir"])
+            cfg.ssd.storage_dir = str(extra["ssd_storage_dir"])
         if "ssd_capacity_bytes" in extra:
-            cfg.ssd_capacity_bytes = int(extra["ssd_capacity_bytes"])
+            cfg.ssd.capacity_bytes = int(extra["ssd_capacity_bytes"])
+        if "copy_to_ssd_async" in extra:
+            cfg.copy_pipeline.async_enabled = bool(extra["copy_to_ssd_async"])
+        if "copy_to_ssd_queue_depth" in extra:
+            cfg.copy_pipeline.queue_depth = int(extra["copy_to_ssd_queue_depth"])
+        if "ssd_segment_size_bytes" in extra:
+            cfg.ssd.segment_size_bytes = int(extra["ssd_segment_size_bytes"])
+        if "ssd_batch_max_ops" in extra:
+            cfg.copy_pipeline.batch_max_ops = int(extra["ssd_batch_max_ops"])
+        if "ssd_queue_depth" in extra:
+            cfg.ssd.io.queue_depth = int(extra["ssd_queue_depth"])
+        if "ssd_writer_threads" in extra:
+            cfg.copy_pipeline.worker_threads = int(extra["ssd_writer_threads"])
+        if "ssd_enable_background_gc" in extra:
+            cfg.ssd.durability.enable_background_gc = bool(
+                extra["ssd_enable_background_gc"]
+            )
         if "auto_promote_on_read" in extra:
-            cfg.auto_promote_on_read = bool(extra["auto_promote_on_read"])
+            cfg.eviction.auto_promote_on_read = bool(extra["auto_promote_on_read"])
         if "eviction_policy" in extra:
-            cfg.eviction_policy = str(extra["eviction_policy"])
+            cfg.eviction.policy = str(extra["eviction_policy"])
         if "eviction_candidate_window" in extra:
-            cfg.eviction_candidate_window = int(extra["eviction_candidate_window"])
+            cfg.eviction.candidate_window = int(extra["eviction_candidate_window"])
+        if "ssd_io_backend" in extra and UMBPIoBackend is not None:
+            backend = str(extra["ssd_io_backend"]).lower()
+            if backend in ("pthread", "posix"):
+                cfg.ssd.io.backend = UMBPIoBackend.PThread
+            elif backend in ("io_uring", "uring"):
+                cfg.ssd.io.backend = UMBPIoBackend.IoUring
+        if "ssd_durability_mode" in extra and UMBPDurabilityMode is not None:
+            durability = str(extra["ssd_durability_mode"]).lower()
+            if durability in ("strict", "sync"):
+                cfg.ssd.durability.mode = UMBPDurabilityMode.Strict
+            elif durability in ("relaxed", "async"):
+                cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
 
         self.storage_config = storage_config
 
@@ -78,7 +114,7 @@ class UMBPStore(HiCacheStorage):
         self.is_mla_follower = False
         tp_size = getattr(storage_config, "tp_size", 1) if storage_config else 1
         if self.is_mla_backend and tp_size > 1:
-            cfg.ssd_enabled = True
+            cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
                 if UMBPRole is not None and hasattr(cfg, "role"):
@@ -94,7 +130,7 @@ class UMBPStore(HiCacheStorage):
                 "UMBPStore MLA+TP>1: rank=%d, role=%s, shared_ssd=%s",
                 self.local_rank,
                 "leader" if self.local_rank == 0 else "follower",
-                cfg.ssd_storage_dir,
+                cfg.ssd.storage_dir,
             )
 
         try:
@@ -105,12 +141,12 @@ class UMBPStore(HiCacheStorage):
 
             if is_dp_attention_enabled():
                 dp_rank = get_attention_dp_rank()
-                if dp_rank > 0 and cfg.ssd_enabled:
-                    cfg.ssd_storage_dir = f"{cfg.ssd_storage_dir}/dp{dp_rank}"
+                if dp_rank > 0 and cfg.ssd.enabled:
+                    cfg.ssd.storage_dir = f"{cfg.ssd.storage_dir}/dp{dp_rank}"
                     logger.info(
                         "UMBPStore DP isolation: dp_rank=%d, ssd_dir=%s",
                         dp_rank,
-                        cfg.ssd_storage_dir,
+                        cfg.ssd.storage_dir,
                     )
         except (ImportError, AssertionError):
             pass
@@ -137,8 +173,8 @@ class UMBPStore(HiCacheStorage):
 
         logger.info(
             "UMBPStore initialized: dram=%d MB, ssd=%s, mla=%s, rank=%d",
-            cfg.dram_capacity_bytes // (1024 * 1024),
-            cfg.ssd_enabled,
+            cfg.dram.capacity_bytes // (1024 * 1024),
+            cfg.ssd.enabled,
             self.is_mla_backend,
             self.local_rank,
         )
@@ -293,42 +329,18 @@ class UMBPStore(HiCacheStorage):
         else:
             sizes = list(buffer_sizes)
 
-        # Compute depths before dedup so we can pass them for non-existing keys.
         expanded_depths = self._compute_expanded_depths(keys, extra_info)
 
-        # Dedup: skip already-existing keys
-        exist_results = self.client.batch_exists(key_strs)
+        if expanded_depths:
+            put_results = self.client.batch_put_from_ptr_with_depth(
+                key_strs, list(buffer_ptrs), sizes, expanded_depths
+            )
+        else:
+            put_results = self.client.batch_put_from_ptr(
+                key_strs, list(buffer_ptrs), sizes
+            )
 
-        set_keys = []
-        set_ptrs = []
-        set_sizes = []
-        set_depths = []
-        set_indices = []
-        final_results = [False] * len(key_strs)
-
-        for i in range(len(key_strs)):
-            if exist_results[i]:
-                final_results[i] = True  # Already exists
-            else:
-                set_keys.append(key_strs[i])
-                set_ptrs.append(buffer_ptrs[i])
-                set_sizes.append(sizes[i])
-                set_depths.append(expanded_depths[i] if expanded_depths else -1)
-                set_indices.append(i)
-
-        if set_keys:
-            if expanded_depths:
-                put_results = self.client.batch_put_from_ptr_with_depth(
-                    set_keys, set_ptrs, set_sizes, set_depths
-                )
-            else:
-                put_results = self.client.batch_put_from_ptr(
-                    set_keys, set_ptrs, set_sizes
-                )
-            for idx, result in zip(set_indices, put_results):
-                final_results[idx] = result
-
-        return self._batch_postprocess(final_results, is_set_operate=True)
+        return self._batch_postprocess(put_results, is_set_operate=True)
 
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -351,11 +363,8 @@ class UMBPStore(HiCacheStorage):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_results = self.client.batch_exists(query_keys)
-        for i in range(len(query_keys)):
-            if not exist_results[i]:
-                return i // key_multiplier
-        return len(query_keys) // key_multiplier
+        hit_count = self.client.batch_exists_consecutive(query_keys)
+        return hit_count // key_multiplier
 
     # ------------------------------------------------------------------
     # Legacy ABC interface (required by HiCacheStorage)
