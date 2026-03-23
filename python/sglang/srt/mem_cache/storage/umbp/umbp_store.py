@@ -30,8 +30,16 @@ def _import_umbp_client():
     UMBPRole = umbp_mod.UMBPRole
     UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
     UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
+    UMBPDistributedConfig = getattr(umbp_mod, "UMBPDistributedConfig", None)
 
-    return UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode
+    return (
+        UMBPClient,
+        UMBPConfig,
+        UMBPRole,
+        UMBPIoBackend,
+        UMBPDurabilityMode,
+        UMBPDistributedConfig,
+    )
 
 
 class UMBPStore(HiCacheStorage):
@@ -45,9 +53,14 @@ class UMBPStore(HiCacheStorage):
         storage_config: HiCacheStorageConfig = None,
         mem_pool_host: HostKVCache = None,
     ):
-        UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode = (
-            _import_umbp_client()
-        )
+        (
+            UMBPClient,
+            UMBPConfig,
+            UMBPRole,
+            UMBPIoBackend,
+            UMBPDurabilityMode,
+            UMBPDistributedConfig,
+        ) = _import_umbp_client()
 
         cfg = UMBPConfig()
 
@@ -95,6 +108,42 @@ class UMBPStore(HiCacheStorage):
                 cfg.ssd.durability.mode = UMBPDurabilityMode.Strict
             elif durability in ("relaxed", "async"):
                 cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
+
+        # Distributed mode: when master_address is provided, construct
+        # UMBPDistributedConfig and assign to cfg.distributed.  This enables
+        # the PoolClient inside UMBPClient to connect to the Master for
+        # cross-node KV cache sharing via RDMA.
+        # Default node_id to node_address:tp_rank so that the id is globally
+        # unique across nodes (tp_rank alone collides in multi-node setups).
+        tp_rank = storage_config.tp_rank if storage_config is not None else 0
+        if (
+            "master_address" in extra
+            and UMBPDistributedConfig is not None
+        ):
+            dist_cfg = UMBPDistributedConfig()
+            dist_cfg.master_address = str(extra["master_address"])
+            node_address = str(extra.get("node_address", ""))
+            dist_cfg.node_id = str(extra.get("node_id", f"{node_address}:{tp_rank}"))
+            dist_cfg.node_address = node_address
+            if "auto_heartbeat" in extra:
+                dist_cfg.auto_heartbeat = bool(extra["auto_heartbeat"])
+            if "io_engine_host" in extra:
+                dist_cfg.io_engine_host = str(extra["io_engine_host"])
+            if "io_engine_port" in extra:
+                dist_cfg.io_engine_port = int(extra["io_engine_port"])
+            if "staging_buffer_size" in extra:
+                dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
+            if "peer_service_port" in extra:
+                dist_cfg.peer_service_port = int(extra["peer_service_port"])
+            if "cache_remote_fetches" in extra:
+                dist_cfg.cache_remote_fetches = bool(extra["cache_remote_fetches"])
+            cfg.distributed = dist_cfg
+            logger.info(
+                "UMBPStore distributed mode: master=%s, node_id=%s, node_addr=%s",
+                dist_cfg.master_address,
+                dist_cfg.node_id,
+                dist_cfg.node_address,
+            )
 
         self.storage_config = storage_config
 
