@@ -7,6 +7,7 @@ Follows the same pattern as MooncakeStore:
 """
 
 import logging
+import os
 from typing import Any, List, Optional
 
 import torch
@@ -113,9 +114,22 @@ class UMBPStore(HiCacheStorage):
         # UMBPDistributedConfig and assign to cfg.distributed.  This enables
         # the PoolClient inside UMBPClient to connect to the Master for
         # cross-node KV cache sharing via RDMA.
-        # Default node_id to node_address:tp_rank so that the id is globally
-        # unique across nodes (tp_rank alone collides in multi-node setups).
+        # Default node_id to node_address:<rank> so that the id is globally
+        # unique across nodes.  In DP+EP mode the attention tp_rank is 0 for
+        # every rank, so we fall back to dp_rank to keep node_ids distinct.
         tp_rank = storage_config.tp_rank if storage_config is not None else 0
+        unique_rank = tp_rank
+        try:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_dp_rank,
+                is_dp_attention_enabled,
+            )
+
+            if is_dp_attention_enabled():
+                dp_rank = get_attention_dp_rank()
+                unique_rank = dp_rank if tp_rank == 0 and dp_rank > 0 else tp_rank
+        except (ImportError, AssertionError):
+            pass
         if (
             "master_address" in extra
             and UMBPDistributedConfig is not None
@@ -123,14 +137,15 @@ class UMBPStore(HiCacheStorage):
             dist_cfg = UMBPDistributedConfig()
             dist_cfg.master_address = str(extra["master_address"])
             node_address = str(extra.get("node_address", ""))
-            dist_cfg.node_id = str(extra.get("node_id", f"{node_address}:{tp_rank}"))
+            dist_cfg.node_id = str(extra.get("node_id", f"{node_address}:{unique_rank}"))
             dist_cfg.node_address = node_address
             if "auto_heartbeat" in extra:
                 dist_cfg.auto_heartbeat = bool(extra["auto_heartbeat"])
             if "io_engine_host" in extra:
                 dist_cfg.io_engine_host = str(extra["io_engine_host"])
             if "io_engine_port" in extra:
-                dist_cfg.io_engine_port = int(extra["io_engine_port"])
+                port_list = extra["io_engine_port"]
+                dist_cfg.io_engine_port = int(port_list[unique_rank])
             if "staging_buffer_size" in extra:
                 dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
             if "peer_service_port" in extra:
@@ -199,6 +214,11 @@ class UMBPStore(HiCacheStorage):
                     )
         except (ImportError, AssertionError):
             pass
+
+        # Pin RDMA NIC per rank so each rank uses a dedicated NIC,
+        # avoiding QPN collisions from round-robin selection.
+        os.environ["MORI_IO_RDMA_NIC_IDX"] = str(unique_rank)
+        logger.info("UMBPStore: pinning RDMA NIC to index %d for unique_rank %d", unique_rank, unique_rank)
 
         self.client = UMBPClient(cfg)
 
