@@ -51,8 +51,11 @@ device_module = get_device_module()
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events = [
+            device_module.Event(enable_timing=(i == num_layers - 1))
+            for i in range(num_layers)
+        ]
+        self.start_event = device_module.Event(enable_timing=True)
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -142,6 +145,7 @@ class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
+    num_tokens: int = 0
 
 
 class TransferBuffer:
@@ -477,7 +481,10 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl", "umbp"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "umbp"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -674,8 +681,8 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -692,7 +699,9 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(start_event, finish_event, op.node_ids, len(device_indices))
+        )
 
     def load(
         self,
@@ -765,6 +774,7 @@ class HiCacheController:
                 start_event=producer_event.start_event,
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(device_indices),
             )
         )
         return producer_id

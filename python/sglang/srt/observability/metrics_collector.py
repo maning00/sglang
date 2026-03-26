@@ -80,6 +80,7 @@ class SchedulerStats:
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    gpu_kv_cache_occupancy: float = 0.0
     full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
@@ -90,6 +91,12 @@ class SchedulerStats:
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
+
+    # Per-tier cache hit tokens (per batch, for Counter increment)
+    l1_hit_tokens: int = 0
+    l2_hit_tokens: int = 0
+    l3_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
     max_total_num_tokens: int = 0
 
@@ -203,6 +210,16 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.gpu_kv_cache_occupancy = Gauge(
+            name="sglang:gpu_kv_cache_occupancy",
+            documentation=(
+                "GPU KV cache occupancy ratio: (locked + cached) / total. "
+                "Includes both running-request-locked tokens and "
+                "evictable cached tokens."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.full_token_usage = Gauge(
             name="sglang:full_token_usage",
             documentation="The token usage for full attention layers.",
@@ -262,6 +279,39 @@ class SchedulerMetricsCollector:
             documentation="The prefix cache hit rate.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+
+        # Per-tier cache hit token counters
+        self.cache_hit_tokens_l1_total = Counter(
+            name="sglang:cache_hit_tokens_l1_total",
+            documentation=(
+                "Total tokens matched from L1 GPU device cache (radix tree)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.cache_hit_tokens_l2_total = Counter(
+            name="sglang:cache_hit_tokens_l2_total",
+            documentation=(
+                "Total tokens loaded back from L2 Host DRAM cache "
+                "(excluding L3 storage-promoted tokens)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.cache_hit_tokens_l3_total = Counter(
+            name="sglang:cache_hit_tokens_l3_total",
+            documentation=(
+                "Total tokens prefetched from L3 storage backend "
+                "(promoted through Host to GPU)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.cache_miss_tokens_total = Counter(
+            name="sglang:cache_miss_tokens_total",
+            documentation=(
+                "Total tokens not found in any cache tier, "
+                "requiring full prefill compute."
+            ),
+            labelnames=labels.keys(),
         )
 
         self.max_total_num_tokens = Gauge(
@@ -932,6 +982,7 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.gpu_kv_cache_occupancy, stats.gpu_kv_cache_occupancy)
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
@@ -946,6 +997,20 @@ class SchedulerMetricsCollector:
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+
+        # Per-tier cache hit counters
+        # Always touch all 4 counters so Prometheus exposes them (even when 0).
+        # Counter.inc(0) is a no-op for the value but initializes the time series.
+        self.cache_hit_tokens_l1_total.labels(**self.labels).inc(stats.l1_hit_tokens)
+        self.cache_hit_tokens_l2_total.labels(**self.labels).inc(stats.l2_hit_tokens)
+        self.cache_hit_tokens_l3_total.labels(**self.labels).inc(stats.l3_hit_tokens)
+        self.cache_miss_tokens_total.labels(**self.labels).inc(stats.cache_miss_tokens)
+        # Reset after increment — stats is reused across prefill/decode/idle
+        # cycles, so stale values would be re-counted on subsequent log_stats().
+        stats.l1_hit_tokens = 0
+        stats.l2_hit_tokens = 0
+        stats.l3_hit_tokens = 0
+        stats.cache_miss_tokens = 0
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
 
@@ -1556,28 +1621,56 @@ class RadixCacheMetricsCollector:
             ]
         self.eviction_duration_seconds = Histogram(
             name="sglang:eviction_duration_seconds",
-            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            documentation=(
+                "Eviction wall-clock duration in seconds. "
+                "write_through: CPU-side only (tree walk + index free). "
+                "write_back: includes blocking D2H transfer wait."
+            ),
             labelnames=labels.keys(),
             buckets=bucket_eviction_duration,
         )
 
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
-            documentation="The number of tokens evicted from GPU to CPU.",
+            documentation=(
+                "Total tokens evicted from L1 GPU "
+                "(backuped: freed to L2, regular: deleted entirely)."
+            ),
             labelnames=labels.keys(),
         )
         self.eviction_num_bytes = Counter(
             name="sglang:evicted_bytes_total",
             documentation=(
-                "Logical KV cache bytes evicted from GPU to host "
-                "(aligned with evicted tokens)."
+                "Logical KV bytes freed from L1 GPU (backuped + regular). "
+                "Note: regular-path bytes are deleted, not transferred to host."
+            ),
+            labelnames=labels.keys(),
+        )
+
+        # Split counters: backuped (GPU freed, data kept in L2) vs regular (data deleted)
+        self.evicted_backuped_tokens = Counter(
+            name="sglang:evicted_backuped_tokens_total",
+            documentation=(
+                "Tokens evicted via backuped path: GPU memory freed, "
+                "data remains in L2 Host for future load-back."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.evicted_regular_tokens = Counter(
+            name="sglang:evicted_regular_tokens_total",
+            documentation=(
+                "Tokens evicted via regular path: data deleted from "
+                "radix tree entirely (not backed up to L2 Host)."
             ),
             labelnames=labels.keys(),
         )
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            documentation=(
+                "Load-back enqueue duration in seconds "
+                "(device alloc + queue push; actual H2D transfer is async)."
+            ),
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )
@@ -1627,8 +1720,8 @@ class RadixCacheMetricsCollector:
         self.eviction_bandwidth_gb_s = Histogram(
             name="sglang:eviction_bandwidth_gb_s",
             documentation=(
-                "Per-eviction logical KV bandwidth in GB/s "
-                "(evicted logical bytes / eviction duration)."
+                "Per-batch L1→L2 write bandwidth in GB/s "
+                "(logical KV bytes / CUDA event elapsed time)."
             ),
             labelnames=labels.keys(),
             buckets=bucket_bandwidth_gb_s,
@@ -1636,8 +1729,8 @@ class RadixCacheMetricsCollector:
         self.load_back_bandwidth_gb_s = Histogram(
             name="sglang:load_back_bandwidth_gb_s",
             documentation=(
-                "Per-load-back logical KV bandwidth in GB/s "
-                "(loaded logical bytes / load-back duration)."
+                "Per-batch L2→L1 load bandwidth in GB/s "
+                "(logical KV bytes / CUDA event elapsed time)."
             ),
             labelnames=labels.keys(),
             buckets=bucket_bandwidth_gb_s,
@@ -1648,6 +1741,12 @@ class RadixCacheMetricsCollector:
 
     def increment_eviction_num_bytes(self, num_bytes: int) -> None:
         self.eviction_num_bytes.labels(**self.labels).inc(num_bytes)
+
+    def increment_evicted_backuped_tokens(self, num_tokens: int) -> None:
+        self.evicted_backuped_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_evicted_regular_tokens(self, num_tokens: int) -> None:
+        self.evicted_regular_tokens.labels(**self.labels).inc(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)

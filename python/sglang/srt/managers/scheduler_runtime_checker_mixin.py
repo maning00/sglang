@@ -327,6 +327,11 @@ class SchedulerRuntimeCheckerMixin:
             )
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(token_usage, 2)
+            if self.max_total_num_tokens > 0:
+                avail = self.token_to_kv_pool_allocator.available_size()
+                self.stats.gpu_kv_cache_occupancy = (
+                    1.0 - avail / self.max_total_num_tokens
+                )
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled

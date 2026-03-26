@@ -56,6 +56,12 @@ class PrefillStats:
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
 
+    # Per-tier cache hit breakdown (raw token counts, no page alignment)
+    log_l1_hit_tokens: int = 0
+    log_l2_hit_tokens: int = 0
+    log_l3_hit_tokens: int = 0
+    log_miss_tokens: int = 0
+
     @classmethod
     def from_adder(
         cls,
@@ -71,6 +77,10 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+            log_l1_hit_tokens=adder.log_l1_hit_tokens,
+            log_l2_hit_tokens=adder.log_l2_hit_tokens,
+            log_l3_hit_tokens=adder.log_l3_hit_tokens,
+            log_miss_tokens=adder.log_miss_tokens,
         )
 
 
@@ -301,6 +311,11 @@ class SchedulerMetricsMixin:
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
             self.stats.full_token_usage = full_token_usage
+            if self.max_total_num_tokens > 0:
+                avail = self.token_to_kv_pool_allocator.available_size()
+                self.stats.gpu_kv_cache_occupancy = (
+                    1.0 - avail / self.max_total_num_tokens
+                )
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
@@ -312,6 +327,12 @@ class SchedulerMetricsMixin:
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            # Per-tier cache hit tokens (for Counter increment)
+            self.stats.l1_hit_tokens = prefill_stats.log_l1_hit_tokens
+            self.stats.l2_hit_tokens = prefill_stats.log_l2_hit_tokens
+            self.stats.l3_hit_tokens = prefill_stats.log_l3_hit_tokens
+            self.stats.cache_miss_tokens = prefill_stats.log_miss_tokens
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
@@ -505,6 +526,11 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             # usage of full attention
             self.stats.full_token_usage = full_token_usage
+            if self.max_total_num_tokens > 0:
+                avail = self.token_to_kv_pool_allocator.available_size()
+                self.stats.gpu_kv_cache_occupancy = (
+                    1.0 - avail / self.max_total_num_tokens
+                )
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:

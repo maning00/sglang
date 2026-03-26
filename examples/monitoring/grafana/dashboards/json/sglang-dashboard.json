@@ -801,7 +801,10 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
         },
         "overrides": []
       },
@@ -832,36 +835,53 @@
             "default": true,
             "type": "prometheus"
           },
-          "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "avg without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (sglang:cache_hit_rate{instance=~\"$instance\",model_name=~\"$model_name\"})",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
+          "expr": "(sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "Total(avg)",
+          "legendFormat": "总命中率 (L1+L2+L3)",
           "range": true,
-          "refId": "A",
-          "useBackend": false
+          "refId": "A"
         },
         {
           "datasource": {
             "default": true,
             "type": "prometheus"
           },
-          "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "avg by (dp_rank) (sglang:cache_hit_rate{instance=~\"$instance\",model_name=~\"$model_name\"})",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "dp_rank={{dp_rank}}",
+          "legendFormat": "L1 命中率 (GPU)",
           "range": true,
-          "refId": "B",
-          "useBackend": false
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "instant": false,
+          "legendFormat": "L2 命中率 (Host DRAM)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "instant": false,
+          "legendFormat": "L3 命中率 (Storage)",
+          "range": true,
+          "refId": "D"
         }
       ],
-      "title": "Cache Hit Rate",
-      "type": "timeseries"
+      "title": "Cache Hit Rate (分层)",
+      "type": "timeseries",
+      "description": "分层 Cache 命中率。总命中率 = (L1+L2+L3) / (L1+L2+L3+Miss)。各层占比使用无 page 对齐的原始 token 数。"
     },
     {
       "datasource": {
@@ -1186,7 +1206,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L3 存储层预取与回写速率（logical KV bytes/s）：预取 (L3→Host DRAM)，回写 (Host DRAM→L3)。对应 token 指标保留为对照：prefetched_tokens_total / backuped_tokens_total。",
+      "description": "L3 存储层预取与回写速率（tokens/s）：预取 (L3→Host DRAM)，回写 (Host DRAM→L3)。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1196,6 +1216,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
+            "axisLabel": "tokens/s",
             "axisPlacement": "auto",
             "drawStyle": "line",
             "fillOpacity": 0,
@@ -1222,7 +1243,7 @@
             }
           },
           "mappings": [],
-          "unit": "binBps",
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -1265,7 +1286,7 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(sglang:prefetched_bytes_total{instance=~\"$instance\"}[$__rate_interval])",
+          "expr": "rate(sglang:prefetched_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "预取 L3→Host",
           "range": true,
@@ -1277,7 +1298,7 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(sglang:backuped_bytes_total{instance=~\"$instance\"}[$__rate_interval])",
+          "expr": "rate(sglang:backuped_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "回写 Host→L3",
           "range": true,
@@ -1292,7 +1313,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L1 (GPU) KV cache 淘汰与加载回速率（logical KV bytes/s）：淘汰（无 HiCache 时丢弃，有 HiCache 时写入 L2），以及从 L2 (Host) 加载回 GPU。对应 token 指标保留为对照：evicted_tokens_total / load_back_tokens_total。",
+      "description": "L1 (GPU) KV cache 淘汰与加载回速率（tokens/s）：淘汰（无 HiCache 时丢弃，有 HiCache 时写入 L2），以及从 L2 (Host) 加载回 GPU。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1302,6 +1323,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
+            "axisLabel": "tokens/s",
             "axisPlacement": "auto",
             "drawStyle": "line",
             "fillOpacity": 0,
@@ -1328,7 +1350,7 @@
             }
           },
           "mappings": [],
-          "unit": "binBps",
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -1371,9 +1393,9 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(sglang:evicted_bytes_total{instance=~\"$instance\"}[$__rate_interval])",
+          "expr": "rate(sglang:evicted_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "L1→L2 淘汰",
+          "legendFormat": "L1 淘汰 (total)",
           "range": true,
           "refId": "A"
         },
@@ -1383,7 +1405,31 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(sglang:load_back_bytes_total{instance=~\"$instance\"}[$__rate_interval])",
+          "expr": "rate(sglang:evicted_backuped_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
+          "instant": false,
+          "legendFormat": "L1 淘汰-backuped (数据留L2)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(sglang:evicted_regular_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
+          "instant": false,
+          "legendFormat": "L1 淘汰-regular (直接删除)",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(sglang:load_back_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "L2→L1 加载回 GPU",
           "range": true,
@@ -1478,7 +1524,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:cached_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "命中 tokens/s",
+          "legendFormat": "命中 tokens/s ({{cache_source}})",
           "range": true,
           "refId": "A"
         }
@@ -1572,11 +1618,11 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "avg without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (sglang:token_usage{instance=~\"$instance\",model_name=~\"$model_name\",engine_type=~\"decode|unified\"})",
+          "expr": "avg without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (sglang:gpu_kv_cache_occupancy{instance=~\"$instance\",model_name=~\"$model_name\",engine_type=~\"decode|unified\"})",
           "instant": false,
-          "legendFormat": "Total(avg)",
+          "legendFormat": "L1 占用率 (locked+cached)",
           "range": true,
-          "refId": "A"
+          "refId": "C"
         },
         {
           "datasource": {
@@ -1584,11 +1630,11 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "avg by (dp_rank) (sglang:token_usage{instance=~\"$instance\",model_name=~\"$model_name\",engine_type=~\"decode|unified\"})",
+          "expr": "avg without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (sglang:token_usage{instance=~\"$instance\",model_name=~\"$model_name\",engine_type=~\"decode|unified\"})",
           "instant": false,
-          "legendFormat": "dp_rank={{dp_rank}}",
+          "legendFormat": "L1 锁定率 (locked only)",
           "range": true,
-          "refId": "B"
+          "refId": "A"
         }
       ],
       "title": "GPU KV Cache 使用率",
@@ -1599,7 +1645,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L1→L2 单次淘汰带宽分布（logical KV bytes / 单次淘汰耗时），单位 GB/s。",
+      "description": "L1→L2 PCIe 写入带宽分布（logical KV bytes / CUDA event 耗时），单位 GB/s。反映 GPU→Host 真实传输速率。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1721,7 +1767,7 @@
           "refId": "D"
         }
       ],
-      "title": "HiCache L1→L2 单次淘汰带宽 (GB/s)",
+      "title": "HiCache L1→L2 PCIe 写入带宽 (GB/s)",
       "type": "timeseries"
     },
     {
@@ -1729,7 +1775,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L2→L1 单次加载回带宽分布（logical KV bytes / 单次加载回耗时），单位 GB/s。",
+      "description": "L2→L1 PCIe 加载带宽分布（logical KV bytes / CUDA event 耗时），单位 GB/s。反映 Host→GPU 真实传输速率。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1851,7 +1897,116 @@
           "refId": "D"
         }
       ],
-      "title": "HiCache L2→L1 单次加载回带宽 (GB/s)",
+      "title": "HiCache L2→L1 PCIe 加载带宽 (GB/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "L3 Storage 读写带宽。Write = Host→Storage (backup)，Read = Storage→Host (prefetch)。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:backuped_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "Write (Host→Storage)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetched_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "Read (Storage→Host)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "HiCache L3 Storage 读写带宽",
       "type": "timeseries"
     }
   ],

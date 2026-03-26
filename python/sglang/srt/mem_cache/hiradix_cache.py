@@ -680,8 +680,16 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                for (
+                    start_event,
+                    finish_event,
+                    ack_list,
+                    num_tokens,
+                ) in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
+                    self._observe_pcie_bandwidth(
+                        start_event, finish_event, num_tokens, is_write=True
+                    )
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         if self.enable_storage:
@@ -695,7 +703,12 @@ class HiRadixCache(RadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+        for (
+            _,
+            finish_event,
+            _ack_list,
+            _num_tokens,
+        ) in self.cache_controller.ack_write_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -710,8 +723,13 @@ class HiRadixCache(RadixCache):
 
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            start_event, finish_event, ack_list, num_tokens = (
+                self.cache_controller.ack_write_queue.pop(0)
+            )
             finish_event.synchronize()
+            self._observe_pcie_bandwidth(
+                start_event, finish_event, num_tokens, is_write=True
+            )
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
@@ -721,11 +739,19 @@ class HiRadixCache(RadixCache):
 
     def loading_check(self):
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+        for (
+            start_event,
+            finish_event,
+            ack_list,
+            num_tokens,
+        ) in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
+            self._observe_pcie_bandwidth(
+                start_event, finish_event, num_tokens, is_write=False
+            )
             # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
@@ -835,6 +861,22 @@ class HiRadixCache(RadixCache):
         duration_seconds = max(duration_seconds, 1e-9)
         return float(num_bytes) / duration_seconds / float(1024**3)
 
+    def _observe_pcie_bandwidth(
+        self, start_event, finish_event, num_tokens: int, is_write: bool
+    ) -> None:
+        """Compute real PCIe bandwidth from CUDA event timing and observe."""
+        if self.metrics_collector is None or num_tokens <= 0:
+            return
+        elapsed_ms = start_event.elapsed_time(finish_event)
+        if elapsed_ms <= 0:
+            return
+        transferred_bytes = self._tokens_to_logical_bytes(num_tokens)
+        bandwidth_gb_s = transferred_bytes / (elapsed_ms * 1e-3) / float(1 << 30)
+        if is_write:
+            self.metrics_collector.observe_eviction_bandwidth_gb_s(bandwidth_gb_s)
+        else:
+            self.metrics_collector.observe_load_back_bandwidth_gb_s(bandwidth_gb_s)
+
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -896,6 +938,8 @@ class HiRadixCache(RadixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        num_evicted_backuped = 0
+        num_evicted_regular = 0
         write_back_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -906,7 +950,9 @@ class HiRadixCache(RadixCache):
             if self._is_pinned(x):
                 # Still active: demote to host if possible
                 if x.backuped:
-                    num_evicted += self._evict_backuped(x)
+                    n = self._evict_backuped(x)
+                    num_evicted += n
+                    num_evicted_backuped += n
                     continue
                 written = self.write_backup(x, write_back=True)
                 if written > 0:
@@ -929,9 +975,13 @@ class HiRadixCache(RadixCache):
                     num_evicted += self.write_backup(x, write_back=True)
                     write_back_nodes.append(x)
                 else:
-                    num_evicted += self._evict_regular(x)
+                    n = self._evict_regular(x)
+                    num_evicted += n
+                    num_evicted_regular += n
             else:
-                num_evicted += self._evict_backuped(x)
+                n = self._evict_backuped(x)
+                num_evicted += n
+                num_evicted_backuped += n
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -947,15 +997,23 @@ class HiRadixCache(RadixCache):
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
-                self._evict_backuped(node)
+                n = self._evict_backuped(node)
+                num_evicted_backuped += n
 
         self.update_eviction_metrics(num_evicted, start_time)
         if self.metrics_collector is not None and num_evicted > 0:
             evicted_bytes = self._tokens_to_logical_bytes(num_evicted)
             self.metrics_collector.increment_eviction_num_bytes(evicted_bytes)
-            self.metrics_collector.observe_eviction_bandwidth_gb_s(
-                self._to_gb_per_second(evicted_bytes, time.perf_counter() - start_time)
-            )
+            # NOTE: eviction_bandwidth is now measured in writing_check()
+            # via CUDA event timing for accurate PCIe bandwidth.
+            if num_evicted_backuped > 0:
+                self.metrics_collector.increment_evicted_backuped_tokens(
+                    num_evicted_backuped
+                )
+            if num_evicted_regular > 0:
+                self.metrics_collector.increment_evicted_regular_tokens(
+                    num_evicted_regular
+                )
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
@@ -1084,13 +1142,13 @@ class HiRadixCache(RadixCache):
 
         if self.metrics_collector is not None:
             elapsed_seconds = time.perf_counter() - start_time
-            loaded_bytes = self._tokens_to_logical_bytes(len(device_indices))
             self.metrics_collector.observe_load_back_duration(elapsed_seconds)
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
-            self.metrics_collector.increment_load_back_num_bytes(loaded_bytes)
-            self.metrics_collector.observe_load_back_bandwidth_gb_s(
-                self._to_gb_per_second(loaded_bytes, elapsed_seconds)
+            self.metrics_collector.increment_load_back_num_bytes(
+                self._tokens_to_logical_bytes(len(device_indices))
             )
+            # NOTE: load_back_bandwidth is now measured in loading_check()
+            # via CUDA event timing for accurate PCIe bandwidth.
 
         return device_indices
 

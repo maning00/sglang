@@ -7,6 +7,7 @@ Follows the same pattern as MooncakeStore:
 """
 
 import logging
+import os
 from typing import Any, List, Optional
 
 import torch
@@ -23,15 +24,20 @@ logger = logging.getLogger(__name__)
 
 def _import_umbp_client():
     """Import UMBPClient from mori.umbp (requires mori built with BUILD_UMBP=ON)."""
-    import mori.umbp as umbp_mod
-
-    UMBPClient = umbp_mod.UMBPClient
-    UMBPConfig = umbp_mod.UMBPConfig
-    UMBPRole = umbp_mod.UMBPRole
-    UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
-    UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
+    from mori.umbp import (
+        UMBPClient,
+        UMBPConfig,
+        UMBPDurabilityMode,
+        UMBPIoBackend,
+        UMBPRole,
+    )
 
     return UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode
+
+
+def _optional_env_int(name: str) -> Optional[int]:
+    value = os.getenv(name)
+    return int(value) if value is not None else None
 
 
 class UMBPStore(HiCacheStorage):
@@ -49,10 +55,24 @@ class UMBPStore(HiCacheStorage):
             _import_umbp_client()
         )
 
-        cfg = UMBPConfig()
+        cfg = UMBPConfig.from_environment()
+        # UMBPStore owns role selection explicitly. Do not inherit LOCAL_RANK /
+        # UMBP_ROLE-based multi-process defaults from mori here, otherwise
+        # ordinary multi-rank sglang runs can accidentally become follower-only
+        # and skip writes.
+        cfg.role = UMBPRole.Standalone
+        extra = getattr(storage_config, "extra_config", None) or {}
+        explicit_tenant_id = (
+            os.getenv("UMBP_SPDK_PROXY_TENANT_ID") is not None
+            or "spdk_proxy_tenant_id" in extra
+        )
+        tenant_id_base = (
+            int(extra["spdk_proxy_tenant_id_base"])
+            if "spdk_proxy_tenant_id_base" in extra
+            else _optional_env_int("UMBP_SPDK_PROXY_TENANT_ID_BASE")
+        )
 
         # Load settings from extra_config if available
-        extra = getattr(storage_config, "extra_config", None) or {}
         if "dram_capacity_bytes" in extra:
             cfg.dram.capacity_bytes = int(extra["dram_capacity_bytes"])
         if "ssd_enabled" in extra:
@@ -95,6 +115,48 @@ class UMBPStore(HiCacheStorage):
                 cfg.ssd.durability.mode = UMBPDurabilityMode.Strict
             elif durability in ("relaxed", "async"):
                 cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
+        if "ssd_backend" in extra:
+            ssd_backend = str(extra["ssd_backend"]).strip().lower()
+            if ssd_backend not in ("posix", "spdk", "spdk_proxy"):
+                raise ValueError(
+                    "extra_config['ssd_backend'] must be one of: "
+                    "posix, spdk, spdk_proxy"
+                )
+            cfg.ssd_backend = ssd_backend
+        if "spdk_nvme_pci_addr" in extra:
+            cfg.spdk_nvme_pci_addr = str(extra["spdk_nvme_pci_addr"])
+        if "spdk_proxy_shm_name" in extra:
+            cfg.spdk_proxy_shm_name = str(extra["spdk_proxy_shm_name"])
+        if "spdk_proxy_startup_timeout_ms" in extra:
+            cfg.spdk_proxy_startup_timeout_ms = int(
+                extra["spdk_proxy_startup_timeout_ms"]
+            )
+        if "spdk_proxy_bin" in extra:
+            cfg.spdk_proxy_bin = str(extra["spdk_proxy_bin"])
+        if "spdk_proxy_tenant_id" in extra:
+            cfg.spdk_proxy_tenant_id = int(extra["spdk_proxy_tenant_id"])
+        if "spdk_proxy_tenant_quota_bytes" in extra:
+            cfg.spdk_proxy_tenant_quota_bytes = int(
+                extra["spdk_proxy_tenant_quota_bytes"]
+            )
+        if "spdk_proxy_max_channels" in extra:
+            cfg.spdk_proxy_max_channels = int(extra["spdk_proxy_max_channels"])
+        if "spdk_proxy_data_per_channel_mb" in extra:
+            cfg.spdk_proxy_data_per_channel_mb = int(
+                extra["spdk_proxy_data_per_channel_mb"]
+            )
+        if "spdk_proxy_auto_start" in extra:
+            cfg.spdk_proxy_auto_start = bool(extra["spdk_proxy_auto_start"])
+        if "spdk_proxy_idle_exit_timeout_ms" in extra:
+            cfg.spdk_proxy_idle_exit_timeout_ms = int(
+                extra["spdk_proxy_idle_exit_timeout_ms"]
+            )
+        if "spdk_proxy_allow_borrow" in extra:
+            cfg.spdk_proxy_allow_borrow = bool(extra["spdk_proxy_allow_borrow"])
+        if "spdk_proxy_reserved_shared_bytes" in extra:
+            cfg.spdk_proxy_reserved_shared_bytes = int(
+                extra["spdk_proxy_reserved_shared_bytes"]
+            )
 
         self.storage_config = storage_config
 
@@ -113,45 +175,111 @@ class UMBPStore(HiCacheStorage):
         # MLA + TP > 1: shared SSD mode
         self.is_mla_follower = False
         tp_size = getattr(storage_config, "tp_size", 1) if storage_config else 1
+        use_spdk = cfg.ssd_backend in ("spdk", "spdk_proxy")
         if self.is_mla_backend and tp_size > 1:
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
-                if UMBPRole is not None and hasattr(cfg, "role"):
-                    cfg.role = UMBPRole.SharedSSDLeader
-                cfg.force_ssd_copy_on_write = True
+                cfg.role = UMBPRole.SharedSSDLeader
             else:
-                # Follower: read-only, SSD filesystem fallback.
-                if UMBPRole is not None and hasattr(cfg, "role"):
-                    cfg.role = UMBPRole.SharedSSDFollower
-                cfg.follower_mode = True
+                # Follower: read-only access.
+                cfg.role = UMBPRole.SharedSSDFollower
                 self.is_mla_follower = True
+                # SPDK: follower must use the proxy path rather than direct
+                # SpdkSsdTier.  Give a longer startup timeout so followers can
+                # wait for the shared proxy service to become READY.
+                if use_spdk:
+                    cfg.ssd_backend = "spdk_proxy"
+                    if cfg.spdk_proxy_startup_timeout_ms < 60000:
+                        cfg.spdk_proxy_startup_timeout_ms = 60000
             logger.info(
-                "UMBPStore MLA+TP>1: rank=%d, role=%s, shared_ssd=%s",
+                "UMBPStore MLA+TP>1: rank=%d, role=%s, ssd_backend=%s, shared_ssd=%s",
                 self.local_rank,
                 "leader" if self.local_rank == 0 else "follower",
+                cfg.ssd_backend,
                 cfg.ssd.storage_dir,
             )
 
         try:
             from sglang.srt.layers.dp_attention import (
                 get_attention_dp_rank,
+                get_attention_dp_size,
                 is_dp_attention_enabled,
             )
 
             if is_dp_attention_enabled():
                 dp_rank = get_attention_dp_rank()
-                if dp_rank > 0 and cfg.ssd.enabled:
-                    cfg.ssd.storage_dir = f"{cfg.ssd.storage_dir}/dp{dp_rank}"
-                    logger.info(
-                        "UMBPStore DP isolation: dp_rank=%d, ssd_dir=%s",
-                        dp_rank,
-                        cfg.ssd.storage_dir,
-                    )
+                dp_size = get_attention_dp_size()
+                if cfg.ssd.enabled:
+                    if cfg.ssd_backend in ("spdk", "spdk_proxy"):
+                        # DP + SPDK must always use the proxy service path.
+                        # Direct SpdkSsdTier is single-process and cannot
+                        # provide tenant isolation across DP ranks.
+                        cfg.ssd_backend = "spdk_proxy"
+                        if cfg.spdk_proxy_startup_timeout_ms < 60000:
+                            cfg.spdk_proxy_startup_timeout_ms = 60000
+                        if tenant_id_base is not None:
+                            cfg.spdk_proxy_tenant_id = tenant_id_base + dp_rank
+                        elif not explicit_tenant_id:
+                            cfg.spdk_proxy_tenant_id = dp_rank
+                        elif dp_size > 1:
+                            logger.warning(
+                                "UMBPStore DP isolation: using explicit fixed tenant_id=%s "
+                                "with dp_size=%d; all DP groups will share one tenant "
+                                "unless you set spdk_proxy_tenant_id_base",
+                                cfg.spdk_proxy_tenant_id,
+                                dp_size,
+                            )
+                        if cfg.spdk_proxy_tenant_quota_bytes <= 0 and dp_size > 1:
+                            # Reserve 5% headroom for offset allocator bin
+                            # rounding (small-float bins round up each
+                            # allocation by up to ~12.5%).
+                            safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
+                            cfg.spdk_proxy_tenant_quota_bytes = max(
+                                1, safe_cap // dp_size
+                            )
+                        # Validate: total tenant quotas must fit within SSD
+                        # capacity after allocator rounding.
+                        if dp_size > 1:
+                            total_quota = cfg.spdk_proxy_tenant_quota_bytes * dp_size
+                            if total_quota > cfg.ssd.capacity_bytes:
+                                old_quota = cfg.spdk_proxy_tenant_quota_bytes
+                                safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
+                                cfg.spdk_proxy_tenant_quota_bytes = max(
+                                    1, safe_cap // dp_size
+                                )
+                                logger.warning(
+                                    "UMBPStore: tenant_quota_bytes=%d × dp_size=%d = %d "
+                                    "exceeds ssd_capacity=%d. Reduced to %d to "
+                                    "avoid SPDK proxy NO_SPACE. Consider "
+                                    "increasing UMBP_SSD_BYTES.",
+                                    old_quota,
+                                    dp_size,
+                                    total_quota,
+                                    cfg.ssd.capacity_bytes,
+                                    cfg.spdk_proxy_tenant_quota_bytes,
+                                )
+                        logger.info(
+                            "UMBPStore DP isolation: dp_rank=%d, dp_size=%d, tenant_id=%s, tenant_quota_bytes=%s",
+                            dp_rank,
+                            dp_size,
+                            getattr(cfg, "spdk_proxy_tenant_id", "n/a"),
+                            getattr(cfg, "spdk_proxy_tenant_quota_bytes", "n/a"),
+                        )
+                    else:
+                        cfg.ssd.storage_dir = f"{cfg.ssd.storage_dir}/dp{dp_rank}"
+                        logger.info(
+                            "UMBPStore DP isolation: dp_rank=%d, dp_size=%d, ssd_dir=%s",
+                            dp_rank,
+                            dp_size,
+                            cfg.ssd.storage_dir,
+                        )
         except (ImportError, AssertionError):
             pass
 
         self.client = UMBPClient(cfg)
+        if mem_pool_host is not None:
+            self.register_mem_pool_host(mem_pool_host)
 
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:
@@ -172,11 +300,12 @@ class UMBPStore(HiCacheStorage):
                 self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
         logger.info(
-            "UMBPStore initialized: dram=%d MB, ssd=%s, mla=%s, rank=%d",
+            "UMBPStore initialized: dram=%d MB, ssd=%s, mla=%s, rank=%d, ssd_backend=%s",
             cfg.dram.capacity_bytes // (1024 * 1024),
             cfg.ssd.enabled,
             self.is_mla_backend,
             self.local_rank,
+            cfg.ssd_backend,
         )
 
     # ------------------------------------------------------------------
@@ -390,7 +519,9 @@ class UMBPStore(HiCacheStorage):
             return 0
         assert len(keys) == len(target_locations) == len(target_sizes)
         results = self.client.batch_get_into_ptr(
-            keys, list(target_locations), list(target_sizes)
+            keys,
+            list(target_locations),
+            list(target_sizes),
         )
         for i, ok in enumerate(results):
             if not ok:
@@ -423,7 +554,9 @@ class UMBPStore(HiCacheStorage):
             return True
         assert len(keys) == len(target_locations) == len(target_sizes)
         results = self.client.batch_put_from_ptr(
-            keys, list(target_locations), list(target_sizes)
+            keys,
+            list(target_locations),
+            list(target_sizes),
         )
         return all(results)
 
