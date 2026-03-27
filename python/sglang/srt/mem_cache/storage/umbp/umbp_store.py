@@ -8,6 +8,7 @@ Follows the same pattern as MooncakeStore:
 
 import logging
 import os
+import socket
 from typing import Any, List, Optional
 
 import torch
@@ -24,20 +25,75 @@ logger = logging.getLogger(__name__)
 
 def _import_umbp_client():
     """Import UMBPClient from mori.umbp (requires mori built with BUILD_UMBP=ON)."""
-    from mori.umbp import (
+    import mori.umbp as umbp_mod
+
+    UMBPClient = umbp_mod.UMBPClient
+    UMBPConfig = umbp_mod.UMBPConfig
+    UMBPRole = umbp_mod.UMBPRole
+    UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
+    UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
+    UMBPDistributedConfig = getattr(umbp_mod, "UMBPDistributedConfig", None)
+
+    return (
         UMBPClient,
         UMBPConfig,
-        UMBPDurabilityMode,
-        UMBPIoBackend,
         UMBPRole,
+        UMBPIoBackend,
+        UMBPDurabilityMode,
+        UMBPDistributedConfig,
     )
-
-    return UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode
 
 
 def _optional_env_int(name: str) -> Optional[int]:
     value = os.getenv(name)
     return int(value) if value is not None else None
+
+
+def _optional_env_str(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    return value if value is not None and value != "" else None
+
+
+def _bool_from_any(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _default_node_address() -> str:
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "127.0.0.1"
+
+
+def _select_rank_config_value(
+    value: Any,
+    rank_index: int,
+    field_name: str,
+    cast_type,
+    auto_increment_scalar: bool = False,
+):
+    if value is None:
+        raise ValueError(f"{field_name} must not be None")
+
+    candidates = value
+    if isinstance(value, str) and "," in value:
+        candidates = [item.strip() for item in value.split(",") if item.strip()]
+
+    if isinstance(candidates, (list, tuple)):
+        if not candidates:
+            raise ValueError(f"{field_name} must not be empty")
+        if rank_index >= len(candidates):
+            raise ValueError(
+                f"{field_name} has {len(candidates)} entries, but rank_index={rank_index}"
+            )
+        return cast_type(candidates[rank_index])
+
+    selected = cast_type(candidates)
+    if auto_increment_scalar:
+        selected = cast_type(selected + rank_index)
+    return selected
 
 
 class UMBPStore(HiCacheStorage):
@@ -51,9 +107,27 @@ class UMBPStore(HiCacheStorage):
         storage_config: HiCacheStorageConfig = None,
         mem_pool_host: HostKVCache = None,
     ):
-        UMBPClient, UMBPConfig, UMBPRole, UMBPIoBackend, UMBPDurabilityMode = (
-            _import_umbp_client()
-        )
+        (
+            UMBPClient,
+            UMBPConfig,
+            UMBPRole,
+            UMBPIoBackend,
+            UMBPDurabilityMode,
+            UMBPDistributedConfig,
+        ) = _import_umbp_client()
+
+        if storage_config is not None:
+            self.is_mla_backend = storage_config.is_mla_model
+            self.local_rank = storage_config.tp_rank
+            self.pp_rank = storage_config.pp_rank
+            self.pp_size = storage_config.pp_size
+            self.tp_size = storage_config.tp_size
+        else:
+            self.is_mla_backend = False
+            self.local_rank = 0
+            self.pp_rank = 0
+            self.pp_size = 1
+            self.tp_size = 1
 
         cfg = UMBPConfig.from_environment()
         # UMBPStore owns role selection explicitly. Do not inherit LOCAL_RANK /
@@ -71,6 +145,31 @@ class UMBPStore(HiCacheStorage):
             if "spdk_proxy_tenant_id_base" in extra
             else _optional_env_int("UMBP_SPDK_PROXY_TENANT_ID_BASE")
         )
+        dp_rank_hint = _optional_env_int("SGLANG_DP_RANK")
+        dp_size_hint = _optional_env_int("SGLANG_DP_SIZE")
+        local_rank_hint = _optional_env_int("LOCAL_RANK")
+
+        if dp_rank_hint is None:
+            try:
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_dp_rank,
+                    get_attention_dp_size,
+                    is_dp_attention_enabled,
+                )
+
+                if is_dp_attention_enabled():
+                    dp_rank_hint = get_attention_dp_rank()
+                    dp_size_hint = get_attention_dp_size()
+            except (ImportError, AssertionError):
+                pass
+
+        if local_rank_hint is not None:
+            unique_rank = local_rank_hint
+        else:
+            base_rank = dp_rank_hint if dp_rank_hint is not None else 0
+            unique_rank = ((base_rank * max(self.pp_size, 1)) + self.pp_rank) * max(
+                self.tp_size, 1
+            ) + self.local_rank
 
         # Load settings from extra_config if available
         if "dram_capacity_bytes" in extra:
@@ -158,23 +257,105 @@ class UMBPStore(HiCacheStorage):
                 extra["spdk_proxy_reserved_shared_bytes"]
             )
 
-        self.storage_config = storage_config
+        master_address = extra.get("master_address", _optional_env_str("UMBP_MASTER_ADDRESS"))
+        if master_address and UMBPDistributedConfig is not None:
+            dist_cfg = UMBPDistributedConfig()
+            dist_cfg.master_address = str(master_address)
 
-        # TP/PP rank info for key suffix generation
-        if storage_config is not None:
-            self.is_mla_backend = storage_config.is_mla_model
-            self.local_rank = storage_config.tp_rank
-            self.pp_rank = storage_config.pp_rank
-            self.pp_size = storage_config.pp_size
-        else:
-            self.is_mla_backend = False
-            self.local_rank = 0
-            self.pp_rank = 0
-            self.pp_size = 1
+            node_address = extra.get("node_address", _optional_env_str("UMBP_NODE_ADDRESS"))
+            if node_address is None:
+                node_address = _default_node_address()
+            else:
+                node_address = _select_rank_config_value(
+                    node_address,
+                    unique_rank,
+                    "node_address",
+                    str,
+                )
+            dist_cfg.node_address = node_address
+
+            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
+            if node_id is None:
+                dist_cfg.node_id = (
+                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
+                    f":pp{self.pp_rank}:tp{self.local_rank}"
+                )
+            else:
+                dist_cfg.node_id = _select_rank_config_value(
+                    node_id,
+                    unique_rank,
+                    "node_id",
+                    str,
+                )
+
+            if "auto_heartbeat" in extra:
+                dist_cfg.auto_heartbeat = _bool_from_any(extra["auto_heartbeat"])
+
+            io_engine_host = extra.get(
+                "io_engine_host", _optional_env_str("UMBP_IO_ENGINE_HOST")
+            )
+            if io_engine_host is None:
+                io_engine_host = node_address
+            else:
+                io_engine_host = _select_rank_config_value(
+                    io_engine_host,
+                    unique_rank,
+                    "io_engine_host",
+                    str,
+                )
+            dist_cfg.io_engine_host = io_engine_host
+
+            io_engine_port = extra.get(
+                "io_engine_port", _optional_env_str("UMBP_IO_ENGINE_PORT")
+            )
+            if io_engine_port is not None:
+                dist_cfg.io_engine_port = _select_rank_config_value(
+                    io_engine_port,
+                    unique_rank,
+                    "io_engine_port",
+                    int,
+                    auto_increment_scalar=True,
+                )
+
+            if "staging_buffer_size" in extra:
+                dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
+
+            peer_service_port = extra.get(
+                "peer_service_port", _optional_env_str("UMBP_PEER_SERVICE_PORT")
+            )
+            if peer_service_port is not None:
+                dist_cfg.peer_service_port = _select_rank_config_value(
+                    peer_service_port,
+                    unique_rank,
+                    "peer_service_port",
+                    int,
+                    auto_increment_scalar=True,
+                )
+
+            cache_remote_fetches = extra.get(
+                "cache_remote_fetches",
+                _optional_env_str("UMBP_CACHE_REMOTE_FETCHES"),
+            )
+            if cache_remote_fetches is not None:
+                dist_cfg.cache_remote_fetches = _bool_from_any(cache_remote_fetches)
+
+            cfg.distributed = dist_cfg
+            logger.info(
+                "UMBPStore distributed mode: master=%s, node_id=%s, node_addr=%s, "
+                "io=%s:%s, peer_port=%s",
+                dist_cfg.master_address,
+                dist_cfg.node_id,
+                dist_cfg.node_address,
+                dist_cfg.io_engine_host,
+                dist_cfg.io_engine_port,
+                dist_cfg.peer_service_port,
+            )
+
+        self.storage_config = storage_config
 
         # MLA + TP > 1: shared SSD mode
         self.is_mla_follower = False
-        tp_size = getattr(storage_config, "tp_size", 1) if storage_config else 1
+        tp_size = self.tp_size
         use_spdk = cfg.ssd_backend in ("spdk", "spdk_proxy")
         if self.is_mla_backend and tp_size > 1:
             cfg.ssd.enabled = True
@@ -210,6 +391,8 @@ class UMBPStore(HiCacheStorage):
             if is_dp_attention_enabled():
                 dp_rank = get_attention_dp_rank()
                 dp_size = get_attention_dp_size()
+                dp_rank_hint = dp_rank
+                dp_size_hint = dp_size
                 if cfg.ssd.enabled:
                     if cfg.ssd_backend in ("spdk", "spdk_proxy"):
                         # DP + SPDK must always use the proxy service path.
@@ -276,6 +459,45 @@ class UMBPStore(HiCacheStorage):
                         )
         except (ImportError, AssertionError):
             pass
+
+        if (
+            cfg.ssd.enabled
+            and not self.is_mla_follower
+            and not (self.is_mla_backend and tp_size > 1)
+            and cfg.ssd_backend not in ("spdk", "spdk_proxy")
+        ):
+            rank_dir_parts = []
+            if dp_rank_hint is not None:
+                rank_dir_parts.append(f"dp{dp_rank_hint}")
+            if self.pp_size > 1:
+                rank_dir_parts.append(f"pp{self.pp_rank}")
+            if self.tp_size > 1:
+                rank_dir_parts.append(f"tp{self.local_rank}")
+            if not rank_dir_parts and unique_rank != 0:
+                rank_dir_parts.append(f"rank{unique_rank}")
+            if rank_dir_parts:
+                cfg.ssd.storage_dir = os.path.join(
+                    cfg.ssd.storage_dir, "_".join(rank_dir_parts)
+                )
+                logger.info(
+                    "UMBPStore local SSD isolation: unique_rank=%d, ssd_dir=%s",
+                    unique_rank,
+                    cfg.ssd.storage_dir,
+                )
+
+        if cfg.ssd.enabled and cfg.ssd_backend in ("spdk", "spdk_proxy"):
+            if dp_rank_hint is not None and tenant_id_base is not None:
+                cfg.spdk_proxy_tenant_id = tenant_id_base + dp_rank_hint
+            elif dp_rank_hint is not None and not explicit_tenant_id:
+                cfg.spdk_proxy_tenant_id = dp_rank_hint
+            if (
+                dp_rank_hint is not None
+                and dp_size_hint is not None
+                and cfg.spdk_proxy_tenant_quota_bytes <= 0
+                and dp_size_hint > 1
+            ):
+                safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
+                cfg.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
         self.client = UMBPClient(cfg)
         if mem_pool_host is not None:
@@ -565,3 +787,17 @@ class UMBPStore(HiCacheStorage):
 
     def clear(self) -> None:
         self.client.clear()
+
+    def flush(self) -> bool:
+        if self.client is None or not hasattr(self.client, "flush"):
+            return True
+        return bool(self.client.flush())
+
+    def close(self) -> None:
+        if getattr(self, "client", None) is None:
+            return
+        try:
+            self.flush()
+        except Exception:
+            logger.exception("UMBPStore flush during close failed")
+        self.client = None
