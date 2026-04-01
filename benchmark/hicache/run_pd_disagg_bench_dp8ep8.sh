@@ -515,14 +515,27 @@ launch_pd_server() {
         cmd+=(--nnodes "$NNODES" --node-rank "$NODE_RANK")
     fi
 
-    # Hierarchical cache args
+    # Hierarchical cache / decode offload args
     if bool_is_true "$ENABLE_HICACHE"; then
-        cmd+=(
-            --enable-hierarchical-cache
-            --hicache-size "$HICACHE_SIZE"
-            --hicache-write-policy "$WRITE_POLICY"
-            --hicache-mem-layout page_first
-        )
+        if [[ "$role" == "prefill" ]]; then
+            # Prefill: full hierarchical cache (HiRadixCache)
+            cmd+=(
+                --enable-hierarchical-cache
+                --hicache-size "$HICACHE_SIZE"
+                --hicache-write-policy "$WRITE_POLICY"
+                --hicache-mem-layout page_first
+            )
+        else
+            # Decode: offload KV to host/storage via offload manager
+            # (--enable-hierarchical-cache conflicts with decode's disable_radix_cache,
+            #  so we use --disaggregation-decode-enable-offload-kvcache instead.
+            #  The offload manager reads hicache-size/storage-backend from server_args.)
+            cmd+=(
+                --disaggregation-decode-enable-offload-kvcache
+                --hicache-size "$HICACHE_SIZE"
+                --hicache-mem-layout page_first
+            )
+        fi
         if bool_is_true "$ENABLE_UMBP"; then
             local extra_config
             extra_config="$(build_umbp_extra_config)"
@@ -576,6 +589,11 @@ else
 fi
 log "  Cache tier:  $CACHE_LABEL"
 if bool_is_true "$ENABLE_HICACHE"; then
+    if [[ "$PD_ROLE" == "prefill" ]]; then
+        log "  Cache mode:  hierarchical cache (HiRadixCache)"
+    else
+        log "  Cache mode:  decode offload (disaggregation-decode-enable-offload-kvcache)"
+    fi
     log "  L2 size:     ${HICACHE_SIZE} GB/rank"
 fi
 if bool_is_true "$ENABLE_UMBP"; then

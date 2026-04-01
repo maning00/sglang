@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -77,6 +78,16 @@ class DecodeKVCacheOffloadManager:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
+        # Parse JSON string to dict — HiCacheController expects a dict for
+        # storage_backend_extra_config (it calls .pop() on it).
+        storage_extra_config = server_args.hicache_storage_backend_extra_config
+        if isinstance(storage_extra_config, str):
+            storage_extra_config = (
+                json.loads(storage_extra_config) if storage_extra_config else {}
+            )
+        elif storage_extra_config is None:
+            storage_extra_config = {}
+
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
@@ -86,7 +97,7 @@ class DecodeKVCacheOffloadManager:
             load_cache_event=threading.Event(),
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
-            storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            storage_backend_extra_config=storage_extra_config,
         )
 
         self.ongoing_offload = {}
