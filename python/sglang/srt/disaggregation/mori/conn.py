@@ -44,6 +44,14 @@ logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 
 
+def _normalize_state_indices(
+    state_indices,
+) -> Optional[npt.NDArray[np.int32]]:
+    if state_indices is None:
+        return None
+    return np.asarray(state_indices, dtype=np.int32)
+
+
 def _pack_mem_desc_list(mems: List[MemoryDesc]) -> bytes:
     if not mems:
         return b""
@@ -66,6 +74,7 @@ class TransferInfo:
     engine_key: str
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
+    dst_state_indices: npt.NDArray[np.int32]
     required_dst_info_num: int
     is_dummy: bool
 
@@ -86,6 +95,11 @@ class TransferInfo:
         else:
             dst_aux_index = -1
 
+        if len(payload) > 6 and payload[6]:
+            dst_state_indices = np.frombuffer(payload[6], dtype=np.int32)
+        else:
+            dst_state_indices = np.array([], dtype=np.int32)
+
         required_dst_info_num = (
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
         )
@@ -97,6 +111,7 @@ class TransferInfo:
             engine_key=engine_key,
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
+            dst_state_indices=dst_state_indices,
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
         )
@@ -114,6 +129,8 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    dst_state_item_lens: List[int]
+    dst_state_dim_per_tensor: List[int]
 
     @property
     def engine_key(self) -> str:
@@ -131,6 +148,16 @@ class KVArgsRegisterInfo:
         decode_tp_size = int(payload[8].decode("ascii"))
         decode_tp_rank = int(payload[9].decode("ascii"))
         dst_kv_item_len = int(payload[10].decode("ascii"))
+        dst_state_item_lens = (
+            list(struct.unpack(f"{len(payload[11]) // 4}I", payload[11]))
+            if len(payload) > 11 and len(payload[11]) > 0
+            else []
+        )
+        dst_state_dim_per_tensor = (
+            list(struct.unpack(f"{len(payload[12]) // 4}I", payload[12]))
+            if len(payload) > 12 and len(payload[12]) > 0
+            else []
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -142,6 +169,8 @@ class KVArgsRegisterInfo:
             decode_tp_size=decode_tp_size,
             decode_tp_rank=decode_tp_rank,
             dst_kv_item_len=dst_kv_item_len,
+            dst_state_item_lens=dst_state_item_lens,
+            dst_state_dim_per_tensor=dst_state_dim_per_tensor,
         )
 
 
@@ -739,6 +768,199 @@ class MoriKVManager(CommonKVManager):
 
         return []
 
+    def send_state(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        src_state_indices: npt.NDArray[np.int32],
+        dst_state_indices: npt.NDArray[np.int32],
+    ) -> List[TransferStatus]:
+        # Guard: no local state tensors -> no-op (e.g. SWA layers=0 on this PP rank)
+        if not self.state_mem_descs:
+            return []
+
+        state_type = getattr(self.kv_args, "state_type", "none")
+
+        # Section 8.1 validations
+        if state_type == "none":
+            raise RuntimeError(
+                "PD state transfer failed: state_type is 'none' but state_indices were provided"
+            )
+
+        if not peer_info.dst_state_mem_descs:
+            raise RuntimeError(
+                f"PD state transfer failed: remote peer has no state descriptors "
+                f"(state_type={state_type}, prefill_tp_size={self.attn_tp_size}, "
+                f"decode_tp_size={peer_info.decode_tp_size})"
+            )
+
+        if len(peer_info.dst_state_mem_descs) != len(self.state_mem_descs):
+            raise RuntimeError(
+                f"PD state transfer failed: state descriptor count mismatch "
+                f"(local={len(self.state_mem_descs)}, remote={len(peer_info.dst_state_mem_descs)}), "
+                f"likely PP configuration mismatch (state_type={state_type})"
+            )
+
+        if len(self.kv_args.state_item_lens) != len(self.state_mem_descs):
+            raise RuntimeError(
+                f"PD state transfer failed: local state_item_lens count "
+                f"({len(self.kv_args.state_item_lens)}) does not match state descriptor "
+                f"count ({len(self.state_mem_descs)}) (state_type={state_type})"
+            )
+
+        if state_type == "mamba":
+            return self._send_mamba_state(
+                peer_info, src_state_indices, dst_state_indices
+            )
+        elif state_type in ("swa", "nsa"):
+            return self._send_swa_nsa_state(
+                peer_info, src_state_indices, dst_state_indices, state_type
+            )
+        else:
+            raise RuntimeError(
+                f"PD state transfer failed: unknown state_type={state_type}"
+            )
+
+    def _send_mamba_state(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        src_state_indices: npt.NDArray[np.int32],
+        dst_state_indices: npt.NDArray[np.int32],
+    ) -> List[TransferStatus]:
+        if len(src_state_indices) != 1 or len(dst_state_indices) != 1:
+            raise RuntimeError(
+                f"PD state transfer failed: mamba requires single state index, "
+                f"got src={len(src_state_indices)}, dst={len(dst_state_indices)}"
+            )
+
+        tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
+        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
+        dst_state_dim_per_tensor = peer_info.dst_state_dim_per_tensor
+
+        # If dim info missing, silently degrade to whole-item copy (Mooncake compat)
+        if tp_mismatch and (
+            not src_state_dim_per_tensor or not dst_state_dim_per_tensor
+        ):
+            tp_mismatch = False
+
+        if tp_mismatch:
+            logger.warning_once(
+                "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
+                f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={peer_info.decode_tp_size}. "
+                "Performance may be affected."
+            )
+
+        src_idx = int(src_state_indices[0])
+        dst_idx = int(dst_state_indices[0])
+        statuses = []
+
+        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
+
+        for i in range(len(self.state_mem_descs)):
+            src_desc = self.state_mem_descs[i]
+            dst_desc = peer_info.dst_state_mem_descs[i]
+            src_item_len = self.kv_args.state_item_lens[i]
+
+            if not tp_mismatch:
+                # same-TP: whole item copy
+                src_offset = src_idx * src_item_len
+                dst_offset = dst_idx * src_item_len
+                size = src_item_len
+            else:
+                # TP mismatch slice copy
+                dst_item_len = peer_info.dst_state_item_lens[i]
+                src_dim = src_state_dim_per_tensor[i]
+                dst_dim = dst_state_dim_per_tensor[i]
+
+                src_bytes_per_dim = src_item_len // src_dim
+
+                if self.attn_tp_size > peer_info.decode_tp_size:
+                    src_dim_start = 0
+                    num_dims_to_send = src_dim
+                    writers_per_decode = self.attn_tp_size // peer_info.decode_tp_size
+                    local_writer_idx = local_tp_rank % writers_per_decode
+                    dst_dim_start = local_writer_idx * src_dim
+                else:
+                    src_dim_start = (dst_tp_rank * dst_dim) % src_dim
+                    num_dims_to_send = dst_dim
+                    dst_dim_start = 0
+
+                dst_bytes_per_dim = dst_item_len // dst_dim
+                src_dim_offset = src_dim_start * src_bytes_per_dim
+                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
+                bytes_to_send = num_dims_to_send * src_bytes_per_dim
+
+                src_offset = src_idx * src_item_len + src_dim_offset
+                dst_offset = dst_idx * dst_item_len + dst_dim_offset
+                size = bytes_to_send
+
+            transfer_uid = self.engine.allocate_transfer_uid()
+            batch_statuses = self.engine.batch_write(
+                [src_desc],
+                [[src_offset]],
+                [dst_desc],
+                [[dst_offset]],
+                [[size]],
+                [transfer_uid],
+            )
+            statuses.extend(batch_statuses)
+
+        return statuses
+
+    def _send_swa_nsa_state(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        src_state_indices: npt.NDArray[np.int32],
+        dst_state_indices: npt.NDArray[np.int32],
+        state_type: str,
+    ) -> List[TransferStatus]:
+        # TP mismatch check for non-MLA SWA
+        if (
+            state_type == "swa"
+            and not self.is_mla_backend
+            and peer_info.decode_tp_size != self.attn_tp_size
+        ):
+            raise RuntimeError(
+                f"PD state transfer does not support TP-mismatched non-MLA SWA models "
+                f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
+            )
+
+        # Truncate to common prefix if lengths differ (Mooncake compat)
+        common_len = min(len(src_state_indices), len(dst_state_indices))
+        if common_len == 0 and max(len(src_state_indices), len(dst_state_indices)) > 0:
+            raise RuntimeError(
+                f"No overlapping state indices for state_type={state_type}"
+            )
+        if len(src_state_indices) != len(dst_state_indices):
+            logger.warning(
+                "State index length mismatch for %s: src=%d dst=%d; truncating to common prefix=%d",
+                state_type,
+                len(src_state_indices),
+                len(dst_state_indices),
+                common_len,
+            )
+            src_state_indices = src_state_indices[:common_len]
+            dst_state_indices = dst_state_indices[:common_len]
+
+        # Group contiguous indices and issue per-tensor transfers
+        src_groups, dst_groups = group_concurrent_contiguous(
+            src_state_indices, dst_state_indices
+        )
+
+        statuses = []
+        for i in range(len(self.state_mem_descs)):
+            src_desc = self.state_mem_descs[i]
+            dst_desc = peer_info.dst_state_mem_descs[i]
+            state_item_len = self.kv_args.state_item_lens[i]
+
+            statuses.extend(
+                self._issue_layer_transfers(
+                    src_desc, dst_desc, state_item_len, src_groups, dst_groups
+                )
+            )
+
+        return statuses
+
     def send_aux_data_to_endpoint(
         self,
         remote: str,
@@ -819,6 +1041,16 @@ class MoriKVManager(CommonKVManager):
                     result_statuses.extend(statuses)
                 if (
                     is_last
+                    and state_indices is not None
+                    and not info.is_dummy
+                    and self.state_mem_descs
+                ):
+                    statuses = self.send_state(
+                        peer_info, state_indices, info.dst_state_indices
+                    )
+                    result_statuses.extend(statuses)
+                if (
+                    is_last
                     and aux_index is not None
                     and info.dst_aux_index >= 0
                     and self.pp_group.is_last_rank
@@ -874,12 +1106,14 @@ class MoriKVSender(CommonKVSender):
             else:
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
+        normalized_state = _normalize_state_indices(state_indices) if is_last else None
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
             is_last,
             aux_index=self.aux_index if is_last else None,
+            state_indices=normalized_state,
         )
         self.transfer_statuses.extend(statuses)
         if infos is not None:
@@ -934,8 +1168,8 @@ class MoriKVSender(CommonKVSender):
     def _collect_failure_reason(self) -> str:
         for status in self.transfer_statuses:
             if status.Failed():
-                return f"KV transfer failed: {status.Message()}"
-        return "KV transfer failed due to unknown reason"
+                return f"PD transfer failed: {status.Message()}"
+        return "PD transfer failed due to unknown reason"
 
     def _notify_decode(
         self, status: KVPoll, failure_reason: Optional[str] = None
@@ -1007,6 +1241,14 @@ class MoriKVReceiver(CommonKVReceiver):
         decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
+        packed_state_item_lens = b"".join(
+            struct.pack("I", item_len)
+            for item_len in self.kv_mgr.kv_args.state_item_lens
+        )
+        state_dim_per_tensor = getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", [])
+        packed_state_dim_per_tensor = b"".join(
+            struct.pack("I", dim) for dim in state_dim_per_tensor
+        )
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1025,6 +1267,8 @@ class MoriKVReceiver(CommonKVReceiver):
                         decode_tp_size,
                         decode_tp_rank,
                         kv_item_len,
+                        packed_state_item_lens,
+                        packed_state_dim_per_tensor,
                     ]
                 )
 
@@ -1041,11 +1285,15 @@ class MoriKVReceiver(CommonKVReceiver):
             np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
         )
         aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
-        state_bytes = b""
+        normalized_state = _normalize_state_indices(state_indices)
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info.get("is_dummy", False)
+            if not is_dummy and normalized_state is not None:
+                state_bytes = normalized_state.tobytes()
+            else:
+                state_bytes = b""
             with lock:
                 sock.send_multipart(
                     [
