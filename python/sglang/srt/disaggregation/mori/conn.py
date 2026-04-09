@@ -235,6 +235,7 @@ class MoriKVManager(CommonKVManager):
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[MemoryDesc] = []
         self.transfer_lock = threading.Lock()
+        self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -346,15 +347,21 @@ class MoriKVManager(CommonKVManager):
         super().update_status(bootstrap_room, status)
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
-        """Thread-local ZMQ socket cache. Each worker thread gets its own sockets."""
+        """Thread-local ZMQ socket cache with shared Context.
+
+        Each worker thread gets its own PUSH socket (ZMQ sockets are not
+        thread-safe), but all sockets share a single process-level Context
+        to avoid creating excessive I/O threads and TCP connections.
+        """
         cache = getattr(self._socket_local, "socket_cache", None)
         if cache is None:
             cache = {}
             self._socket_local.socket_cache = cache
         if endpoint not in cache:
-            ctx = zmq.Context()
-            sock = ctx.socket(zmq.PUSH)
+            sock = self._zmq_ctx.socket(zmq.PUSH)
+            sock.setsockopt(zmq.SNDHWM, 0)
             sock.setsockopt(zmq.SNDTIMEO, 5000)
+            sock.setsockopt(zmq.LINGER, 0)
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
             sock.connect(endpoint)
@@ -569,8 +576,13 @@ class MoriKVManager(CommonKVManager):
         try:
             transfer_info = TransferInfo.from_zmq(payload)
             with self.transfer_lock:
+                # Accept metadata when room is not yet created (None) or
+                # in Bootstrapping. Reject for active/terminal states where
+                # the worker may already be using transfer_infos.
+                # None is allowed because metadata can arrive from decode
+                # before the prefill scheduler creates the MoriKVSender.
                 current = self.request_status.get(transfer_info.room)
-                if current != KVPoll.Bootstrapping:
+                if current is not None and current != KVPoll.Bootstrapping:
                     logger.debug(
                         "Ignoring stale transfer info for room %s (status=%s)",
                         transfer_info.room,
@@ -991,24 +1003,29 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
-        prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if not self.aux_mem_descs or not peer_info.dst_aux_mem_descs:
+            return []
 
-        for i in range(len(prefill_aux_ptrs)):
-            length = prefill_aux_item_lens[i]
-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
+        statuses: List[TransferStatus] = []
+        for i in range(len(self.aux_mem_descs)):
+            src_desc = self.aux_mem_descs[i]
+            dst_desc = peer_info.dst_aux_mem_descs[i]
+            item_len = self.kv_args.aux_item_lens[i]
+            src_offset = prefill_aux_index * item_len
+            dst_offset = dst_aux_index * item_len
 
-            self.send_aux_data_to_endpoint(
-                remote=peer_info.endpoint,
-                dst_port=peer_info.dst_port,
-                room=room,
-                buffer_index=i,
-                aux_index=dst_aux_index,
-                data=data,
+            transfer_uid = self.engine.allocate_transfer_uid()
+            batch_statuses = self.engine.batch_write(
+                [src_desc],
+                [[src_offset]],
+                [dst_desc],
+                [[dst_offset]],
+                [[item_len]],
+                [transfer_uid],
             )
+            statuses.extend(batch_statuses)
 
-        return []
+        return statuses
 
     def send_state(
         self,
@@ -1201,31 +1218,8 @@ class MoriKVManager(CommonKVManager):
 
         return statuses
 
-    def send_aux_data_to_endpoint(
-        self,
-        remote: str,
-        dst_port: int,
-        room: int,
-        buffer_index: int,
-        aux_index: int,
-        data: bytes,
-    ):
-        na = NetworkAddress(remote, dst_port)
-        socket = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
-
-        socket.send_multipart(
-            [
-                MoriKVManager.AUX_DATA_HEADER,
-                str(room).encode("ascii"),
-                str(buffer_index).encode("ascii"),
-                str(aux_index).encode("ascii"),
-                struct.pack(">I", len(data)),
-                data,
-            ]
-        )
-
     def _handle_aux_data(self, msg: List[bytes]):
-        """Handle AUX_DATA messages received by the decode thread."""
+        """Handle AUX_DATA messages received by the decode thread (legacy TCP path)."""
         room = int(msg[1].decode("ascii"))
         buffer_index = int(msg[2].decode("ascii"))
         aux_index = int(msg[3].decode("ascii"))
@@ -1238,10 +1232,6 @@ class MoriKVManager(CommonKVManager):
 
         AuxDataCodec.deserialize_data_to_buffer(
             self.kv_args, buffer_index, aux_index, data
-        )
-
-        logger.debug(
-            f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
     def add_transfer_request(
