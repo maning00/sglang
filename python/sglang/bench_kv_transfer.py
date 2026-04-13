@@ -1051,7 +1051,21 @@ def _run_http_server(
     async def chat_completions(request: Request):
         return await generate(request)
 
-    logger.info("Starting HTTP server on %s:%d (mode=%s)", args.host, args.port, mode)
+    @app.on_event("startup")
+    async def on_startup():
+        print(
+            f"\n"
+            f"========================================\n"
+            f"  bench_kv_transfer ({mode}) is ready\n"
+            f"  HTTP:      http://{args.host}:{args.port}\n"
+            f"  TP size:   {tp_size}\n"
+            f"  KV geom:   {args.num_layers}L x {args.head_dim}d x {args.kv_head_num}h ({args.kv_cache_type}, {args.dtype})\n"
+            f"  Pool:      {pool_size:,} tokens\n"
+            f"  Max conc:  {args.max_concurrency}\n"
+            f"========================================\n",
+            flush=True,
+        )
+
     config = uvicorn.Config(
         app,
         host=args.host,
