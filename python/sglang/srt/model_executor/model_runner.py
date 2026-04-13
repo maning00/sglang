@@ -2449,7 +2449,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
-    def _noop_forward(self, forward_batch: ForwardBatch) -> ModelRunnerOutput:
+    def _dummy_forward(self, forward_batch: ForwardBatch) -> ModelRunnerOutput:
         """Skip real computation: fill KV slots with dummy data, return fake logits.
 
         Preserves the full scheduler → KV allocation → RadixCache insert →
@@ -2486,8 +2486,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        if self.server_args.noop_forward:
-            return self._noop_forward(forward_batch)
+        if self.server_args.dummy_forward:
+            return self._dummy_forward(forward_batch)
 
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
