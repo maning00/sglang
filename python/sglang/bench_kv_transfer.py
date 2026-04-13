@@ -1116,6 +1116,10 @@ async def _handle_prefill(
             timeout=60,
         )
         if status == KVPoll.Failed:
+            logger.error(
+                "Prefill room %d: bootstrap failed (input_len=%d)",
+                bootstrap_room, input_len,
+            )
             return JSONResponse({"error": "bootstrap timeout"}, status_code=500)
 
         # Phase 2: Send KV and wait for completion
@@ -1131,6 +1135,9 @@ async def _handle_prefill(
         )
         transfer_ms = (time.perf_counter() - t0) * 1000
 
+    except Exception:
+        logger.exception("Prefill room %d: unexpected error", bootstrap_room)
+        raise
     finally:
         page_allocator.free(kv_indices)
         aux_allocator.free(aux_idx_arr)
@@ -1140,8 +1147,16 @@ async def _handle_prefill(
             sender.clear()
 
     if status == KVPoll.Failed:
+        logger.error(
+            "Prefill room %d: transfer failed after %.1fms (input_len=%d, pages=%d)",
+            bootstrap_room, transfer_ms, input_len, num_pages,
+        )
         return JSONResponse({"error": "transfer failed"}, status_code=500)
 
+    logger.info(
+        "Prefill room %d: OK %.1fms (input_len=%d, pages=%d)",
+        bootstrap_room, transfer_ms, input_len, num_pages,
+    )
     return JSONResponse(
         {
             "text": "",
@@ -1193,6 +1208,10 @@ async def _handle_decode(
             )
 
         if not kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            logger.error(
+                "Decode room %d: cannot reach bootstrap at %s",
+                bootstrap_room, bootstrap_addr,
+            )
             return JSONResponse(
                 {"error": "cannot reach bootstrap"}, status_code=503
             )
@@ -1215,8 +1234,16 @@ async def _handle_decode(
         receiver.clear()
 
         if status == KVPoll.Failed:
+            logger.error(
+                "Decode room %d: transfer failed after %.1fms (input_len=%d, pages=%d)",
+                bootstrap_room, transfer_ms, input_len, num_pages,
+            )
             return JSONResponse({"error": "transfer failed"}, status_code=500)
 
+        logger.info(
+            "Decode room %d: OK %.1fms (input_len=%d, pages=%d)",
+            bootstrap_room, transfer_ms, input_len, num_pages,
+        )
         if is_stream:
             pages_owned = False
             return StreamingResponse(
@@ -1245,6 +1272,9 @@ async def _handle_decode(
                     },
                 }
             )
+    except Exception:
+        logger.exception("Decode room %d: unexpected error", bootstrap_room)
+        raise
     finally:
         if pages_owned:
             page_allocator.free(dst_indices)
