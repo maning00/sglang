@@ -878,11 +878,28 @@ def _nonzero_rank_loop(
                 sender.init(num_kv_indices=num_pages, aux_index=int(aux_idx))
                 poller.add_sender(bootstrap_room, sender, kv_indices)
             elif mode == "decode":
-                kv_manager.try_ensure_parallel_info(bootstrap_addr)
+                if not kv_manager.try_ensure_parallel_info(bootstrap_addr):
+                    logger.error(
+                        "Rank %d: cannot reach bootstrap %s for room %d",
+                        tp_rank, bootstrap_addr, bootstrap_room,
+                    )
+                    page_allocator.free(kv_indices)
+                    aux_allocator.free(np.array([aux_idx], dtype=np.int32))
+                    active_rooms.pop(bootstrap_room, None)
+                    continue
                 receiver = MoriKVReceiver(
                     kv_manager, bootstrap_addr, bootstrap_room
                 )
                 receiver.init(prefill_dp_rank=0)
+                if receiver.conclude_state == KVPoll.Failed:
+                    logger.error(
+                        "Rank %d: receiver init failed for room %d",
+                        tp_rank, bootstrap_room,
+                    )
+                    page_allocator.free(kv_indices)
+                    aux_allocator.free(np.array([aux_idx], dtype=np.int32))
+                    active_rooms.pop(bootstrap_room, None)
+                    continue
                 receiver.send_metadata(
                     kv_indices=kv_indices,
                     aux_index=int(aux_idx),
@@ -1007,7 +1024,7 @@ def _run_http_server(
 
         # Extract bootstrap info injected by Rust router
         bootstrap_host = body.get("bootstrap_host", "")
-        bootstrap_port = body.get("bootstrap_port", args.bootstrap_port)
+        bootstrap_port = body.get("bootstrap_port") or args.bootstrap_port
         bootstrap_room = body.get("bootstrap_room")
 
         if bootstrap_room is None:
