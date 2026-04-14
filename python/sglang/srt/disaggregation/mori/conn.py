@@ -222,13 +222,6 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
-        # Send CPU-resident AUX data via ZMQ TCP instead of RDMA.
-        # Useful when RDMA AUX transfer is unreliable.
-        # Default: false
-        self._send_aux_tcp = os.environ.get("SGLANG_MORI_SEND_AUX_TCP", "").lower() in (
-            "1",
-            "true",
-        )
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
@@ -354,13 +347,6 @@ class MoriKVManager(CommonKVManager):
             sock.connect(endpoint)
             cache[endpoint] = sock
         return cache[endpoint]
-
-    @staticmethod
-    def _collect_status_failure_reason(statuses: List[TransferStatus]) -> str:
-        for s in statuses:
-            if s.Failed():
-                return f"PD transfer failed: {s.Message()}"
-        return "PD transfer failed due to unknown reason"
 
     def _handle_register_message(self, payload: List[bytes]) -> None:
         try:
@@ -729,78 +715,6 @@ class MoriKVManager(CommonKVManager):
         )
         return statuses
 
-    def _batched_layer_transfers(
-        self,
-        src_descs: List[MemoryDesc],
-        dst_descs: List[MemoryDesc],
-        kv_item_len: int,
-        src_groups: List[List[int]],
-        dst_groups: List[List[int]],
-    ) -> List[TransferStatus]:
-        """Issue one batch_write() across all layers (same offsets/sizes per layer)."""
-        if not src_groups or not src_descs:
-            return []
-        local_offsets = [int(g[0]) * kv_item_len for g in src_groups]
-        remote_offsets = [int(g[0]) * kv_item_len for g in dst_groups]
-        sizes = [len(g) * kv_item_len for g in src_groups]
-        num_layers = len(src_descs)
-        all_uids = [self.engine.allocate_transfer_uid() for _ in range(num_layers)]
-        return self.engine.batch_write(
-            list(src_descs),
-            [local_offsets] * num_layers,
-            list(dst_descs),
-            [remote_offsets] * num_layers,
-            [sizes] * num_layers,
-            all_uids,
-        )
-
-    def _batched_tp_slice_transfers(
-        self,
-        src_descs: List[MemoryDesc],
-        dst_descs: List[MemoryDesc],
-        kv_indices: npt.NDArray[np.int32],
-        dst_indices: npt.NDArray[np.int32],
-        tp_cfg: TPSliceConfig,
-    ) -> List[TransferStatus]:
-        """Issue one batch_write() across all layers for TP-mismatch slice transfers."""
-        if kv_indices.size == 0 or dst_indices.size == 0 or not src_descs:
-            return []
-        limit = min(kv_indices.size, dst_indices.size)
-        if not limit:
-            return []
-        src_pages = kv_indices[:limit].astype(np.int64)
-        dst_pages = dst_indices[:limit].astype(np.int64)
-        token_slots = np.arange(tp_cfg.page_size, dtype=np.int64)
-        local_offsets = (
-            (
-                src_pages[:, np.newaxis] * tp_cfg.src_item_len
-                + token_slots * tp_cfg.bytes_per_token_src
-                + tp_cfg.src_head_slice_offset
-            )
-            .flatten()
-            .tolist()
-        )
-        remote_offsets = (
-            (
-                dst_pages[:, np.newaxis] * tp_cfg.dst_item_len
-                + token_slots * tp_cfg.bytes_per_token_dst
-                + tp_cfg.dst_head_slice_offset
-            )
-            .flatten()
-            .tolist()
-        )
-        sizes = [tp_cfg.heads_bytes_per_token_to_send] * (limit * tp_cfg.page_size)
-        num_layers = len(src_descs)
-        all_uids = [self.engine.allocate_transfer_uid() for _ in range(num_layers)]
-        return self.engine.batch_write(
-            list(src_descs),
-            [local_offsets] * num_layers,
-            list(dst_descs),
-            [remote_offsets] * num_layers,
-            [sizes] * num_layers,
-            all_uids,
-        )
-
     def send_kvcache(
         self,
         peer_info: KVArgsRegisterInfo,
@@ -889,37 +803,6 @@ class MoriKVManager(CommonKVManager):
         room: int,
     ) -> List[TransferStatus]:
         return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
-
-    def send_aux_rdma(
-        self,
-        peer_info: KVArgsRegisterInfo,
-        prefill_aux_index: int,
-        dst_aux_index: int,
-        room: int,
-    ) -> List[TransferStatus]:
-        if not self.aux_mem_descs or not peer_info.dst_aux_mem_descs:
-            return []
-
-        statuses: List[TransferStatus] = []
-        for i in range(len(self.aux_mem_descs)):
-            src_desc = self.aux_mem_descs[i]
-            dst_desc = peer_info.dst_aux_mem_descs[i]
-            item_len = self.kv_args.aux_item_lens[i]
-            src_offset = prefill_aux_index * item_len
-            dst_offset = dst_aux_index * item_len
-
-            transfer_uid = self.engine.allocate_transfer_uid()
-            batch_statuses = self.engine.batch_write(
-                [src_desc],
-                [[src_offset]],
-                [dst_desc],
-                [[dst_offset]],
-                [[item_len]],
-                [transfer_uid],
-            )
-            statuses.extend(batch_statuses)
-
-        return statuses
 
     def send_aux_tcp(
         self,
@@ -1229,7 +1112,7 @@ class MoriKVManager(CommonKVManager):
                     and self.pp_group.is_last_rank
                 ):
                     result_statuses.extend(
-                        self.send_aux_tcp(
+                        self.send_aux(
                             peer_info, aux_index, info.dst_aux_index, bootstrap_room
                         )
                     )
