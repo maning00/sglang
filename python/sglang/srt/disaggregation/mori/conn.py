@@ -237,8 +237,21 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
+        # Send CPU-resident AUX data via ZMQ TCP instead of RDMA.
+        # Useful when RDMA AUX transfer is unreliable.
+        # Default: false
+        self._send_aux_tcp = os.environ.get("SGLANG_MORI_SEND_AUX_TCP", "").lower() in (
+            "1",
+            "true",
+        )
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Number of transfer worker threads on the prefill side.
+            # Each worker pulls TransferKVChunk items from its own queue
+            # and issues RDMA (or TCP) transfers independently.
+            # More workers can hide per-transfer latency but increase CPU
+            # and memory usage.
+            # Default: 4
             queue_size = get_int_env_var("SGLANG_MORI_TRANSFER_QUEUE_SIZE", 4)
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(queue_size)
@@ -1017,6 +1030,17 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
+        if self._send_aux_tcp:
+            return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
+        return self.send_aux_rdma(peer_info, prefill_aux_index, dst_aux_index, room)
+
+    def send_aux_rdma(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_aux_index: int,
+        dst_aux_index: int,
+        room: int,
+    ) -> List[TransferStatus]:
         if not self.aux_mem_descs or not peer_info.dst_aux_mem_descs:
             return []
 
@@ -1040,6 +1064,43 @@ class MoriKVManager(CommonKVManager):
             statuses.extend(batch_statuses)
 
         return statuses
+
+    def send_aux_tcp(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_aux_index: int,
+        dst_aux_index: int,
+        room: int,
+    ) -> List[TransferStatus]:
+        for i in range(len(self.kv_args.aux_data_ptrs)):
+            length = self.kv_args.aux_item_lens[i]
+            src_addr = self.kv_args.aux_data_ptrs[i] + length * prefill_aux_index
+            data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
+            self._send_aux_data_to_endpoint(
+                remote=peer_info.endpoint,
+                dst_port=peer_info.dst_port,
+                room=room,
+                buffer_index=i,
+                aux_index=dst_aux_index,
+                data=data,
+            )
+        return []  # TCP path has no TransferStatus to poll
+
+    def _send_aux_data_to_endpoint(
+        self, remote, dst_port, room, buffer_index, aux_index, data
+    ):
+        na = NetworkAddress(remote, dst_port)
+        socket = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
+        socket.send_multipart(
+            [
+                MoriKVManager.AUX_DATA_HEADER,
+                str(room).encode("ascii"),
+                str(buffer_index).encode("ascii"),
+                str(aux_index).encode("ascii"),
+                struct.pack(">I", len(data)),
+                data,
+            ]
+        )
 
     def send_state(
         self,
