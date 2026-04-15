@@ -203,6 +203,48 @@ class TPSliceConfig:
     heads_bytes_per_token_to_send: int
 
 
+@dataclasses.dataclass(frozen=True)
+class GroupedIndexPlan:
+    src_starts: List[int]
+    dst_starts: List[int]
+    counts: List[int]
+
+    @classmethod
+    def from_groups(
+        cls, src_groups: List[List[int]], dst_groups: List[List[int]]
+    ) -> GroupedIndexPlan:
+        if len(src_groups) != len(dst_groups):
+            raise ValueError("Source and destination groups must have the same length")
+        return cls(
+            src_starts=[int(group[0]) for group in src_groups],
+            dst_starts=[int(group[0]) for group in dst_groups],
+            counts=[len(group) for group in src_groups],
+        )
+
+    def materialize(self, item_len: int) -> BatchTransferPlan:
+        return BatchTransferPlan(
+            local_offsets=[start * item_len for start in self.src_starts],
+            remote_offsets=[start * item_len for start in self.dst_starts],
+            sizes=[count * item_len for count in self.counts],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchTransferPlan:
+    local_offsets: List[int]
+    remote_offsets: List[int]
+    sizes: List[int]
+
+    def empty(self) -> bool:
+        return not self.sizes
+
+
+@dataclasses.dataclass(frozen=True)
+class TransferTarget:
+    info: TransferInfo
+    peer_info: KVArgsRegisterInfo
+
+
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -570,31 +612,32 @@ class MoriKVManager(CommonKVManager):
         dst_slice = dst_mem_descs[start_layer:end_layer]
         return src_descs, dst_slice, num_local_layers
 
-    def _issue_layer_transfers(
+    def _submit_batch_transfer_plan(
         self,
         src_desc: MemoryDesc,
         dst_desc: MemoryDesc,
-        kv_item_len: int,
-        src_groups: List[List[int]],
-        dst_groups: List[List[int]],
+        plan: BatchTransferPlan,
     ) -> List[TransferStatus]:
-        if not src_groups:
+        if plan.empty():
             return []
-        local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
-        remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
-        sizes = [len(src_group) * kv_item_len for src_group in src_groups]
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
         statuses = self.engine.batch_write(
             [src_desc],
-            [local_offsets],
+            [plan.local_offsets],
             [dst_desc],
-            [remote_offsets],
-            [sizes],
+            [plan.remote_offsets],
+            [plan.sizes],
             [transfer_uid],
         )
         return statuses
+
+    def _build_contiguous_transfer_plan(
+        self, grouped_plan: GroupedIndexPlan, item_len: int
+    ) -> BatchTransferPlan:
+        # Reuse grouped indices across all layers/tensors that share the same item length.
+        return grouped_plan.materialize(item_len)
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
@@ -654,20 +697,18 @@ class MoriKVManager(CommonKVManager):
             heads_bytes_per_token_to_send=heads_bytes_per_token,
         )
 
-    def _issue_tp_slice_transfers(
+    def _build_tp_slice_transfer_plan(
         self,
-        src_desc: MemoryDesc,
-        dst_desc: MemoryDesc,
         kv_indices: npt.NDArray[np.int32],
         dst_indices: npt.NDArray[np.int32],
         tp_cfg: TPSliceConfig,
-    ) -> List[TransferStatus]:
+    ) -> BatchTransferPlan:
         if kv_indices.size == 0 or dst_indices.size == 0:
-            return []
+            return BatchTransferPlan([], [], [])
 
         limit = min(kv_indices.size, dst_indices.size)
         if not limit:
-            return []
+            return BatchTransferPlan([], [], [])
 
         src_pages = kv_indices[:limit].astype(np.int64)
         dst_pages = dst_indices[:limit].astype(np.int64)
@@ -702,18 +743,13 @@ class MoriKVManager(CommonKVManager):
         sizes = [tp_cfg.heads_bytes_per_token_to_send] * num_transfers
 
         if not local_offsets:
-            return []
+            return BatchTransferPlan([], [], [])
 
-        transfer_uid = self.engine.allocate_transfer_uid()
-        statuses = self.engine.batch_write(
-            [src_desc],
-            [local_offsets],
-            [dst_desc],
-            [remote_offsets],
-            [sizes],
-            [transfer_uid],
+        return BatchTransferPlan(
+            local_offsets=local_offsets,
+            remote_offsets=remote_offsets,
+            sizes=sizes,
         )
-        return statuses
 
     def send_kvcache(
         self,
@@ -721,24 +757,26 @@ class MoriKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[TransferStatus]:
-        src_groups, dst_groups = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(
+                prefill_kv_indices,
+                dst_kv_indices,
+            )
         )
         statuses: List[TransferStatus] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
 
         if self.is_mla_backend:
-            src_descs, dst_descs, layers_current_pp_stage = self._get_mla_mem_desc_slices(
-                peer_info.dst_kv_mem_descs
+            layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
+            src_descs, dst_descs, layers_current_pp_stage = (
+                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
             for layer_id in range(layers_current_pp_stage):
                 statuses.extend(
-                    self._issue_layer_transfers(
+                    self._submit_batch_transfer_plan(
                         src_descs[layer_id],
                         dst_descs[layer_id],
-                        kv_item_len,
-                        src_groups,
-                        dst_groups,
+                        layer_plan,
                     )
                 )
             return statuses
@@ -753,44 +791,40 @@ class MoriKVManager(CommonKVManager):
 
         if peer_info.decode_tp_size != self.attn_tp_size:
             tp_cfg = self._build_tp_slice_config(peer_info)
+            slice_plan = self._build_tp_slice_transfer_plan(
+                prefill_kv_indices, dst_kv_indices, tp_cfg
+            )
             for layer_id in range(layers_current_pp_stage):
                 statuses.extend(
-                    self._issue_tp_slice_transfers(
+                    self._submit_batch_transfer_plan(
                         src_k_descs[layer_id],
                         dst_k_descs[layer_id],
-                        prefill_kv_indices,
-                        dst_kv_indices,
-                        tp_cfg,
+                        slice_plan,
                     )
                 )
                 statuses.extend(
-                    self._issue_tp_slice_transfers(
+                    self._submit_batch_transfer_plan(
                         src_v_descs[layer_id],
                         dst_v_descs[layer_id],
-                        prefill_kv_indices,
-                        dst_kv_indices,
-                        tp_cfg,
+                        slice_plan,
                     )
                 )
             return statuses
 
+        layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
         for layer_id in range(layers_current_pp_stage):
             statuses.extend(
-                self._issue_layer_transfers(
+                self._submit_batch_transfer_plan(
                     src_k_descs[layer_id],
                     dst_k_descs[layer_id],
-                    kv_item_len,
-                    src_groups,
-                    dst_groups,
+                    layer_plan,
                 )
             )
             statuses.extend(
-                self._issue_layer_transfers(
+                self._submit_batch_transfer_plan(
                     src_v_descs[layer_id],
                     dst_v_descs[layer_id],
-                    kv_item_len,
-                    src_groups,
-                    dst_groups,
+                    layer_plan,
                 )
             )
         return statuses
@@ -1014,8 +1048,8 @@ class MoriKVManager(CommonKVManager):
             dst_state_indices = dst_state_indices[:common_len]
 
         # Group contiguous indices and issue per-tensor transfers
-        src_groups, dst_groups = group_concurrent_contiguous(
-            src_state_indices, dst_state_indices
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(src_state_indices, dst_state_indices)
         )
 
         statuses = []
@@ -1025,8 +1059,10 @@ class MoriKVManager(CommonKVManager):
             state_item_len = self.kv_args.state_item_lens[i]
 
             statuses.extend(
-                self._issue_layer_transfers(
-                    src_desc, dst_desc, state_item_len, src_groups, dst_groups
+                self._submit_batch_transfer_plan(
+                    src_desc,
+                    dst_desc,
+                    self._build_contiguous_transfer_plan(grouped_plan, state_item_len),
                 )
             )
 
@@ -1065,27 +1101,33 @@ class MoriKVManager(CommonKVManager):
         ):
             return [], None
 
+        targets: List[TransferTarget] = []
         target_infos_snapshot: Optional[List[TransferInfo]] = None
         with self.transfer_lock:
             transfer_infos = self.transfer_infos.get(bootstrap_room)
             if not transfer_infos:
-                reason = (
-                    f"No transfer info found for bootstrap_room={bootstrap_room}"
-                )
+                reason = f"No transfer info found for bootstrap_room={bootstrap_room}"
                 self.record_failure(bootstrap_room, reason)
                 self.update_status(bootstrap_room, KVPoll.Failed)
                 return [], None
 
             self.update_status(bootstrap_room, KVPoll.Transferring)
-            result_statuses: List[TransferStatus] = []
-
             for info in transfer_infos.values():
                 peer_info = self.decode_kv_args_table.get(info.engine_key)
                 if not peer_info:
                     reason = f"Peer info missing for engine {info.engine_key}"
                     self.record_failure(bootstrap_room, reason)
                     self.update_status(bootstrap_room, KVPoll.Failed)
-                    return result_statuses, list(transfer_infos.values())
+                    return [], list(transfer_infos.values())
+                targets.append(TransferTarget(info=info, peer_info=peer_info))
+            if is_last:
+                target_infos_snapshot = list(transfer_infos.values())
+
+        result_statuses: List[TransferStatus] = []
+        try:
+            for target in targets:
+                info = target.info
+                peer_info = target.peer_info
 
                 if not info.is_dummy:
                     dst_indices_chunk = info.dst_kv_indices[index_slice]
@@ -1116,11 +1158,18 @@ class MoriKVManager(CommonKVManager):
                             peer_info, aux_index, info.dst_aux_index, bootstrap_room
                         )
                     )
+        except Exception as e:
+            reason = f"Transfer submission failed: {e}"
+            with self.transfer_lock:
+                self.record_failure(bootstrap_room, reason)
+                self.update_status(bootstrap_room, KVPoll.Failed)
+            raise
 
-            if is_last:
+        if is_last:
+            with self.transfer_lock:
+                # Keep transfer_infos alive until sender.clear() so abort/failure
+                # paths can still recover notification targets after posting.
                 self.update_status(bootstrap_room, KVPoll.Success)
-                target_infos_snapshot = list(transfer_infos.values())
-                self.transfer_infos.pop(bootstrap_room, None)
 
         return result_statuses, target_infos_snapshot
 
