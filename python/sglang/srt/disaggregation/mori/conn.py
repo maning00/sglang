@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -32,10 +32,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.common.utils import (
-    FastQueue,
-    group_concurrent_contiguous,
-)
+from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -206,16 +203,46 @@ class TPSliceConfig:
     heads_bytes_per_token_to_send: int
 
 
-@dataclasses.dataclass
-class TransferKVChunk:
-    """A single chunk of KV transfer work enqueued to a worker thread."""
+@dataclasses.dataclass(frozen=True)
+class GroupedIndexPlan:
+    src_starts: List[int]
+    dst_starts: List[int]
+    counts: List[int]
 
-    room: int
-    prefill_kv_indices: npt.NDArray[np.int32]
-    index_slice: slice
-    is_last: bool
-    aux_index: Optional[int]
-    state_indices: Optional[npt.NDArray[np.int32]]
+    @classmethod
+    def from_groups(
+        cls, src_groups: List[List[int]], dst_groups: List[List[int]]
+    ) -> GroupedIndexPlan:
+        if len(src_groups) != len(dst_groups):
+            raise ValueError("Source and destination groups must have the same length")
+        return cls(
+            src_starts=[int(group[0]) for group in src_groups],
+            dst_starts=[int(group[0]) for group in dst_groups],
+            counts=[len(group) for group in src_groups],
+        )
+
+    def materialize(self, item_len: int) -> BatchTransferPlan:
+        return BatchTransferPlan(
+            local_offsets=[start * item_len for start in self.src_starts],
+            remote_offsets=[start * item_len for start in self.dst_starts],
+            sizes=[count * item_len for count in self.counts],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchTransferPlan:
+    local_offsets: List[int]
+    remote_offsets: List[int]
+    sizes: List[int]
+
+    def empty(self) -> bool:
+        return not self.sizes
+
+
+@dataclasses.dataclass(frozen=True)
+class TransferTarget:
+    info: TransferInfo
+    peer_info: KVArgsRegisterInfo
 
 
 class MoriKVManager(CommonKVManager):
@@ -237,26 +264,13 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
-        # Send CPU-resident AUX data via ZMQ TCP instead of RDMA.
-        # Useful when RDMA AUX transfer is unreliable.
-        # Default: false
-        self._send_aux_tcp = os.environ.get("SGLANG_MORI_SEND_AUX_TCP", "").lower() in (
-            "1",
-            "true",
-        )
+        # Send CPU-resident AUX data via RDMA instead of ZMQ TCP.
+        # Default: TCP.  Set SGLANG_MORI_SEND_AUX_RDMA=1 to use RDMA.
+        self._send_aux_rdma = os.environ.get(
+            "SGLANG_MORI_SEND_AUX_RDMA", ""
+        ).lower() in ("1", "true")
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Number of transfer worker threads on the prefill side.
-            # Each worker pulls TransferKVChunk items from its own queue
-            # and issues RDMA (or TCP) transfers independently.
-            # More workers can hide per-transfer latency but increase CPU
-            # and memory usage.
-            # Default: 4
-            queue_size = get_int_env_var("SGLANG_MORI_TRANSFER_QUEUE_SIZE", 4)
-            self.transfer_queues: List[FastQueue] = [
-                FastQueue() for _ in range(queue_size)
-            ]
-            self._start_transfer_workers()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
@@ -380,217 +394,6 @@ class MoriKVManager(CommonKVManager):
             sock.connect(endpoint)
             cache[endpoint] = sock
         return cache[endpoint]
-
-    def _start_transfer_workers(self) -> None:
-        for i, queue in enumerate(self.transfer_queues):
-            threading.Thread(
-                target=self._transfer_worker_loop,
-                args=(queue,),
-                daemon=True,
-                name=f"mori-transfer-worker-{i}",
-            ).start()
-
-    def _transfer_worker_loop(self, queue: FastQueue) -> None:
-        room_statuses: Dict[int, List[TransferStatus]] = {}
-        room_infos: Dict[int, List[TransferInfo]] = {}
-
-        while True:
-            chunk = None
-            try:
-                chunk: TransferKVChunk = queue.get()
-                self._process_transfer_chunk(chunk, room_statuses, room_infos)
-            except Exception:
-                logger.exception("Transfer worker failed")
-                if chunk is not None:
-                    self._handle_worker_exception(chunk.room, room_statuses, room_infos)
-
-    def _process_transfer_chunk(
-        self,
-        chunk: TransferKVChunk,
-        room_statuses: Dict[int, List[TransferStatus]],
-        room_infos: Dict[int, List[TransferInfo]],
-    ) -> None:
-        room = chunk.room
-
-        if (
-            room not in self.request_status
-            or self.request_status.get(room) == KVPoll.Failed
-        ):
-            room_statuses.pop(room, None)
-            room_infos.pop(room, None)
-            return
-
-        with self.transfer_lock:
-            room_info_dict = self.transfer_infos.get(room)
-            if not room_info_dict:
-                return
-            infos_snapshot = list(room_info_dict.values())
-            peer_snapshot = {
-                info.engine_key: self.decode_kv_args_table.get(info.engine_key)
-                for info in infos_snapshot
-            }
-            self.update_status(room, KVPoll.Transferring)
-
-        if room not in room_infos:
-            room_infos[room] = infos_snapshot
-
-        chunk_statuses: List[TransferStatus] = []
-        for info in infos_snapshot:
-            peer_info = peer_snapshot.get(info.engine_key)
-            if not peer_info:
-                reason = f"Peer info missing for {info.engine_key}"
-                self._worker_fail_room(room, reason, room_statuses, room_infos)
-                return
-
-            if not info.is_dummy:
-                dst_indices_chunk = info.dst_kv_indices[chunk.index_slice]
-                chunk_statuses.extend(
-                    self.send_kvcache(
-                        peer_info, chunk.prefill_kv_indices, dst_indices_chunk
-                    )
-                )
-
-            if (
-                chunk.is_last
-                and chunk.state_indices is not None
-                and not info.is_dummy
-                and self.state_mem_descs
-            ):
-                chunk_statuses.extend(
-                    self.send_state(
-                        peer_info, chunk.state_indices, info.dst_state_indices
-                    )
-                )
-
-            if (
-                chunk.is_last
-                and chunk.aux_index is not None
-                and info.dst_aux_index >= 0
-                and self.pp_group.is_last_rank
-            ):
-                chunk_statuses.extend(
-                    self.send_aux(peer_info, chunk.aux_index, info.dst_aux_index, room)
-                )
-
-        existing = room_statuses.get(room)
-        if existing:
-            existing = [s for s in existing if not s.Succeeded()]
-        else:
-            existing = []
-        existing.extend(chunk_statuses)
-        room_statuses[room] = existing
-
-        if chunk.is_last:
-            all_statuses = room_statuses[room]
-            success = self._poll_statuses_until_complete(all_statuses, room)
-            has_transfer_error = any(s.Failed() for s in all_statuses)
-
-            with self.transfer_lock:
-                still_active = room in self.transfer_infos
-                if still_active:
-                    self.transfer_infos.pop(room, None)
-                is_failed = self.request_status.get(room) == KVPoll.Failed
-
-            if still_active:
-                if is_failed:
-                    reason = self.failure_records.get(room, "Aborted during transfer")
-                    self.update_status(room, KVPoll.Failed)
-                    self.notify_decode_status(
-                        room_infos[room], room, KVPoll.Failed, reason
-                    )
-                elif not success or has_transfer_error:
-                    with self.failure_lock:
-                        recorded_reason = self.failure_records.get(room)
-                    reason = recorded_reason or self._collect_status_failure_reason(
-                        all_statuses
-                    )
-                    self.record_failure(room, reason)
-                    self.update_status(room, KVPoll.Failed)
-                    self.notify_decode_status(
-                        room_infos[room], room, KVPoll.Failed, reason
-                    )
-                else:
-                    self.update_status(room, KVPoll.Success)
-                    self.notify_decode_status(room_infos[room], room, KVPoll.Success)
-
-            room_statuses.pop(room, None)
-            room_infos.pop(room, None)
-
-    def _worker_fail_room(
-        self,
-        room: int,
-        reason: str,
-        room_statuses: Dict[int, List[TransferStatus]],
-        room_infos: Dict[int, List[TransferInfo]],
-    ) -> None:
-        """Worker-side room failure: update status and notify decode."""
-        self.record_failure(room, reason)
-        self.update_status(room, KVPoll.Failed)
-        infos = room_infos.get(room)
-        if infos:
-            try:
-                self.notify_decode_status(infos, room, KVPoll.Failed, reason)
-            except Exception:
-                logger.debug("Failed to send failure notification for room %s", room)
-        room_statuses.pop(room, None)
-        room_infos.pop(room, None)
-
-    def _handle_worker_exception(
-        self,
-        room: int,
-        room_statuses: Dict[int, List[TransferStatus]],
-        room_infos: Dict[int, List[TransferInfo]],
-    ) -> None:
-        reason = f"Transfer worker exception for room {room}"
-        infos = room_infos.get(room)
-        if not infos:
-            with self.transfer_lock:
-                d = self.transfer_infos.get(room)
-                if d:
-                    infos = list(d.values())
-                    room_infos[room] = infos
-        self._worker_fail_room(room, reason, room_statuses, room_infos)
-
-    def _poll_statuses_until_complete(
-        self,
-        statuses: List[TransferStatus],
-        room: int,
-        timeout: float = 30.0,
-    ) -> bool:
-        if not statuses:
-            return True
-        deadline = time.time() + timeout
-        sleep_sec = 0.0001  # start at 100us
-        max_sleep = 0.001  # cap at 1ms
-        while True:
-            if all(not s.InProgress() for s in statuses):
-                return True
-            if self.request_status.get(room) == KVPoll.Failed:
-                return False  # External abort
-            if room not in self.request_status:
-                return False  # Room cleared
-            if time.time() > deadline:
-                in_progress = sum(1 for s in statuses if s.InProgress())
-                failed = sum(1 for s in statuses if s.Failed())
-                logger.warning(
-                    "RDMA completion timeout for room %s after %.1fs: total=%d in_progress=%d failed=%d",
-                    room,
-                    timeout,
-                    len(statuses),
-                    in_progress,
-                    failed,
-                )
-                self.record_failure(room, f"RDMA completion timeout after {timeout}s")
-                return False
-            time.sleep(sleep_sec)  # releases GIL
-            sleep_sec = min(sleep_sec * 2, max_sleep)
-
-    @staticmethod
-    def _collect_status_failure_reason(statuses: List[TransferStatus]) -> str:
-        for s in statuses:
-            if s.Failed():
-                return f"PD transfer failed: {s.Message()}"
-        return "PD transfer failed due to unknown reason"
 
     def _handle_register_message(self, payload: List[bytes]) -> None:
         try:
@@ -814,31 +617,32 @@ class MoriKVManager(CommonKVManager):
         dst_slice = dst_mem_descs[start_layer:end_layer]
         return src_descs, dst_slice, num_local_layers
 
-    def _issue_layer_transfers(
+    def _submit_batch_transfer_plan(
         self,
         src_desc: MemoryDesc,
         dst_desc: MemoryDesc,
-        kv_item_len: int,
-        src_groups: List[List[int]],
-        dst_groups: List[List[int]],
+        plan: BatchTransferPlan,
     ) -> List[TransferStatus]:
-        if not src_groups:
+        if plan.empty():
             return []
-        local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
-        remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
-        sizes = [len(src_group) * kv_item_len for src_group in src_groups]
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
         statuses = self.engine.batch_write(
             [src_desc],
-            [local_offsets],
+            [plan.local_offsets],
             [dst_desc],
-            [remote_offsets],
-            [sizes],
+            [plan.remote_offsets],
+            [plan.sizes],
             [transfer_uid],
         )
         return statuses
+
+    def _build_contiguous_transfer_plan(
+        self, grouped_plan: GroupedIndexPlan, item_len: int
+    ) -> BatchTransferPlan:
+        # Reuse grouped indices across all layers/tensors that share the same item length.
+        return grouped_plan.materialize(item_len)
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
@@ -898,52 +702,33 @@ class MoriKVManager(CommonKVManager):
             heads_bytes_per_token_to_send=heads_bytes_per_token,
         )
 
-    def _batched_layer_transfers(
+    def _build_tp_slice_transfer_plan(
         self,
-        src_descs: List[MemoryDesc],
-        dst_descs: List[MemoryDesc],
-        kv_item_len: int,
-        src_groups: List[List[int]],
-        dst_groups: List[List[int]],
-    ) -> List[TransferStatus]:
-        """Issue one batch_write() across all layers (same offsets/sizes per layer)."""
-        if not src_groups or not src_descs:
-            return []
-        local_offsets = [int(g[0]) * kv_item_len for g in src_groups]
-        remote_offsets = [int(g[0]) * kv_item_len for g in dst_groups]
-        sizes = [len(g) * kv_item_len for g in src_groups]
-        num_layers = len(src_descs)
-        all_uids = [self.engine.allocate_transfer_uid() for _ in range(num_layers)]
-        return self.engine.batch_write(
-            list(src_descs),
-            [local_offsets] * num_layers,
-            list(dst_descs),
-            [remote_offsets] * num_layers,
-            [sizes] * num_layers,
-            all_uids,
-        )
-
-    def _batched_tp_slice_transfers(
-        self,
-        src_descs: List[MemoryDesc],
-        dst_descs: List[MemoryDesc],
         kv_indices: npt.NDArray[np.int32],
         dst_indices: npt.NDArray[np.int32],
         tp_cfg: TPSliceConfig,
-    ) -> List[TransferStatus]:
-        """Issue one batch_write() across all layers for TP-mismatch slice transfers."""
-        if kv_indices.size == 0 or dst_indices.size == 0 or not src_descs:
-            return []
+    ) -> BatchTransferPlan:
+        if kv_indices.size == 0 or dst_indices.size == 0:
+            return BatchTransferPlan([], [], [])
+
         limit = min(kv_indices.size, dst_indices.size)
         if not limit:
-            return []
+            return BatchTransferPlan([], [], [])
+
         src_pages = kv_indices[:limit].astype(np.int64)
         dst_pages = dst_indices[:limit].astype(np.int64)
         token_slots = np.arange(tp_cfg.page_size, dtype=np.int64)
+
+        src_page_bases = src_pages * tp_cfg.src_item_len
+        dst_page_bases = dst_pages * tp_cfg.dst_item_len
+
+        src_token_offsets = token_slots * tp_cfg.bytes_per_token_src
+        dst_token_offsets = token_slots * tp_cfg.bytes_per_token_dst
+
         local_offsets = (
             (
-                src_pages[:, np.newaxis] * tp_cfg.src_item_len
-                + token_slots * tp_cfg.bytes_per_token_src
+                src_page_bases[:, np.newaxis]
+                + src_token_offsets
                 + tp_cfg.src_head_slice_offset
             )
             .flatten()
@@ -951,23 +736,24 @@ class MoriKVManager(CommonKVManager):
         )
         remote_offsets = (
             (
-                dst_pages[:, np.newaxis] * tp_cfg.dst_item_len
-                + token_slots * tp_cfg.bytes_per_token_dst
+                dst_page_bases[:, np.newaxis]
+                + dst_token_offsets
                 + tp_cfg.dst_head_slice_offset
             )
             .flatten()
             .tolist()
         )
-        sizes = [tp_cfg.heads_bytes_per_token_to_send] * (limit * tp_cfg.page_size)
-        num_layers = len(src_descs)
-        all_uids = [self.engine.allocate_transfer_uid() for _ in range(num_layers)]
-        return self.engine.batch_write(
-            list(src_descs),
-            [local_offsets] * num_layers,
-            list(dst_descs),
-            [remote_offsets] * num_layers,
-            [sizes] * num_layers,
-            all_uids,
+
+        num_transfers = limit * tp_cfg.page_size
+        sizes = [tp_cfg.heads_bytes_per_token_to_send] * num_transfers
+
+        if not local_offsets:
+            return BatchTransferPlan([], [], [])
+
+        return BatchTransferPlan(
+            local_offsets=local_offsets,
+            remote_offsets=remote_offsets,
+            sizes=sizes,
         )
 
     def send_kvcache(
@@ -976,52 +762,77 @@ class MoriKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[TransferStatus]:
-        src_groups, dst_groups = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(
+                prefill_kv_indices,
+                dst_kv_indices,
+            )
         )
+        statuses: List[TransferStatus] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
 
         if self.is_mla_backend:
-            src_descs, dst_descs, _ = self._get_mla_mem_desc_slices(
-                peer_info.dst_kv_mem_descs
+            layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
+            src_descs, dst_descs, layers_current_pp_stage = (
+                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
-            return self._batched_layer_transfers(
-                src_descs, dst_descs, kv_item_len, src_groups, dst_groups
-            )
+            for layer_id in range(layers_current_pp_stage):
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_descs[layer_id],
+                        dst_descs[layer_id],
+                        layer_plan,
+                    )
+                )
+            return statuses
 
         (
             src_k_descs,
             src_v_descs,
             dst_k_descs,
             dst_v_descs,
-            _,
+            layers_current_pp_stage,
         ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
 
         if peer_info.decode_tp_size != self.attn_tp_size:
             tp_cfg = self._build_tp_slice_config(peer_info)
-            statuses = self._batched_tp_slice_transfers(
-                src_k_descs, dst_k_descs, prefill_kv_indices, dst_kv_indices, tp_cfg
+            slice_plan = self._build_tp_slice_transfer_plan(
+                prefill_kv_indices, dst_kv_indices, tp_cfg
             )
+            for layer_id in range(layers_current_pp_stage):
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_k_descs[layer_id],
+                        dst_k_descs[layer_id],
+                        slice_plan,
+                    )
+                )
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_v_descs[layer_id],
+                        dst_v_descs[layer_id],
+                        slice_plan,
+                    )
+                )
+            return statuses
+
+        layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
+        for layer_id in range(layers_current_pp_stage):
             statuses.extend(
-                self._batched_tp_slice_transfers(
-                    src_v_descs,
-                    dst_v_descs,
-                    prefill_kv_indices,
-                    dst_kv_indices,
-                    tp_cfg,
+                self._submit_batch_transfer_plan(
+                    src_k_descs[layer_id],
+                    dst_k_descs[layer_id],
+                    layer_plan,
                 )
             )
-            return statuses
-        else:
-            statuses = self._batched_layer_transfers(
-                src_k_descs, dst_k_descs, kv_item_len, src_groups, dst_groups
-            )
             statuses.extend(
-                self._batched_layer_transfers(
-                    src_v_descs, dst_v_descs, kv_item_len, src_groups, dst_groups
+                self._submit_batch_transfer_plan(
+                    src_v_descs[layer_id],
+                    dst_v_descs[layer_id],
+                    layer_plan,
                 )
             )
-            return statuses
+        return statuses
 
     def send_aux(
         self,
@@ -1030,9 +841,9 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        if self._send_aux_tcp:
-            return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
-        return self.send_aux_rdma(peer_info, prefill_aux_index, dst_aux_index, room)
+        if self._send_aux_rdma:
+            return self.send_aux_rdma(peer_info, prefill_aux_index, dst_aux_index, room)
+        return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
 
     def send_aux_rdma(
         self,
@@ -1041,29 +852,30 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        if not self.aux_mem_descs or not peer_info.dst_aux_mem_descs:
-            return []
+        if not self.aux_mem_descs or len(self.aux_mem_descs) != len(
+            peer_info.dst_aux_mem_descs
+        ):
+            return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
 
-        statuses: List[TransferStatus] = []
+        src_descs: List[MemoryDesc] = []
+        dst_descs: List[MemoryDesc] = []
+        local_offsets: List[List[int]] = []
+        remote_offsets: List[List[int]] = []
+        sizes: List[List[int]] = []
+        uids = []
         for i in range(len(self.aux_mem_descs)):
-            src_desc = self.aux_mem_descs[i]
-            dst_desc = peer_info.dst_aux_mem_descs[i]
             item_len = self.kv_args.aux_item_lens[i]
-            src_offset = prefill_aux_index * item_len
-            dst_offset = dst_aux_index * item_len
-
-            transfer_uid = self.engine.allocate_transfer_uid()
-            batch_statuses = self.engine.batch_write(
-                [src_desc],
-                [[src_offset]],
-                [dst_desc],
-                [[dst_offset]],
-                [[item_len]],
-                [transfer_uid],
+            src_descs.append(self.aux_mem_descs[i])
+            dst_descs.append(peer_info.dst_aux_mem_descs[i])
+            local_offsets.append([prefill_aux_index * item_len])
+            remote_offsets.append([dst_aux_index * item_len])
+            sizes.append([item_len])
+            uids.append(self.engine.allocate_transfer_uid())
+        return list(
+            self.engine.batch_write(
+                src_descs, local_offsets, dst_descs, remote_offsets, sizes, uids
             )
-            statuses.extend(batch_statuses)
-
-        return statuses
+        )
 
     def send_aux_tcp(
         self,
@@ -1275,8 +1087,8 @@ class MoriKVManager(CommonKVManager):
             dst_state_indices = dst_state_indices[:common_len]
 
         # Group contiguous indices and issue per-tensor transfers
-        src_groups, dst_groups = group_concurrent_contiguous(
-            src_state_indices, dst_state_indices
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(src_state_indices, dst_state_indices)
         )
 
         statuses = []
@@ -1286,8 +1098,10 @@ class MoriKVManager(CommonKVManager):
             state_item_len = self.kv_args.state_item_lens[i]
 
             statuses.extend(
-                self._issue_layer_transfers(
-                    src_desc, dst_desc, state_item_len, src_groups, dst_groups
+                self._submit_batch_transfer_plan(
+                    src_desc,
+                    dst_desc,
+                    self._build_contiguous_transfer_plan(grouped_plan, state_item_len),
                 )
             )
 
@@ -1317,29 +1131,90 @@ class MoriKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> None:
+    ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
         if (
             bootstrap_room not in self.request_status
             or self.request_status.get(bootstrap_room) == KVPoll.Failed
         ):
-            return
+            return [], None
 
-        chunk = TransferKVChunk(
-            room=bootstrap_room,
-            prefill_kv_indices=kv_indices,
-            index_slice=index_slice,
-            is_last=is_last,
-            aux_index=aux_index,
-            state_indices=state_indices,
-        )
-
+        targets: List[TransferTarget] = []
+        target_infos_snapshot: Optional[List[TransferInfo]] = None
         with self.transfer_lock:
-            dst_keys = list(self.transfer_infos.get(bootstrap_room, {}).keys())
-        shard_key = sum(hash(k) for k in dst_keys) if dst_keys else bootstrap_room
-        shard_idx = shard_key % len(self.transfer_queues)
-        self.transfer_queues[shard_idx].put(chunk)
+            transfer_infos = self.transfer_infos.get(bootstrap_room)
+            if not transfer_infos:
+                reason = f"No transfer info found for bootstrap_room={bootstrap_room}"
+                self.record_failure(bootstrap_room, reason)
+                self.update_status(bootstrap_room, KVPoll.Failed)
+                return [], None
+
+            self.update_status(bootstrap_room, KVPoll.Transferring)
+            for info in transfer_infos.values():
+                peer_info = self.decode_kv_args_table.get(info.engine_key)
+                if not peer_info:
+                    reason = f"Peer info missing for engine {info.engine_key}"
+                    self.record_failure(bootstrap_room, reason)
+                    self.update_status(bootstrap_room, KVPoll.Failed)
+                    return [], list(transfer_infos.values())
+                targets.append(TransferTarget(info=info, peer_info=peer_info))
+            if is_last:
+                target_infos_snapshot = list(transfer_infos.values())
+
+        result_statuses: List[TransferStatus] = []
+        try:
+            for target in targets:
+                info = target.info
+                peer_info = target.peer_info
+
+                if not info.is_dummy:
+                    dst_indices_chunk = info.dst_kv_indices[index_slice]
+                    result_statuses.extend(
+                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                    )
+
+                if (
+                    is_last
+                    and state_indices is not None
+                    and not info.is_dummy
+                    and self.state_mem_descs
+                ):
+                    result_statuses.extend(
+                        self.send_state(
+                            peer_info, state_indices, info.dst_state_indices
+                        )
+                    )
+
+                if (
+                    is_last
+                    and aux_index is not None
+                    and info.dst_aux_index >= 0
+                    and self.pp_group.is_last_rank
+                ):
+                    result_statuses.extend(
+                        self.send_aux(
+                            peer_info, aux_index, info.dst_aux_index, bootstrap_room
+                        )
+                    )
+        except Exception as e:
+            reason = f"Transfer submission failed: {e}"
+            with self.transfer_lock:
+                self.record_failure(bootstrap_room, reason)
+                self.update_status(bootstrap_room, KVPoll.Failed)
+            logger.exception(
+                "Mori KV transfer submission failed for bootstrap_room=%s",
+                bootstrap_room,
+            )
+            return result_statuses, target_infos_snapshot
+
+        if is_last:
+            with self.transfer_lock:
+                # Keep transfer_infos alive until sender.clear() so abort/failure
+                # paths can still recover notification targets after posting.
+                self.update_status(bootstrap_room, KVPoll.Success)
+
+        return result_statuses, target_infos_snapshot
 
 
 class MoriKVSender(CommonKVSender):
@@ -1352,7 +1227,11 @@ class MoriKVSender(CommonKVSender):
         pp_rank: int,
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        self.transfer_statuses: List[TransferStatus] = []
+        self.pending_infos: Optional[List[TransferInfo]] = None
+        self.sent_last_chunk = False
         self.conclude_state: Optional[KVPoll] = None
+        self.status_notified = False
         self.init_time = time.time()
 
     def send(
@@ -1379,7 +1258,7 @@ class MoriKVSender(CommonKVSender):
                 return
 
         normalized_state = _normalize_state_indices(state_indices) if is_last else None
-        self.kv_mgr.add_transfer_request(
+        statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
@@ -1387,14 +1266,25 @@ class MoriKVSender(CommonKVSender):
             aux_index=self.aux_index if is_last else None,
             state_indices=normalized_state,
         )
+        self.transfer_statuses.extend(statuses)
+        if infos is not None:
+            self.pending_infos = infos
+            if is_last:
+                self.sent_last_chunk = True
+        self._maybe_finalize_if_room_failed()
+
+    def _maybe_finalize_if_room_failed(self) -> None:
+        if self.conclude_state is not None:
+            return
+        if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+            self._finalize_failure()
 
     def poll(self) -> KVPoll:
-        """Pure status reader — all transfer work is done by worker threads."""
         if self.conclude_state is not None:
             return self.conclude_state
 
         if self.bootstrap_room not in self.kv_mgr.request_status:
-            self.conclude_state = KVPoll.Failed
+            self._finalize_failure()
             return KVPoll.Failed
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -1408,13 +1298,74 @@ class MoriKVSender(CommonKVSender):
                 )
                 self.kv_mgr.record_failure(self.bootstrap_room, reason)
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                self.conclude_state = KVPoll.Failed
+                self._finalize_failure(reason)
                 return KVPoll.Failed
             return status
 
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-        return status
+        if status == KVPoll.Failed:
+            self._finalize_failure()
+            return KVPoll.Failed
+
+        if status == KVPoll.Success and self.kv_mgr.is_dummy_cp_rank:
+            self.conclude_state = KVPoll.Success
+            return KVPoll.Success
+
+        transfers_done = self._all_transfers_finished()
+        if transfers_done:
+            if self._has_transfer_error():
+                reason = self._collect_failure_reason()
+                self.kv_mgr.record_failure(self.bootstrap_room, reason)
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self._finalize_failure(reason)
+                return KVPoll.Failed
+            self._notify_decode(KVPoll.Success)
+            self.conclude_state = KVPoll.Success
+            return KVPoll.Success
+        return KVPoll.Transferring if status == KVPoll.Success else status
+
+    def _all_transfers_finished(self) -> bool:
+        if not self.sent_last_chunk:
+            return False
+        if not self.transfer_statuses:
+            return True
+        return all(not status.InProgress() for status in self.transfer_statuses)
+
+    def _has_transfer_error(self) -> bool:
+        return any(status.Failed() for status in self.transfer_statuses)
+
+    def _collect_failure_reason(self) -> str:
+        for status in self.transfer_statuses:
+            if status.Failed():
+                return f"KV transfer failed: {status.Message()}"
+        return "KV transfer failed due to unknown reason"
+
+    def _notify_decode(
+        self, status: KVPoll, failure_reason: Optional[str] = None
+    ) -> None:
+        if self.status_notified:
+            return
+
+        infos = self.pending_infos
+        if infos is None:
+            with self.kv_mgr.transfer_lock:
+                room_infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room)
+                if room_infos is not None:
+                    infos = list(room_infos.values())
+        if infos:
+            self.kv_mgr.notify_decode_status(
+                infos, self.bootstrap_room, status, failure_reason
+            )
+        self.status_notified = True
+
+    def _finalize_failure(self, failure_reason: Optional[str] = None) -> None:
+        if self.conclude_state == KVPoll.Failed:
+            return
+        if failure_reason is None:
+            failure_reason = self.kv_mgr.failure_records.get(
+                self.bootstrap_room, "KV transfer failed"
+            )
+        self._notify_decode(KVPoll.Failed, failure_reason)
+        self.conclude_state = KVPoll.Failed
 
     def clear(self) -> None:
         with self.kv_mgr.transfer_lock:
@@ -1422,6 +1373,8 @@ class MoriKVSender(CommonKVSender):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
+        if self.conclude_state is None:
+            self._finalize_failure()
         self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
@@ -1432,6 +1385,7 @@ class MoriKVSender(CommonKVSender):
     def abort(self):
         self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self._notify_decode(KVPoll.Failed, "Aborted by AbortReq.")
         self.conclude_state = KVPoll.Failed
 
 
