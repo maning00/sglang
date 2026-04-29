@@ -40,13 +40,24 @@ Environment variables (override defaults):
   PREFILL_PORT              Prefill server port (default: 30000)
   DECODE_HOST               Decode server bind address (default: 0.0.0.0)
   DECODE_PORT               Decode server port (default: 30001)
-  PREFILL_URL               Full URL to prefill server (decode needs this,
-                            e.g. http://10.0.0.1:30000)
+  PREFILL_URLS              Space-separated prefill URLs for multi-prefill
+                            (xP1D), e.g.
+                            "http://10.0.0.1:30000 http://10.0.0.2:30000".
+                            Used by the decode node to fan out --prefill flags
+                            to sglang_router. MUST use spaces, not commas.
+  PREFILL_URL               [DEPRECATED] Single-prefill shortcut for 1P1D
+                            (back-compat). Folded into PREFILL_URLS if set.
 
   # Router (decode node only)
   ENABLE_ROUTER             Auto-start router on decode node (default: true)
   ROUTER_HOST               Router bind address (default: 0.0.0.0)
   ROUTER_PORT               Router port (default: 8000)
+
+  # KV Events (ZMQ publisher on SGLang + subscriber in UMBP)
+  ENABLE_KV_EVENTS          Enable KV events publisher on sglang server (default: true)
+  KV_EVENTS_PUBLISHER       Publisher backend (default: zmq)
+  KV_EVENTS_ENDPOINT        ZMQ bind endpoint (default: tcp://*:5557)
+  KV_EVENTS_TOPIC           ZMQ topic prefix (default: empty)
 
   # Cache tiers
   ENABLE_HICACHE            Enable L2 DRAM cache (default: true)
@@ -65,8 +76,12 @@ Examples:
   # Prefill node with all cache tiers:
   ./run_pd_disagg_bench_dp8ep8.sh --role prefill
 
-  # Decode node, connecting to prefill at 10.0.0.1:
+  # Decode node (1P1D), connecting to prefill at 10.0.0.1:
   PREFILL_URL=http://10.0.0.1:30000 \\
+    ./run_pd_disagg_bench_dp8ep8.sh --role decode
+
+  # Decode node (2P1D), router fans out to two prefill servers:
+  PREFILL_URLS="http://10.0.0.1:30000 http://10.0.0.2:30000" \\
     ./run_pd_disagg_bench_dp8ep8.sh --role decode
 
   # Prefill node, HBM only (no tiered cache):
@@ -100,9 +115,11 @@ fi
 
 # ---- Configurable parameters --------------------------------
 MODEL_PATH="${MODEL_PATH:-/nfs/DeepSeek-V3}"
+USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
 
 # PD Disaggregation
 DISAGG_TRANSFER_BACKEND="${DISAGG_TRANSFER_BACKEND:-mori}"
@@ -112,6 +129,14 @@ PREFILL_PORT="${PREFILL_PORT:-30000}"
 DECODE_HOST="${DECODE_HOST:-0.0.0.0}"
 DECODE_PORT="${DECODE_PORT:-30001}"
 PREFILL_URL="${PREFILL_URL:-}"
+# Multi-prefill (xP1D) endpoints. Space-separated list, used by the decode
+# node to fan out --prefill flags to sglang_router. PREFILL_URL is kept for
+# back-compat with single-prefill (1P1D) callers and is folded in here.
+# DEPRECATED: PREFILL_URL kept for back-compat, prefer PREFILL_URLS.
+# NOTE: do not call `read -a` at top-level; under `set -e`, an empty value
+# (the prefill-role normal case) can abort the script before role dispatch.
+# The array is parsed lazily inside the decode branch.
+PREFILL_URLS="${PREFILL_URLS:-${PREFILL_URL:-}}"
 
 # Router (decode node only)
 ENABLE_ROUTER="${ENABLE_ROUTER:-true}"
@@ -146,6 +171,12 @@ UMBP_IO_ENGINE_PORT="${UMBP_IO_ENGINE_PORT:-}"
 UMBP_PEER_SERVICE_PORT="${UMBP_PEER_SERVICE_PORT:-}"
 UMBP_CACHE_REMOTE_FETCHES="${UMBP_CACHE_REMOTE_FETCHES:-true}"
 UMBP_MASTER_AUTO_START="${UMBP_MASTER_AUTO_START:-true}"
+
+# KV Events
+ENABLE_KV_EVENTS="${ENABLE_KV_EVENTS:-true}"
+KV_EVENTS_PUBLISHER="${KV_EVENTS_PUBLISHER:-zmq}"
+KV_EVENTS_ENDPOINT="${KV_EVENTS_ENDPOINT:-tcp://*:5557}"
+KV_EVENTS_TOPIC="${KV_EVENTS_TOPIC:-}"
 UMBP_MASTER_BIN="${UMBP_MASTER_BIN:-}"
 UMBP_MASTER_LISTEN="${UMBP_MASTER_LISTEN:-}"
 
@@ -174,6 +205,11 @@ PREFILL_WAIT_TIMEOUT="${PREFILL_WAIT_TIMEOUT:-6000}"
 
 MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+
+# Extra args forwarded verbatim to sglang.launch_server for both roles.  Split
+# on whitespace so flag+value pairs stay together
+# (e.g. EXTRA_SERVER_ARGS="--max-total-tokens 20000").
+read -r -a EXTRA_SERVER_ARGS_ARR <<< "${EXTRA_SERVER_ARGS:-}"
 
 # ---- Sanity: UMBP requires HICACHE ---------------------------
 if bool_is_true "$ENABLE_UMBP" && ! bool_is_true "$ENABLE_HICACHE"; then
@@ -465,8 +501,26 @@ build_umbp_extra_config() {
         [[ -n "$UMBP_PEER_SERVICE_PORT" ]] && \
             dist_fields+=", \"peer_service_port\": \"${UMBP_PEER_SERVICE_PORT}\""
         dist_fields+=", \"cache_remote_fetches\": ${UMBP_CACHE_REMOTE_FETCHES}"
+        # Optional override for master's PageBitmapAllocator page_size.
+        # When set, takes precedence over UMBPStore's auto-probe (Path A).
+        [[ -n "${UMBP_DRAM_PAGE_SIZE:-}" ]] && \
+            dist_fields+=", \"dram_page_size\": ${UMBP_DRAM_PAGE_SIZE}"
     fi
-    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": true, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    # Auto-disable SSD when capacity is zero so UMBPConfig::Validate() does
+    # not reject the config (ssd_enabled=true requires ssd_capacity_bytes>0).
+    # Note: mori's dual-scheme DistributedClient does not currently use the
+    # SSD tier at all (only DRAM is registered with the master), so setting
+    # UMBP_SSD_BYTES=0 is the supported way to fully turn SSD off until SSD
+    # support lands in dual-scheme.
+    local ssd_enabled_json="true"
+    if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
+        ssd_enabled_json="false"
+    fi
+    local kv_events_fields=""
+    if bool_is_true "$ENABLE_KV_EVENTS"; then
+        kv_events_fields=", \"kv_events_subscriber\": true"
+    fi
+    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${kv_events_fields}}"
 }
 
 # ---- Launch server (unified for both roles) -----------------
@@ -493,6 +547,9 @@ launch_pd_server() {
     )
     if [[ -n "$KV_CACHE_DTYPE" ]]; then
         cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+    fi
+    if [[ -n "$MEM_FRACTION_STATIC" ]]; then
+        cmd+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
     fi
 
     # Disaggregation args
@@ -546,6 +603,17 @@ launch_pd_server() {
         fi
     fi
 
+    # Append any extra args forwarded from EXTRA_SERVER_ARGS env (safe under
+    # `set -u` even when the array is empty).
+    if bool_is_true "$USE_DUMMY_WEIGHTS"; then
+        cmd+=(--load-format dummy)
+    fi
+    cmd+=(${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"})
+
+    if bool_is_true "$ENABLE_KV_EVENTS"; then
+        cmd+=(--kv-events-config "{\"publisher\": \"${KV_EVENTS_PUBLISHER}\", \"endpoint\": \"${KV_EVENTS_ENDPOINT}\", \"topic\": \"${KV_EVENTS_TOPIC}\"}")
+    fi
+
     "${cmd[@]}"
 }
 
@@ -583,7 +651,17 @@ if [[ "$PD_ROLE" == "prefill" ]]; then
     log "  Bind:        ${PREFILL_HOST}:${PREFILL_PORT}"
 else
     log "  Bind:        ${DECODE_HOST}:${DECODE_PORT}"
-    log "  Prefill URL: ${PREFILL_URL:-<not set>}"
+    if [[ -z "$PREFILL_URLS" ]]; then
+        log "  Prefill URLs: <not set>"
+    else
+        # Word-split in a subshell so set -e / outer $@ are untouched.
+        _count=$(set -- $PREFILL_URLS; echo $#)
+        log "  Prefill URLs: ${_count} node(s)"
+        for url in $PREFILL_URLS; do
+            log "    - $url (bootstrap=${DISAGG_BOOTSTRAP_PORT})"
+        done
+        unset _count
+    fi
     log "  Router:      $(bool_is_true "$ENABLE_ROUTER" && echo "enabled (port $ROUTER_PORT)" || echo "disabled")"
     log "  Max running: $MAX_RUNNING_REQUESTS"
 fi
@@ -697,24 +775,58 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     mkdir -p "$CASE_DIR"
     SERVER_LOG="${CASE_DIR}/server_decode.log"
 
-    # Validate PREFILL_URL
-    if [[ -z "$PREFILL_URL" ]]; then
-        log "ERROR: PREFILL_URL must be set for decode node (e.g. PREFILL_URL=http://10.0.0.1:30000)"
+    # Validate PREFILL_URLS (decode role only).
+    if [[ -z "$PREFILL_URLS" ]]; then
+        log "ERROR: PREFILL_URLS (or PREFILL_URL) must be set for decode node"
+        log "  e.g. PREFILL_URLS=\"http://10.0.0.1:30000 http://10.0.0.2:30000\""
+        exit 1
+    fi
+    # Reject comma-separated form up front; the router would otherwise see
+    # one bogus URL and fail with a confusing connection error.
+    if [[ "$PREFILL_URLS" == *","* ]]; then
+        log "ERROR: PREFILL_URLS must be SPACE-separated, got commas: '$PREFILL_URLS'"
+        log "  Correct form: PREFILL_URLS=\"http://p1:30000 http://p2:30000\""
+        exit 1
+    fi
+    # Parse into array. `|| true` shields `read`'s EOF non-zero from set -e.
+    read -r -a PREFILL_URLS_ARR <<< "$PREFILL_URLS" || true
+    if (( ${#PREFILL_URLS_ARR[@]} == 0 )); then
+        log "ERROR: PREFILL_URLS parsed to 0 entries: '$PREFILL_URLS'"
         exit 1
     fi
 
-    # Extract prefill host/port from URL for TCP check
-    PREFILL_CHECK_HOST="$(echo "$PREFILL_URL" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
-    PREFILL_CHECK_PORT="$(echo "$PREFILL_URL" | sed -E 's|.*:([0-9]+).*|\1|')"
+    # Probe all prefill servers in parallel so wall-clock is max(timeout)
+    # instead of sum(timeout). Failures are collected via tmp marker files
+    # because subshell exit codes are unreliable under set -e.
+    log "Probing ${#PREFILL_URLS_ARR[@]} prefill server(s) in parallel..."
+    _probe_dir="$(mktemp -d)"
+    declare -a _probe_pids=()
+    for url in "${PREFILL_URLS_ARR[@]}"; do
+        host="$(echo "$url" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
+        port="$(echo "$url" | sed -E 's|.*:([0-9]+).*|\1|')"
+        (
+            if wait_for_tcp "$host" "$port" "$PREFILL_WAIT_TIMEOUT" "Prefill ${url}"; then
+                :
+            else
+                # Sanitize url to a safe filename.
+                echo "$url" > "${_probe_dir}/$(echo "$url" | tr '/:' '__').fail"
+            fi
+        ) &
+        _probe_pids+=( "$!" )
+    done
+    for pid in "${_probe_pids[@]}"; do wait "$pid" || true; done
 
-    log "Waiting for prefill server at ${PREFILL_CHECK_HOST}:${PREFILL_CHECK_PORT}..."
-    if ! wait_for_tcp "$PREFILL_CHECK_HOST" "$PREFILL_CHECK_PORT" "$PREFILL_WAIT_TIMEOUT" "Prefill server"; then
-        log "FATAL: Prefill server not reachable. Start prefill node first."
-        echo "FAILED (prefill not reachable)" >> "$SUMMARY_FILE"
+    if compgen -G "${_probe_dir}/*.fail" > /dev/null; then
+        for f in "${_probe_dir}"/*.fail; do
+            log "FATAL: Prefill $(cat "$f") not reachable."
+            echo "FAILED (prefill $(cat "$f") not reachable)" >> "$SUMMARY_FILE"
+        done
+        rm -rf "$_probe_dir"
         kill_master
         exit 1
     fi
-    log "Prefill server is reachable."
+    rm -rf "$_probe_dir"
+    log "All ${#PREFILL_URLS_ARR[@]} prefill server(s) reachable."
 
     log "Launching decode server..."
     launch_pd_server decode "$DECODE_HOST" "$DECODE_PORT" \
@@ -737,13 +849,27 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     if bool_is_true "$ENABLE_ROUTER"; then
         ROUTER_LOG="${CASE_DIR}/router.log"
         log "Launching router at ${ROUTER_HOST}:${ROUTER_PORT}..."
-        python -m sglang_router.launch_router \
-            --pd-disaggregation \
-            --prefill "$PREFILL_URL" "$DISAGG_BOOTSTRAP_PORT" \
-            --decode "http://localhost:${DECODE_PORT}" \
-            --host "$ROUTER_HOST" \
-            --port "$ROUTER_PORT" \
-            > "$ROUTER_LOG" 2>&1 &
+        # Health check tuning: default timeout=5s fails under high-concurrency
+        # stress because prefill's uvicorn /health shares its event loop with
+        # /generate (which is running 2048-token forwards).  Bump timeout to
+        # 120s and failure threshold to 20 so legitimate slow health responses
+        # aren't treated as the worker being dead.  Tunable via env.
+        # Build router command as an array so we can fan out one --prefill
+        # per entry of PREFILL_URLS_ARR (xP1D). All prefills share the same
+        # DISAGG_BOOTSTRAP_PORT (different hosts, no port collision).
+        router_cmd=( python -m sglang_router.launch_router --pd-disaggregation )
+        for url in "${PREFILL_URLS_ARR[@]}"; do
+            router_cmd+=( --prefill "$url" "$DISAGG_BOOTSTRAP_PORT" )
+        done
+        router_cmd+=(
+            --decode "http://localhost:${DECODE_PORT}"
+            --host "$ROUTER_HOST"
+            --port "$ROUTER_PORT"
+            --health-check-timeout-secs "${ROUTER_HEALTH_TIMEOUT_SECS:-120}"
+            --health-check-interval-secs "${ROUTER_HEALTH_INTERVAL_SECS:-60}"
+            --health-failure-threshold "${ROUTER_HEALTH_FAILURE_THRESHOLD:-20}"
+        )
+        "${router_cmd[@]}" > "$ROUTER_LOG" 2>&1 &
         ROUTER_PID=$!
         log "Router PID: $ROUTER_PID"
 

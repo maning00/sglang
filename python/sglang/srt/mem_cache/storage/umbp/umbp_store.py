@@ -9,6 +9,7 @@ Follows the same pattern as MooncakeStore:
 import logging
 import os
 import socket
+import threading
 from typing import Any, List, Optional
 
 import torch
@@ -257,10 +258,26 @@ class UMBPStore(HiCacheStorage):
                 extra["spdk_proxy_reserved_shared_bytes"]
             )
 
+        # Operator-controlled escape hatch for hosts whose RDMA NIC cannot
+        # register a single memory region as large as the full host KV buffer
+        # (e.g. AINIC has a per-MR size cap).  When set, skip the one-shot
+        # register_memory() call in register_mem_pool_host() and stay on the
+        # staging-buffer fallback path (each transfer copies through a
+        # staging_buffer_size-bounded MR that the IO engine pre-registers).
+        disable_zero_copy_register = extra.get(
+            "disable_zero_copy_register",
+            _optional_env_str("UMBP_DISABLE_ZERO_COPY_REGISTER"),
+        )
+        self._disable_zero_copy_register = (
+            _bool_from_any(disable_zero_copy_register)
+            if disable_zero_copy_register is not None
+            else False
+        )
+
         master_address = extra.get("master_address", _optional_env_str("UMBP_MASTER_ADDRESS"))
         if master_address and UMBPDistributedConfig is not None:
             dist_cfg = UMBPDistributedConfig()
-            dist_cfg.master_address = str(master_address)
+            dist_cfg.master_config.master_address = str(master_address)
 
             node_address = extra.get("node_address", _optional_env_str("UMBP_NODE_ADDRESS"))
             if node_address is None:
@@ -272,16 +289,16 @@ class UMBPStore(HiCacheStorage):
                     "node_address",
                     str,
                 )
-            dist_cfg.node_address = node_address
+            dist_cfg.master_config.node_address = node_address
 
             node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
             if node_id is None:
-                dist_cfg.node_id = (
+                dist_cfg.master_config.node_id = (
                     f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
                     f":pp{self.pp_rank}:tp{self.local_rank}"
                 )
             else:
-                dist_cfg.node_id = _select_rank_config_value(
+                dist_cfg.master_config.node_id = _select_rank_config_value(
                     node_id,
                     unique_rank,
                     "node_id",
@@ -289,7 +306,7 @@ class UMBPStore(HiCacheStorage):
                 )
 
             if "auto_heartbeat" in extra:
-                dist_cfg.auto_heartbeat = _bool_from_any(extra["auto_heartbeat"])
+                dist_cfg.master_config.auto_heartbeat = _bool_from_any(extra["auto_heartbeat"])
 
             io_engine_host = extra.get(
                 "io_engine_host", _optional_env_str("UMBP_IO_ENGINE_HOST")
@@ -303,13 +320,13 @@ class UMBPStore(HiCacheStorage):
                     "io_engine_host",
                     str,
                 )
-            dist_cfg.io_engine_host = io_engine_host
+            dist_cfg.io_engine.host = io_engine_host
 
             io_engine_port = extra.get(
                 "io_engine_port", _optional_env_str("UMBP_IO_ENGINE_PORT")
             )
             if io_engine_port is not None:
-                dist_cfg.io_engine_port = _select_rank_config_value(
+                dist_cfg.io_engine.port = _select_rank_config_value(
                     io_engine_port,
                     unique_rank,
                     "io_engine_port",
@@ -339,25 +356,91 @@ class UMBPStore(HiCacheStorage):
             if cache_remote_fetches is not None:
                 dist_cfg.cache_remote_fetches = _bool_from_any(cache_remote_fetches)
 
+            # Auto-compute master's PageBitmapAllocator page_size so every
+            # UMBPStore Put/Get maps to exactly one master page (no partial
+            # tail, 1 RDMA per page).  Resolution order:
+            #   1. extra_config["dram_page_size"] — explicit operator override
+            #      (escape hatch for debugging / forced experiments).
+            #   2. derived from mem_pool_host (the normal production path).
+            #   3. left at 0 when neither source is available; mori's
+            #      UMBPDistributedConfig.dram_page_size defaults to 0, which
+            #      delegates to the master-side ClientRegistryConfig
+            #      .default_dram_page_size (2 MiB by default). The
+            #      partial-tail safety net in PoolClient handles any
+            #      size mismatch.
+            page_byte_size = None
+            if "dram_page_size" in extra:
+                page_byte_size = int(extra["dram_page_size"])
+            elif mem_pool_host is not None:
+                # Probe element_size from the same buffer-meta helper that
+                # batch_preprocess will actually use; this matches per-call
+                # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
+                # without per-case formulas (NSA in particular: get_ksize_per_token
+                # would over-count by the indexer buffer that is never put to UMBP).
+                dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
+                if self.is_mla_backend:
+                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                elif storage_config is not None and getattr(
+                    storage_config, "should_split_heads", False
+                ):
+                    sf = storage_config.tp_lcm_size // storage_config.tp_size
+                    _, esz = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                else:
+                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                page_byte_size = int(esz[0]) if esz else 0
+
+            if page_byte_size is not None and page_byte_size > 0 and hasattr(
+                dist_cfg, "dram_page_size"
+            ):
+                dist_cfg.dram_page_size = int(page_byte_size)
+                logger.info(
+                    "UMBPStore: setting master dram_page_size=%d "
+                    "(ksize_per_token=%s × page_size=%s%s)",
+                    dist_cfg.dram_page_size,
+                    (
+                        mem_pool_host.get_ksize_per_token()
+                        if mem_pool_host is not None
+                        else "n/a"
+                    ),
+                    (
+                        mem_pool_host.page_size
+                        if mem_pool_host is not None
+                        else "n/a"
+                    ),
+                    (
+                        f" / split_factor={storage_config.tp_lcm_size // storage_config.tp_size}"
+                        if (
+                            mem_pool_host is not None
+                            and storage_config is not None
+                            and getattr(storage_config, "should_split_heads", False)
+                        )
+                        else ""
+                    ),
+                )
+
             cfg.distributed = dist_cfg
             logger.info(
                 "UMBPStore distributed mode: master=%s, node_id=%s, node_addr=%s, "
                 "io=%s:%s, peer_port=%s",
-                dist_cfg.master_address,
-                dist_cfg.node_id,
-                dist_cfg.node_address,
-                dist_cfg.io_engine_host,
-                dist_cfg.io_engine_port,
+                dist_cfg.master_config.master_address,
+                dist_cfg.master_config.node_id,
+                dist_cfg.master_config.node_address,
+                dist_cfg.io_engine.host,
+                dist_cfg.io_engine.port,
                 dist_cfg.peer_service_port,
             )
 
         self.storage_config = storage_config
 
-        # MLA + TP > 1: shared SSD mode
+        # MLA + TP > 1: shared SSD mode (standalone only).
+        # In distributed mode every rank is a peer of the master-led pool; we
+        # must NOT short-circuit followers (would leave their DRAM pool empty
+        # while the master still routes keys to them, causing Get misses).
         self.is_mla_follower = False
         tp_size = self.tp_size
         use_spdk = cfg.ssd_backend in ("spdk", "spdk_proxy")
-        if self.is_mla_backend and tp_size > 1:
+        distributed_enabled = cfg.distributed is not None
+        if not distributed_enabled and self.is_mla_backend and tp_size > 1:
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
@@ -530,6 +613,40 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd_backend,
         )
 
+        # ------------------------------------------------------------------
+        # Optional KV events subscriber
+        # Enabled via extra_config["kv_events_subscriber"] = True/1/"true".
+        # Extra knobs:
+        #   kv_events_endpoint — ZMQ connect address (default "tcp://localhost:5557")
+        #   kv_events_topic    — topic filter matching the server's topic (default "")
+        # ------------------------------------------------------------------
+        _is_dp_mode = dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
+        _dp_rank = dp_rank_hint if dp_rank_hint is not None else 0
+
+        self._kv_events_subscriber: Optional[KVEventsSubscriber] = None
+        if _bool_from_any(extra.get("kv_events_subscriber", False)):
+            # DP mode: all DP clients subscribe (filter by dp_rank in on_event).
+            # TP-only mode: only rank 0 subscribes.
+            if _is_dp_mode or self.local_rank == 0:
+                from sglang.srt.disaggregation.kv_events import ZmqEventPublisher
+
+                kv_endpoint_base = str(
+                    extra.get("kv_events_endpoint", "tcp://localhost:5557")
+                )
+                kv_endpoint = (
+                    ZmqEventPublisher.offset_endpoint_port(kv_endpoint_base, _dp_rank)
+                    if _is_dp_mode
+                    else kv_endpoint_base
+                )
+                kv_topic = str(extra.get("kv_events_topic", ""))
+                self._kv_events_subscriber = KVEventsSubscriber(
+                    umbp_client=self.client,
+                    endpoint=kv_endpoint,
+                    topic=kv_topic,
+                    dp_rank=_dp_rank if _is_dp_mode else None,
+                )
+                self._kv_events_subscriber.start()
+
     # ------------------------------------------------------------------
     # Host memory pool registration
     # ------------------------------------------------------------------
@@ -540,6 +657,58 @@ class UMBPStore(HiCacheStorage):
             "page_first_direct",
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
+
+        # In distributed mode, pre-register the entire host KV buffer with the
+        # underlying RDMA IOEngine so PoolClient can take the zero-copy path
+        # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
+        # buffer memcpy + lock and removes the per-call `staging_buffer_size`
+        # cap).  Standalone returns true as no-op by IUMBPClient contract;
+        # we still gate on is_distributed() below to avoid a pointless call.
+        self._zero_copy_registered = False
+        if self.client is None:
+            return
+        try:
+            is_distributed = bool(self.client.is_distributed())
+        except Exception:
+            is_distributed = False
+        if not is_distributed:
+            return
+        if not hasattr(self.client, "register_memory"):
+            return
+        if getattr(self, "_disable_zero_copy_register", False):
+            logger.info(
+                "UMBPStore: skipping host KV buffer RDMA registration because "
+                "disable_zero_copy_register=true (UMBP_DISABLE_ZERO_COPY_REGISTER). "
+                "Falling back to the staging-buffer transfer path; per-transfer "
+                "size is capped by distributed.staging_buffer_size."
+            )
+            return
+        try:
+            kv_buffer = mem_pool_host.kv_buffer
+            host_ptr = int(kv_buffer.data_ptr())
+            host_size = int(kv_buffer.numel() * kv_buffer.element_size())
+            ok = bool(self.client.register_memory(host_ptr, host_size))
+        except Exception as exc:
+            logger.warning(
+                "UMBPStore: register_memory failed (%s); falling back to staging "
+                "buffer path. Per-transfer size will be capped by "
+                "distributed.staging_buffer_size.",
+                exc,
+            )
+            return
+        if ok:
+            self._zero_copy_registered = True
+            logger.info(
+                "UMBPStore: registered host KV buffer for RDMA zero-copy "
+                "(ptr=0x%x, size=%d MB)",
+                host_ptr,
+                host_size // (1024 * 1024),
+            )
+        else:
+            logger.warning(
+                "UMBPStore: register_memory returned false; staying on staging "
+                "buffer fallback path."
+            )
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
@@ -626,7 +795,18 @@ class UMBPStore(HiCacheStorage):
         else:
             sizes = list(buffer_sizes)
 
+        total_bytes = sum(sizes)
+        logger.info(
+            '[UMBPStore] batch_get_v1: calling UMBP BatchGet: '
+            'keys=%d expanded_keys=%d total_bytes=%d',
+            len(keys), len(key_strs), total_bytes,
+        )
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
+        success_count = sum(1 for r in get_results if r)
+        logger.info(
+            '[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d',
+            success_count, len(get_results),
+        )
         return self._batch_postprocess(get_results)
 
     def _compute_expanded_depths(
@@ -682,6 +862,13 @@ class UMBPStore(HiCacheStorage):
 
         expanded_depths = self._compute_expanded_depths(keys, extra_info)
 
+        total_bytes = sum(sizes)
+        logger.info(
+            '[UMBPStore] batch_set_v1: calling UMBP BatchPut: '
+            'keys=%d expanded_keys=%d total_bytes=%d with_depth=%s',
+            len(keys), len(key_strs), total_bytes, bool(expanded_depths),
+        )
+
         if expanded_depths:
             put_results = self.client.batch_put_from_ptr_with_depth(
                 key_strs, list(buffer_ptrs), sizes, expanded_depths
@@ -691,6 +878,11 @@ class UMBPStore(HiCacheStorage):
                 key_strs, list(buffer_ptrs), sizes
             )
 
+        success_count = sum(1 for r in put_results if r)
+        logger.info(
+            '[UMBPStore] batch_set_v1: UMBP BatchPut done: success=%d/%d',
+            success_count, len(put_results),
+        )
         return self._batch_postprocess(put_results, is_set_operate=True)
 
     def batch_exists(
@@ -794,6 +986,12 @@ class UMBPStore(HiCacheStorage):
         return bool(self.client.flush())
 
     def close(self) -> None:
+        if getattr(self, "_kv_events_subscriber", None) is not None:
+            try:
+                self._kv_events_subscriber.stop()
+            except Exception:
+                logger.exception("KVEventsSubscriber stop during close failed")
+            self._kv_events_subscriber = None
         if getattr(self, "client", None) is None:
             return
         try:
@@ -801,3 +999,210 @@ class UMBPStore(HiCacheStorage):
         except Exception:
             logger.exception("UMBPStore flush during close failed")
         self.client = None
+
+
+class KVEventsSubscriber:
+    """Subscribe to SGLang KV cache events published over ZMQ and forward
+    them to the UMBP Master via ``umbp_client``.
+
+    Runs a background thread that receives :class:`KVEventBatch` messages
+    from a ``ZmqEventPublisher`` and dispatches each individual event to
+    :meth:`on_event`.
+
+    Parameters
+    ----------
+    umbp_client:
+        The ``UMBPClient`` instance owned by the parent ``UMBPStore``.
+        Will be used to publish events to the UMBP Master.
+    endpoint:
+        ZMQ endpoint of the SGLang publisher, e.g. ``"tcp://localhost:5557"``.
+        For DP attention rank *N*, the port is offset by *N* (rank 0 → 5557,
+        rank 1 → 5558, …).
+    topic:
+        Topic filter passed to ``zmq.SUBSCRIBE``.  Must match the ``topic``
+        set in ``KVEventsConfig`` on the server side.  Empty string subscribes
+        to everything.
+    poll_timeout_ms:
+        How long (in milliseconds) the receiver thread waits for a message
+        before looping and checking the stop flag.
+    """
+
+    def __init__(
+        self,
+        umbp_client: Any,
+        endpoint: str = "tcp://localhost:5557",
+        topic: str = "",
+        poll_timeout_ms: int = 100,
+        dp_rank: Optional[int] = None,
+    ) -> None:
+        self._umbp_client = umbp_client
+        self._endpoint = endpoint
+        self._topic = topic
+        self._poll_timeout_ms = poll_timeout_ms
+        # When set, only process events whose attn_dp_rank matches (DP mode).
+        self._dp_rank = dp_rank
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # Track reported hashes so AllBlocksCleared can revoke them all.
+        self._reported_hashes: set = set()
+        self._hashes_lock = threading.Lock()
+        # Cache UMBPTierType constants to avoid repeated attribute lookups.
+        import mori.umbp as _umbp_mod
+
+        _tier = _umbp_mod.UMBPTierType
+        self._tier_hbm = _tier.HBM
+        self._tier_dram = _tier.DRAM
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the subscriber background thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="kv-events-subscriber",
+        )
+        self._thread.start()
+        logger.info(
+            "KVEventsSubscriber started: endpoint=%s, topic=%r",
+            self._endpoint,
+            self._topic,
+        )
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Signal the subscriber thread to stop and wait for it to finish."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        logger.info("KVEventsSubscriber stopped")
+
+    # ------------------------------------------------------------------
+    # Event handler
+    # ------------------------------------------------------------------
+
+    def _medium_to_tier(self, medium: Optional[str]) -> Any:
+        """Map a KV event medium string to a UMBPTierType value.
+
+        ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
+        All other values (CPU pinned, unknown) map to DRAM.
+        """
+        from sglang.srt.disaggregation.kv_events import MEDIUM_GPU
+
+        return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
+
+    def on_event(self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]) -> None:
+        """Called once per individual KV cache event.
+
+        Translates SGLang KV cache events into UMBP external KV block
+        report / revoke calls so the UMBP Master can track which GPU/CPU
+        blocks are available on each node for cross-node cache lookup.
+
+        Parameters
+        ----------
+        event:
+            One of :class:`~sglang.srt.disaggregation.kv_events.BlockStored`,
+            :class:`~sglang.srt.disaggregation.kv_events.BlockRemoved`, or
+            :class:`~sglang.srt.disaggregation.kv_events.AllBlocksCleared`.
+        batch_ts:
+            Unix timestamp of the :class:`KVEventBatch` that contained this event.
+        attn_dp_rank:
+            DP attention rank that produced the event, or ``None`` for rank 0.
+        """
+        from sglang.srt.disaggregation.kv_events import (
+            AllBlocksCleared,
+            BlockRemoved,
+            BlockStored,
+        )
+
+        if self._dp_rank is not None:
+            event_dp_rank = attn_dp_rank if attn_dp_rank is not None else 0
+            if event_dp_rank != self._dp_rank:
+                return
+
+        if isinstance(event, BlockStored):
+            hashes = [str(h) for h in event.block_hashes]
+            tier = self._medium_to_tier(event.medium)
+            ok = self._umbp_client.report_external_kv_blocks(hashes, tier)
+            if not ok:
+                logger.warning(
+                    "report_external_kv_blocks failed for %d hashes (dp_rank=%s)",
+                    len(hashes),
+                    attn_dp_rank,
+                )
+            with self._hashes_lock:
+                self._reported_hashes.update(hashes)
+
+        elif isinstance(event, BlockRemoved):
+            hashes = [str(h) for h in event.block_hashes]
+            ok = self._umbp_client.revoke_external_kv_blocks(hashes)
+            if not ok:
+                logger.warning(
+                    "revoke_external_kv_blocks failed for %d hashes (dp_rank=%s)",
+                    len(hashes),
+                    attn_dp_rank,
+                )
+            with self._hashes_lock:
+                self._reported_hashes.difference_update(hashes)
+
+        elif isinstance(event, AllBlocksCleared):
+            with self._hashes_lock:
+                all_hashes = list(self._reported_hashes)
+                self._reported_hashes.clear()
+            if all_hashes:
+                ok = self._umbp_client.revoke_external_kv_blocks(all_hashes)
+                if not ok:
+                    logger.warning(
+                        "revoke_external_kv_blocks (all-clear) failed for %d hashes",
+                        len(all_hashes),
+                    )
+
+        else:
+            logger.debug(
+                "KVEventsSubscriber: unhandled event type %s", type(event).__name__
+            )
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _run(self) -> None:
+        import zmq
+        from msgspec.msgpack import Decoder
+
+        from sglang.srt.disaggregation.kv_events import KVEventBatch
+
+        decoder = Decoder(type=KVEventBatch)
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        sub.connect(self._endpoint)
+        sub.setsockopt_string(zmq.SUBSCRIBE, self._topic)
+        logger.debug(
+            "KVEventsSubscriber connected to %s, topic=%r", self._endpoint, self._topic
+        )
+
+        try:
+            while not self._stop_event.is_set():
+                if not sub.poll(self._poll_timeout_ms):
+                    continue
+                try:
+                    parts = sub.recv_multipart()
+                    # Publisher sends: [topic, seq_bytes, payload]
+                    if len(parts) != 3:
+                        logger.warning(
+                            "Unexpected frame count %d from publisher", len(parts)
+                        )
+                        continue
+                    _, _seq_bytes, payload = parts
+                    batch = decoder.decode(payload)
+                    for event in batch.events:
+                        self.on_event(event, batch.ts, batch.attn_dp_rank)
+                except Exception:
+                    logger.exception("KVEventsSubscriber error decoding message")
+        finally:
+            sub.close(linger=0)
