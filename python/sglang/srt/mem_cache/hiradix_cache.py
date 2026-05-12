@@ -12,6 +12,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_CPU,
+    MEDIUM_GPU,
+    MEDIUM_STORAGE,
+    BlockRemoved,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -153,6 +159,7 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        self._reported_storage_hashes: set[int] = set()
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -382,6 +389,7 @@ class HiRadixCache(RadixCache):
         # After controller threads are fully stopped, it's safe to force-release any
         # leftover pending ops (e.g., async prefetch/backup that didn't get a revoke/ack).
         self._force_release_pending_storage_ops()
+        self._record_storage_remove_events()
 
         self.enable_storage = False
         self.enable_storage_metrics = False
@@ -494,6 +502,14 @@ class HiRadixCache(RadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     entry.release_host()
+                    completed_pages = int(operation.completed_tokens) // self.page_size
+                    if completed_pages > 0:
+                        emitted = self._record_store_event(
+                            entry,
+                            medium=MEDIUM_STORAGE,
+                            max_pages=completed_pages,
+                        )
+                        self._reported_storage_hashes.update(emitted)
                 if log_metrics and self.enable_storage_metrics:
                     backuped_tokens = int(operation.completed_tokens)
                     self.storage_metrics_collector.log_backuped_tokens(backuped_tokens)
@@ -609,10 +625,16 @@ class HiRadixCache(RadixCache):
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
+            if not self.is_storage_idle():
+                logger.warning(
+                    "clear_storage_backend rejected: storage operations are still in-flight."
+                )
+                return False
             try:
                 # Check if the storage backend has a clear method (for nixl backends)
                 if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
+                    self._record_storage_remove_events()
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
@@ -628,6 +650,34 @@ class HiRadixCache(RadixCache):
         else:
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
+
+    def is_storage_idle(self) -> bool:
+        """Return true when no storage-affecting HiCache work is queued or active."""
+        if not self.enable_storage:
+            return True
+        cc = self.cache_controller
+        return (
+            len(self.ongoing_write_through) == 0
+            and len(self.ongoing_backup) == 0
+            and len(self.ongoing_prefetch) == 0
+            and len(cc.ack_write_queue) == 0
+            and cc.backup_queue.empty()
+            and cc.ack_backup_queue.empty()
+            and cc.prefetch_queue.empty()
+            and cc.prefetch_revoke_queue.empty()
+            and cc.host_mem_release_queue.empty()
+        )
+
+    def _record_storage_remove_events(self) -> None:
+        if not self.enable_kv_cache_events or not self._reported_storage_hashes:
+            self._reported_storage_hashes.clear()
+            return
+
+        for block_hash in sorted(self._reported_storage_hashes):
+            self.kv_event_queue.append(
+                BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_STORAGE)
+            )
+        self._reported_storage_hashes.clear()
 
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
@@ -692,6 +742,7 @@ class HiRadixCache(RadixCache):
                     )
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
+                        self._record_store_event(backuped_node, medium=MEDIUM_CPU)
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -732,6 +783,7 @@ class HiRadixCache(RadixCache):
             )
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
+                self._record_store_event(backuped_node, medium=MEDIUM_CPU)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
@@ -754,8 +806,10 @@ class HiRadixCache(RadixCache):
             )
             # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
-                end_node = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(end_node)
+                nodes = self.ongoing_load_back.pop(ack_id)
+                for node in nodes:
+                    self._record_store_event(node, medium=MEDIUM_GPU)
+                self.dec_lock_ref(nodes[-1])
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
@@ -1047,7 +1101,8 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
+        # GPU copy is freed; the CPU copy remains addressable via load_back.
+        self._record_remove_event(node, medium=MEDIUM_GPU)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
@@ -1101,7 +1156,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit BlockRemoved so the router removes this block from its index.
-            self._record_remove_event(x)
+            self._record_remove_event(x, medium=MEDIUM_CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
             x.host_value = None
 
@@ -1162,7 +1217,7 @@ class HiRadixCache(RadixCache):
             )
             return None
 
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self.ongoing_load_back[last_hit_node.id] = nodes_to_load
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
@@ -1501,6 +1556,7 @@ class HiRadixCache(RadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
+            self._record_store_event(new_node, medium=MEDIUM_CPU)
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)

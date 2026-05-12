@@ -1390,6 +1390,11 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
+            if not self.is_storage_idle():
+                logger.warning(
+                    "clear_storage_backend rejected: storage operations are still in-flight."
+                )
+                return False
             try:
                 if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
@@ -1410,6 +1415,23 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
+
+    def is_storage_idle(self) -> bool:
+        """Return true when no storage-affecting HiCache work is queued or active."""
+        if not self.enable_storage:
+            return True
+        cc = self.cache_controller
+        return (
+            len(self.ongoing_write_through) == 0
+            and len(self.ongoing_backup) == 0
+            and len(self.ongoing_prefetch) == 0
+            and len(cc.ack_write_queue) == 0
+            and cc.backup_queue.empty()
+            and cc.ack_backup_queue.empty()
+            and cc.prefetch_queue.empty()
+            and cc.prefetch_revoke_queue.empty()
+            and cc.host_mem_release_queue.empty()
+        )
 
     def drain_storage_control_queues(self):
         cc = self.cache_controller

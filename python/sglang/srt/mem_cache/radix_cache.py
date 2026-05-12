@@ -828,8 +828,14 @@ class RadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size
 
-    def _record_store_event(self, node: TreeNode):
+    def _record_store_event(
+        self,
+        node: TreeNode,
+        medium: str = MEDIUM_GPU,
+        max_pages: Optional[int] = None,
+    ) -> list[int]:
         # One BlockStored per ``page_size`` chunk.
+        emitted_hashes: list[int] = []
         if self.enable_kv_cache_events:
             # Compute hash_value lazily if not already set
             if node.hash_value is None:
@@ -846,6 +852,8 @@ class RadixCache(BasePrefixCache):
 
             page_index = 0
             for start in range(0, len(node.key), self.page_size):
+                if max_pages is not None and page_index >= max_pages:
+                    break
                 page_tokens = node.key.token_ids[start : start + self.page_size]
                 if not page_tokens:
                     continue
@@ -859,14 +867,16 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
-                        medium=MEDIUM_GPU,
+                        medium=medium,
                     )
                 )
+                emitted_hashes.append(block_hash)
 
                 parent_block_hash = block_hash
                 page_index += 1
+        return emitted_hashes
 
-    def _record_remove_event(self, node: TreeNode):
+    def _record_remove_event(self, node: TreeNode, medium: str = MEDIUM_GPU):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
             # Compute hash_value lazily if not already set (must match what was stored)
@@ -882,7 +892,7 @@ class RadixCache(BasePrefixCache):
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
                 )
 
                 page_index += 1

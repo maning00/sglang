@@ -10,6 +10,7 @@ import logging
 import os
 import socket
 import threading
+from collections import defaultdict
 from typing import Any, List, Optional
 
 import torch
@@ -1069,7 +1070,8 @@ class KVEventsSubscriber:
         self._dp_rank = dp_rank
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Track reported hashes so AllBlocksCleared can revoke them all.
+        # Track reported (hash, tier) pairs so AllBlocksCleared can revoke
+        # volatile tiers without touching storage-backed entries.
         self._reported_hashes: set = set()
         self._hashes_lock = threading.Lock()
         # Cache UMBPTierType constants to avoid repeated attribute lookups.
@@ -1078,6 +1080,7 @@ class KVEventsSubscriber:
         _tier = _umbp_mod.UMBPTierType
         self._tier_hbm = _tier.HBM
         self._tier_dram = _tier.DRAM
+        self._tier_ssd = _tier.SSD
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1115,12 +1118,23 @@ class KVEventsSubscriber:
     def _medium_to_tier(self, medium: Optional[str]) -> Any:
         """Map a KV event medium string to a UMBPTierType value.
 
-        ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
-        All other values (CPU pinned, unknown) map to DRAM.
+        ``MEDIUM_GPU`` maps to HBM, ``MEDIUM_CPU`` maps to DRAM, and
+        ``MEDIUM_STORAGE`` maps to SSD.
         """
-        from sglang.srt.disaggregation.kv_events import MEDIUM_GPU
+        from sglang.srt.disaggregation.kv_events import (
+            MEDIUM_CPU,
+            MEDIUM_GPU,
+            MEDIUM_STORAGE,
+        )
 
-        return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
+        if medium == MEDIUM_GPU:
+            return self._tier_hbm
+        if medium == MEDIUM_CPU:
+            return self._tier_dram
+        if medium == MEDIUM_STORAGE:
+            return self._tier_ssd
+        logger.warning("Unknown KV event medium %r, defaulting to DRAM", medium)
+        return self._tier_dram
 
     def on_event(
         self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]
@@ -1164,11 +1178,12 @@ class KVEventsSubscriber:
                     attn_dp_rank,
                 )
             with self._hashes_lock:
-                self._reported_hashes.update(hashes)
+                self._reported_hashes.update((h, tier) for h in hashes)
 
         elif isinstance(event, BlockRemoved):
             hashes = [str(h) for h in event.block_hashes]
-            ok = self._umbp_client.revoke_external_kv_blocks(hashes)
+            tier = self._medium_to_tier(event.medium)
+            ok = self._umbp_client.revoke_external_kv_blocks(hashes, tier)
             if not ok:
                 logger.warning(
                     "revoke_external_kv_blocks failed for %d hashes (dp_rank=%s)",
@@ -1176,18 +1191,24 @@ class KVEventsSubscriber:
                     attn_dp_rank,
                 )
             with self._hashes_lock:
-                self._reported_hashes.difference_update(hashes)
+                self._reported_hashes.difference_update((h, tier) for h in hashes)
 
         elif isinstance(event, AllBlocksCleared):
             with self._hashes_lock:
-                all_hashes = list(self._reported_hashes)
-                self._reported_hashes.clear()
-            if all_hashes:
-                ok = self._umbp_client.revoke_external_kv_blocks(all_hashes)
+                to_revoke: dict[Any, list[str]] = defaultdict(list)
+                remaining = set()
+                for h, tier in self._reported_hashes:
+                    if tier == self._tier_ssd:
+                        remaining.add((h, tier))
+                    else:
+                        to_revoke[tier].append(h)
+                self._reported_hashes = remaining
+            for tier, hashes in to_revoke.items():
+                ok = self._umbp_client.revoke_external_kv_blocks(hashes, tier)
                 if not ok:
                     logger.warning(
                         "revoke_external_kv_blocks (all-clear) failed for %d hashes",
-                        len(all_hashes),
+                        len(hashes),
                     )
 
         else:
