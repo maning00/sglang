@@ -64,6 +64,14 @@ Environment variables (override defaults):
   ENABLE_UMBP               Enable L3 UMBP (DRAM+SSD) (default: true)
   HICACHE_SIZE              L2 DRAM size in GB/rank (default: 128)
 
+  # L2 hugepage backing (forwarded to sglang's UMBPHostTensorAllocator)
+  SGLANG_HICACHE_HOST_HUGEPAGE       Use anonymous hugepages for L2 (default: 1; 0=4 KiB anon)
+  SGLANG_HICACHE_HOST_HUGEPAGE_SIZE  Hugepage size in bytes (default: 2097152 = 2 MiB)
+  SGLANG_HICACHE_HOST_PREFAULT       Eagerly commit pages via MADV_POPULATE_WRITE (default: 1)
+  SGLANG_HICACHE_HOST_NUMA_NODE      NUMA node to bind L2 to; -1 = no binding (default: unset)
+  HUGEPAGE_AUTO_RESERVE              Try sysctl to raise nr_hugepages if short (default: false)
+  HUGEPAGE_HEADROOM_PERCENT          Extra hugepages on top of computed minimum (default: 5)
+
   # Decode-specific
   MAX_RUNNING_REQUESTS      Max concurrent requests on decode (default: 128)
 
@@ -149,6 +157,23 @@ ENABLE_UMBP="${ENABLE_UMBP:-true}"
 HICACHE_SIZE="${HICACHE_SIZE:-128}"
 WRITE_POLICY="write_through"
 
+# L2 hugepage backing — forwarded to sglang's UMBPHostTensorAllocator.
+# Defaults match the design: AnonymousHugetlb backing (2 MiB pages), prefault on,
+# no NUMA binding. Set SGLANG_HICACHE_HOST_HUGEPAGE=0 to fall back to 4 KiB anon
+# (useful for A/B comparisons or hosts without hugepage reservations).
+SGLANG_HICACHE_HOST_HUGEPAGE="${SGLANG_HICACHE_HOST_HUGEPAGE:-1}"
+SGLANG_HICACHE_HOST_HUGEPAGE_SIZE="${SGLANG_HICACHE_HOST_HUGEPAGE_SIZE:-2097152}"
+SGLANG_HICACHE_HOST_PREFAULT="${SGLANG_HICACHE_HOST_PREFAULT:-1}"
+SGLANG_HICACHE_HOST_NUMA_NODE="${SGLANG_HICACHE_HOST_NUMA_NODE:-}"
+
+# Hugepage pool sizing for the L2 KV cache.
+# When ENABLE_HICACHE=true and SGLANG_HICACHE_HOST_HUGEPAGE=1, the script
+# verifies HugePages_Free covers HICACHE_SIZE × DP_SIZE × (1 + headroom%).
+# If short, the script fails fast unless HUGEPAGE_AUTO_RESERVE=true, in which
+# case it tries `sysctl -w vm.nr_hugepages=<N>` (needs root or NOPASSWD sudo).
+HUGEPAGE_AUTO_RESERVE="${HUGEPAGE_AUTO_RESERVE:-false}"
+HUGEPAGE_HEADROOM_PERCENT="${HUGEPAGE_HEADROOM_PERCENT:-5}"
+
 # UMBP (L3) config
 UMBP_DRAM_BYTES="${UMBP_DRAM_BYTES:-68719476736}"
 UMBP_SSD_BYTES="${UMBP_SSD_BYTES:-103079215104}"
@@ -226,6 +251,13 @@ PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=6G
+
+# Forward L2 hugepage knobs into sglang's child process. Only export NUMA_NODE
+# when explicitly set so the C++ default (-1 = no binding) wins on absence.
+export SGLANG_HICACHE_HOST_HUGEPAGE
+export SGLANG_HICACHE_HOST_HUGEPAGE_SIZE
+export SGLANG_HICACHE_HOST_PREFAULT
+[[ -n "$SGLANG_HICACHE_HOST_NUMA_NODE" ]] && export SGLANG_HICACHE_HOST_NUMA_NODE
 
 # ---- Helpers ------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -432,6 +464,125 @@ clean_ssd_dir() {
         sleep 2
     done
     log "WARNING: Could not fully remove $UMBP_SSD_DIR, proceeding anyway."
+}
+
+# ----------------------------------------------------------------------------
+# ensure_hugepages: verify (and optionally raise) the system hugepage pool so
+# sglang's UMBPHostTensorAllocator gets AnonymousHugetlb backing for the L2 KV
+# buffer. Without enough free pages, mmap(MAP_HUGETLB) silently falls back to
+# 4 KiB anonymous pages — the allocator logs a WARN and the AINIC single-MR
+# benefit (registering the entire L2 buffer as one RDMA MR) is lost.
+#
+# Required pages per rank = ceil(HICACHE_SIZE GB / hugepage_size).
+# Total                   = pages_per_rank × DP_SIZE × (1 + HUGEPAGE_HEADROOM_PERCENT/100).
+#
+# Behavior:
+#   - Skips if ENABLE_HICACHE=false or SGLANG_HICACHE_HOST_HUGEPAGE=0.
+#   - If HugePages_Free is sufficient: returns 0 (logs the budget).
+#   - If short and HUGEPAGE_AUTO_RESERVE=false: fails with the exact sysctl
+#     command the operator should run.
+#   - If short and HUGEPAGE_AUTO_RESERVE=true: tries sysctl, then re-checks.
+#     Memory fragmentation on a long-running host can still defeat this; in
+#     that case the user must reboot with hugepages= on the kernel cmdline.
+# ----------------------------------------------------------------------------
+ensure_hugepages() {
+    if ! bool_is_true "$ENABLE_HICACHE"; then
+        return 0
+    fi
+    if ! bool_is_true "$SGLANG_HICACHE_HOST_HUGEPAGE"; then
+        log "Hugepage backing disabled (SGLANG_HICACHE_HOST_HUGEPAGE=0); skipping pool check."
+        return 0
+    fi
+
+    local hp_size_bytes="$SGLANG_HICACHE_HOST_HUGEPAGE_SIZE"
+    if (( hp_size_bytes <= 0 )); then
+        log "ERROR: SGLANG_HICACHE_HOST_HUGEPAGE_SIZE must be > 0, got $hp_size_bytes"
+        return 1
+    fi
+    local hp_size_kb=$(( hp_size_bytes / 1024 ))
+    local hp_size_mb=$(( hp_size_bytes / 1024 / 1024 ))
+
+    # Round up: ceil(HICACHE_SIZE * GiB / hp_size_bytes)
+    local bytes_per_rank=$(( HICACHE_SIZE * 1024 * 1024 * 1024 ))
+    local pages_per_rank=$(( (bytes_per_rank + hp_size_bytes - 1) / hp_size_bytes ))
+    # Apply headroom, then round up again.
+    local pages_needed=$(( pages_per_rank * DP_SIZE ))
+    pages_needed=$(( (pages_needed * (100 + HUGEPAGE_HEADROOM_PERCENT) + 99) / 100 ))
+
+    local sys_default_kb cur_total cur_free
+    sys_default_kb=$(grep -oP '^Hugepagesize:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    cur_total=$(grep -oP '^HugePages_Total:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    cur_free=$(grep -oP '^HugePages_Free:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+
+    log "Hugepage check:"
+    log "  Need:    ${pages_needed} pages × ${hp_size_mb} MiB = $((pages_needed * hp_size_mb / 1024)) GiB"
+    log "           (HICACHE_SIZE=${HICACHE_SIZE} GiB × DP_SIZE=${DP_SIZE} + ${HUGEPAGE_HEADROOM_PERCENT}% headroom)"
+    log "  Current: HugePages_Total=${cur_total}, HugePages_Free=${cur_free}, default Hugepagesize=${sys_default_kb} KiB"
+
+    # Warn (but don't fail) if the system default size differs from the
+    # requested size. Mixed-size pools live under /sys/kernel/mm/hugepages/...
+    # and require operator-managed allocation per size; the script only
+    # touches the default pool via vm.nr_hugepages.
+    if (( sys_default_kb != hp_size_kb )); then
+        log "  WARNING: requested hugepage_size=${hp_size_kb} KiB ≠ system default ${sys_default_kb} KiB."
+        log "           For non-default sizes, manually reserve under"
+        log "           /sys/kernel/mm/hugepages/hugepages-${hp_size_kb}kB/nr_hugepages."
+        log "           This script's pool checks/sysctl only target the default size."
+    fi
+
+    if (( cur_free >= pages_needed )); then
+        log "  OK: HugePages_Free=${cur_free} >= required=${pages_needed}"
+        return 0
+    fi
+
+    log "  SHORT: HugePages_Free=${cur_free} < required=${pages_needed} (deficit $(( pages_needed - cur_free )) pages)"
+
+    if ! bool_is_true "$HUGEPAGE_AUTO_RESERVE"; then
+        log "FATAL: insufficient hugepages and HUGEPAGE_AUTO_RESERVE=false."
+        log "  To fix manually:"
+        log "    sudo sysctl -w vm.nr_hugepages=${pages_needed}"
+        log "    grep -i huge /proc/meminfo   # verify HugePages_Free"
+        log ""
+        log "  Or set HUGEPAGE_AUTO_RESERVE=true to let this script try sysctl."
+        log ""
+        log "  Or set SGLANG_HICACHE_HOST_HUGEPAGE=0 to disable hugepage backing"
+        log "  (degrades L2 to 4 KiB anonymous pages; AINIC single-MR registration"
+        log "   of the full L2 buffer will fail and fall back to staging copy)."
+        return 1
+    fi
+
+    log "Auto-reserving hugepages: sysctl -w vm.nr_hugepages=${pages_needed}"
+    local sysctl_cmd
+    if [[ "$(id -u)" == "0" ]]; then
+        sysctl_cmd=(sysctl -w "vm.nr_hugepages=${pages_needed}")
+    else
+        sysctl_cmd=(sudo -n sysctl -w "vm.nr_hugepages=${pages_needed}")
+    fi
+    if ! "${sysctl_cmd[@]}" >/dev/null 2>&1; then
+        log "FATAL: sysctl to raise nr_hugepages failed."
+        log "  Likely cause: missing root / NOPASSWD sudo, or memory fragmentation."
+        log "  Try one of:"
+        log "    1) Run this script as root."
+        log "    2) Drop caches first:  echo 3 | sudo tee /proc/sys/vm/drop_caches"
+        log "    3) Reboot with kernel cmdline:"
+        log "         default_hugepagesz=${hp_size_mb}M hugepagesz=${hp_size_mb}M hugepages=${pages_needed}"
+        return 1
+    fi
+
+    cur_total=$(grep -oP '^HugePages_Total:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    cur_free=$(grep -oP '^HugePages_Free:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    log "  After sysctl: HugePages_Total=${cur_total}, HugePages_Free=${cur_free}"
+
+    if (( cur_free < pages_needed )); then
+        log "FATAL: even after sysctl, HugePages_Free=${cur_free} < required=${pages_needed}."
+        log "  Memory fragmentation prevents kernel from allocating contiguous huge pages."
+        log "  Reboot with kernel cmdline:"
+        log "    default_hugepagesz=${hp_size_mb}M hugepagesz=${hp_size_mb}M hugepages=${pages_needed}"
+        return 1
+    fi
+
+    log "  Hugepage reservation OK: HugePages_Free=${cur_free}."
+    return 0
 }
 
 wait_for_server() {
@@ -673,6 +824,11 @@ if bool_is_true "$ENABLE_HICACHE"; then
         log "  Cache mode:  decode offload (disaggregation-decode-enable-offload-kvcache)"
     fi
     log "  L2 size:     ${HICACHE_SIZE} GB/rank"
+    if bool_is_true "$SGLANG_HICACHE_HOST_HUGEPAGE"; then
+        log "  L2 backing:  AnonymousHugetlb ($((SGLANG_HICACHE_HOST_HUGEPAGE_SIZE/1024/1024)) MiB pages, prefault=$(bool_is_true "$SGLANG_HICACHE_HOST_PREFAULT" && echo on || echo off), numa_node=${SGLANG_HICACHE_HOST_NUMA_NODE:-default})"
+    else
+        log "  L2 backing:  Anonymous (4 KiB pages — hugepage backing disabled)"
+    fi
 fi
 if bool_is_true "$ENABLE_UMBP"; then
     log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
@@ -723,6 +879,15 @@ log "======================================================"
 
 # ---- Cleanup before start ----------------------------------
 kill_server
+
+# Reserve hugepages for L2 BEFORE launching the server so a shortage is caught
+# early and surfaced as a clear sysctl recommendation rather than a silent
+# fallback to 4 KiB anon pages inside the server's startup logs.
+if ! ensure_hugepages; then
+    echo "FAILED (hugepage reservation insufficient — see log)" >> "$SUMMARY_FILE"
+    kill_master
+    exit 1
+fi
 
 if bool_is_true "$ENABLE_UMBP"; then
     log "Cleaning UMBP SSD dir: $UMBP_SSD_DIR"

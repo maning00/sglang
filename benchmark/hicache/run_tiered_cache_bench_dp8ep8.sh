@@ -75,8 +75,28 @@ export PYTHONPATH
 export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=6G
 
+# ---- Ephemeral port range guard -----------------------------
+# UMBP IOEngine and PeerService bind to fixed ports (default 18080-18087
+# and 19080-19087).  If the kernel's ip_local_port_range overlaps these
+# ports, an outbound TCP connection (Gloo, NCCL, gRPC) may grab one of
+# them as an ephemeral source port before IOEngine/PeerService binds,
+# causing EADDRINUSE and crashing the child process.
+#
+# Push the ephemeral range above 32768 to avoid collisions.
+_ensure_ephemeral_port_range() {
+    local lo hi
+    read -r lo hi < /proc/sys/net/ipv4/ip_local_port_range
+    if (( lo < 32768 )); then
+        log "WARNING: ip_local_port_range starts at $lo (< 32768), raising to 32768-$hi to avoid UMBP port collisions"
+        if ! echo "32768 $hi" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
+            log "WARNING: cannot write to /proc/sys/net/ipv4/ip_local_port_range (not root?). Fixed-port UMBP services may hit EADDRINUSE."
+        fi
+    fi
+}
 # ---- Helpers ------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+_ensure_ephemeral_port_range
 
 bool_is_true() {
     local v="${1:-}"
@@ -274,21 +294,44 @@ wait_for_port_free() {
     local max_wait=60
     local elapsed=0
     local pids
+
+    # Collect all ports that must be free: HTTP port + UMBP IO engine
+    # and peer service ports (one per DP rank, auto-incremented from base).
+    local -a ports_to_check=("$PORT")
+    if [[ -n "${UMBP_IO_ENGINE_PORT:-}" ]]; then
+        for i in $(seq 0 $((DP_SIZE - 1))); do
+            ports_to_check+=($((UMBP_IO_ENGINE_PORT + i)))
+        done
+    fi
+    if [[ -n "${UMBP_PEER_SERVICE_PORT:-}" ]]; then
+        for i in $(seq 0 $((DP_SIZE - 1))); do
+            ports_to_check+=($((UMBP_PEER_SERVICE_PORT + i)))
+        done
+    fi
+
     while (( elapsed < max_wait )); do
-        pids=$(lsof -ti :"$PORT" 2>/dev/null || true)
+        pids=""
+        for p in "${ports_to_check[@]}"; do
+            pids+=" $(lsof -ti :"$p" 2>/dev/null || true)"
+        done
+        pids="$(echo "$pids" | xargs)"
         if [[ -z "$pids" ]]; then
             return 0
         fi
         if (( elapsed == 0 )); then
-            log "Waiting for port $PORT to be released (PIDs: $pids)..."
+            log "Waiting for ports to be released (ports: ${ports_to_check[*]}, PIDs: $pids)..."
         fi
         echo "$pids" | xargs kill -9 2>/dev/null || true
         sleep 2
         elapsed=$(( elapsed + 2 ))
     done
-    pids=$(lsof -ti :"$PORT" 2>/dev/null || true)
+    pids=""
+    for p in "${ports_to_check[@]}"; do
+        pids+=" $(lsof -ti :"$p" 2>/dev/null || true)"
+    done
+    pids="$(echo "$pids" | xargs)"
     if [[ -n "$pids" ]]; then
-        log "ERROR: Port $PORT still occupied after ${max_wait}s (PIDs: $pids)"
+        log "ERROR: Ports still occupied after ${max_wait}s (ports: ${ports_to_check[*]}, PIDs: $pids)"
         return 1
     fi
 }
