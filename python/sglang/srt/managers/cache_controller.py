@@ -18,7 +18,7 @@ import os
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Protocol
 
 import torch
 
@@ -47,6 +47,45 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+class _HiCacheTreeForDrain(Protocol):
+    """Subset of the tree-cache interface drain_pending_storage_acks needs."""
+
+    def writing_check(self, write_back: bool = ...) -> None: ...
+    def _drain_storage_control_queues_local(self) -> None: ...
+    def is_storage_idle(self) -> bool: ...
+
+
+def drain_pending_storage_acks(
+    tree_cache: _HiCacheTreeForDrain, deadline_seconds: float = 5.0
+) -> bool:
+    """Pump pending storage bookkeeping until the cache reports idle.
+
+    Some admin operations (clear_storage_backend, detach_storage_backend)
+    need a quiescent storage tier, but the scheduler only drains storage
+    acks via check_hicache_events() inside _get_new_batch_prefill_raw() --
+    which returns early when the waiting queue is empty. Once the workload
+    goes quiet, the last write-through ack and last backup ack remain in
+    ack_write_queue / ack_backup_queue (and their entries in
+    ongoing_write_through / ongoing_backup) forever, so is_storage_idle()
+    never converges.
+
+    This helper iterates writing_check() + _drain_storage_control_queues_local()
+    in a bounded loop. writing_check() may enqueue a fresh write_backup_storage
+    for each ack it processes, so a single pump is not enough -- the loop keeps
+    going until is_storage_idle() returns True or the deadline expires.
+
+    Returns True if the cache reached idle within the deadline.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        tree_cache.writing_check()
+        tree_cache._drain_storage_control_queues_local()
+        if tree_cache.is_storage_idle():
+            return True
+        time.sleep(0.05)
+    return tree_cache.is_storage_idle()
 
 
 class LayerLoadingEvent:

@@ -19,7 +19,11 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    drain_pending_storage_acks,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -625,7 +629,10 @@ class HiRadixCache(RadixCache):
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
-            if not self.is_storage_idle():
+            # Pump pending storage acks before the idle gate -- see
+            # drain_pending_storage_acks docstring for why a passive
+            # is_storage_idle() check would deadlock.
+            if not drain_pending_storage_acks(self):
                 logger.warning(
                     "clear_storage_backend rejected: storage operations are still in-flight."
                 )

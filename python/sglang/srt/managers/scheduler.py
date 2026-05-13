@@ -2539,14 +2539,10 @@ class Scheduler(
         if not self._is_idle_for_hicache_storage_op():
             logger.warning("Reject clear HiCache storage: scheduler is not idle.")
             return ClearHiCacheReqOutput(success=False)
-        if not hasattr(self.tree_cache, "is_storage_idle"):
-            logger.warning(
-                "Reject clear HiCache storage: tree cache does not expose storage idle state."
-            )
-            return ClearHiCacheReqOutput(success=False)
-        if not self.tree_cache.is_storage_idle():
-            logger.warning("Reject clear HiCache storage: storage is not idle.")
-            return ClearHiCacheReqOutput(success=False)
+        # Storage-side idle is enforced inside clear_storage_backend, which also
+        # actively drains pending acks first (the scheduler stops calling
+        # check_hicache_events() once its waiting queue empties, so the last
+        # write-through / backup acks otherwise leak into the gate forever).
 
         success = self.tree_cache.clear_storage_backend()
         if success:
