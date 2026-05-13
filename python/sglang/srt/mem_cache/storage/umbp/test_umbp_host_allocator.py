@@ -133,9 +133,7 @@ def test_umbp_allocator_del_calls_free_once(monkeypatch: pytest.MonkeyPatch):
     gc.collect()
 
     fake_allocator = allocator._allocator
-    handles = list(allocator._handles.values())
-    assert len(handles) == 1
-    handle = handles[0]
+    handle = allocator._handle
     allocator.__del__()
 
     assert len(fake_allocator.free_calls) == 1

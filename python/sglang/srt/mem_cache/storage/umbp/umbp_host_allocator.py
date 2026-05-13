@@ -2,7 +2,7 @@ import ctypes
 import logging
 import math
 import os
-from typing import Any, Dict
+from typing import Any, Optional
 
 import torch
 
@@ -45,7 +45,7 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         )
         self._numa_node = _int_env("SGLANG_HICACHE_HOST_NUMA_NODE", -1)
         self._prefault = _bool_env("SGLANG_HICACHE_HOST_PREFAULT", True)
-        self._handles: Dict[int, Any] = {}
+        self._handle: Optional[Any] = None
 
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
@@ -81,7 +81,7 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
                 f"(requested_backing={requested_backing}, "
                 f"numa_node={self._numa_node})."
             )
-        self._handles[int(handle.ptr)] = handle
+        self._handle = handle
 
         c_array = (ctypes.c_byte * nbytes).from_address(handle.ptr)
         tensor = torch.frombuffer(c_array, dtype=torch.uint8, count=nbytes)
@@ -114,29 +114,12 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
 
         return tensor.view(dims)
 
-    def mapped_size_for(self, ptr: int) -> int:
-        """Actual mmap size for the allocation whose base address is *ptr*."""
-        handles = getattr(self, "_handles", None)
-        if handles is None:
-            return 0
-        h = handles.get(ptr)
-        return int(h.mapped_size) if h is not None else 0
-
-    @property
-    def mapped_size(self) -> int:
-        """Largest mapped_size across all live allocations, or 0."""
-        handles = getattr(self, "_handles", None)
-        if not handles:
-            return 0
-        return max(int(h.mapped_size) for h in handles.values())
-
     def __del__(self) -> None:
         try:
-            handles = getattr(self, "_handles", None)
+            handle = getattr(self, "_handle", None)
             allocator = getattr(self, "_allocator", None)
-            if handles and allocator is not None:
-                for h in handles.values():
-                    allocator.free(h)
-                self._handles.clear()
+            if handle is not None and allocator is not None:
+                allocator.free(handle)
+                self._handle = None
         except Exception:
             pass

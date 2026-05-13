@@ -602,6 +602,26 @@ wait_for_server() {
     return 1
 }
 
+wait_for_decode_fired_up() {
+    local log_file="$1"
+    local timeout="${2:-600}"
+    local interval=10 elapsed=0
+    if [[ -z "$log_file" ]]; then
+        return 0
+    fi
+    log "Waiting for decode log ${log_file} to report 'fired up' (timeout ${timeout}s)..."
+    while (( elapsed < timeout )); do
+        if [[ -f "$log_file" ]] && grep -q "fired up" "$log_file"; then
+            log "Decode server reported 'fired up' (took ${elapsed}s)."
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$(( elapsed + interval ))
+    done
+    log "WARNING: Decode server did not log 'fired up' within ${timeout}s; continuing."
+    return 1
+}
+
 run_benchmark() {
     local case_dir="$1" case_tag="$2" bench_port="$3"
     local log_file="${case_dir}/bench.log"
@@ -765,7 +785,18 @@ launch_pd_server() {
         cmd+=(--kv-events-config "{\"publisher\": \"${KV_EVENTS_PUBLISHER}\", \"endpoint\": \"${KV_EVENTS_ENDPOINT}\", \"topic\": \"${KV_EVENTS_TOPIC}\"}")
     fi
 
-    "${cmd[@]}"
+    local -a launch_env=()
+    if bool_is_true "$ENABLE_UMBP"; then
+        if [[ -z "${SGLANG_UMBP_TAGS:-}" ]] && [[ "$role" == "prefill" || "$role" == "decode" ]]; then
+            launch_env+=(SGLANG_UMBP_TAGS="sgl_role=${role}")
+        fi
+    fi
+
+    if (( ${#launch_env[@]} > 0 )); then
+        env "${launch_env[@]}" "${cmd[@]}"
+    else
+        "${cmd[@]}"
+    fi
 }
 
 # ---- Determine cache tier label -----------------------------
@@ -1006,6 +1037,8 @@ if [[ "$PD_ROLE" == "decode" ]]; then
         kill_master
         exit 1
     fi
+
+    wait_for_decode_fired_up "$SERVER_LOG"
 
     # Determine benchmark target port
     BENCH_PORT="$DECODE_PORT"
