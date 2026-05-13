@@ -684,13 +684,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             stored = common_pb2.KvBlocksStored(blocks=blocks)
             if event.parent_block_hash is not None:
                 stored.parent_block_hash = event.parent_block_hash
+            if event.medium is not None and hasattr(stored, "medium"):
+                stored.medium = event.medium
 
             return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
 
         elif isinstance(event, BlockRemoved):
+            removed = common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes)
+            if event.medium is not None and hasattr(removed, "medium"):
+                removed.medium = event.medium
             return common_pb2.KvCacheEvent(
                 event_id=event_id,
-                removed=common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes),
+                removed=removed,
             )
 
         elif isinstance(event, AllBlocksCleared):

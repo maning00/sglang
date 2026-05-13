@@ -1078,6 +1078,7 @@ class KVEventsSubscriber:
         _tier = _umbp_mod.UMBPTierType
         self._tier_hbm = _tier.HBM
         self._tier_dram = _tier.DRAM
+        self._tier_ssd = _tier.SSD
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1116,11 +1117,24 @@ class KVEventsSubscriber:
         """Map a KV event medium string to a UMBPTierType value.
 
         ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
-        All other values (CPU pinned, unknown) map to DRAM.
+        ``MEDIUM_CPU`` maps to DRAM. ``MEDIUM_STORAGE`` maps to SSD as
+        HiCache's L3 cost class, regardless of UMBP's internal placement.
         """
-        from sglang.srt.disaggregation.kv_events import MEDIUM_GPU
+        from sglang.srt.disaggregation.kv_events import (
+            MEDIUM_CPU,
+            MEDIUM_GPU,
+            MEDIUM_STORAGE,
+        )
 
-        return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
+        if medium == MEDIUM_GPU:
+            return self._tier_hbm
+        if medium == MEDIUM_CPU:
+            return self._tier_dram
+        if medium == MEDIUM_STORAGE:
+            return self._tier_ssd
+
+        logger.warning("Unknown KV event medium %r, defaulting to DRAM", medium)
+        return self._tier_dram
 
     def on_event(
         self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]

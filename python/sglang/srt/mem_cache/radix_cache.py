@@ -828,16 +828,30 @@ class RadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size
 
-    def _record_store_event(self, node: TreeNode):
+    def _ensure_node_hash_value(self, node: TreeNode):
+        if node.hash_value is not None:
+            return
+        if (
+            node.parent is not None
+            and node.parent != self.root_node
+            and node.parent.hash_value is None
+        ):
+            self._ensure_node_hash_value(node.parent)
+        node.hash_value = compute_node_hash_values(node, self.page_size)
+
+    def _record_store_event(
+        self, node: TreeNode, medium: str = MEDIUM_GPU
+    ) -> list[int]:
         # One BlockStored per ``page_size`` chunk.
+        emitted: list[int] = []
         if self.enable_kv_cache_events:
             # Compute hash_value lazily if not already set
-            if node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
+            self._ensure_node_hash_value(node)
 
             # Get parent's last hash value for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
+                self._ensure_node_hash_value(node.parent)
                 if (
                     node.parent.hash_value is not None
                     and len(node.parent.hash_value) > 0
@@ -859,19 +873,61 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
-                        medium=MEDIUM_GPU,
+                        medium=medium,
                     )
                 )
 
+                emitted.append(block_hash)
                 parent_block_hash = block_hash
                 page_index += 1
+        return emitted
 
-    def _record_remove_event(self, node: TreeNode):
+    def _record_store_event_for_page(
+        self, node: TreeNode, page_index: int, medium: str
+    ) -> Optional[int]:
+        if not self.enable_kv_cache_events:
+            return None
+        self._ensure_node_hash_value(node)
+        if page_index >= len(node.hash_value):
+            return None
+
+        start = page_index * self.page_size
+        page_tokens = node.key.token_ids[start : start + self.page_size]
+        if not page_tokens:
+            return None
+
+        block_hash = hash_str_to_int64(node.hash_value[page_index])
+        if page_index > 0:
+            parent_block_hash = hash_str_to_int64(node.hash_value[page_index - 1])
+        elif node.parent is not None and node.parent != self.root_node:
+            self._ensure_node_hash_value(node.parent)
+            if node.parent.hash_value:
+                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+            else:
+                parent_block_hash = None
+        else:
+            parent_block_hash = None
+
+        self.kv_event_queue.append(
+            BlockStored(
+                block_hashes=[block_hash],
+                parent_block_hash=parent_block_hash,
+                token_ids=page_tokens,
+                block_size=len(page_tokens),
+                lora_id=None,
+                medium=medium,
+            )
+        )
+        return block_hash
+
+    def _record_remove_event(
+        self, node: TreeNode, medium: str = MEDIUM_GPU
+    ) -> list[int]:
         # One BlockRemoved per chunk.
+        emitted: list[int] = []
         if self.enable_kv_cache_events:
             # Compute hash_value lazily if not already set (must match what was stored)
-            if node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
+            self._ensure_node_hash_value(node)
 
             page_index = 0
             for start in range(0, len(node.key), self.page_size):
@@ -882,10 +938,12 @@ class RadixCache(BasePrefixCache):
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
                 )
 
+                emitted.append(block_hash)
                 page_index += 1
+        return emitted
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:

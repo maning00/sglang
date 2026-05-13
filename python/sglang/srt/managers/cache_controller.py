@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -46,6 +47,18 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+def drain_pending_storage_acks(tree_cache, deadline_seconds: float = 5.0) -> bool:
+    """Pump HiCache bookkeeping until storage-side queues become idle."""
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        tree_cache.writing_check()
+        tree_cache._drain_storage_control_queues_local()
+        if tree_cache.is_storage_idle():
+            return True
+        time.sleep(0.05)
+    return tree_cache.is_storage_idle()
 
 
 class LayerLoadingEvent:

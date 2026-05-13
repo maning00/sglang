@@ -59,6 +59,7 @@ class KVCacheEvent(
 # Medium values for hicache storage tiers
 MEDIUM_GPU = "GPU"
 MEDIUM_CPU = "CPU_PINNED"
+MEDIUM_STORAGE = "STORAGE"
 
 
 class OffloadedState:
