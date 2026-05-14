@@ -72,6 +72,16 @@ Environment variables (override defaults):
   HUGEPAGE_AUTO_RESERVE              Try sysctl to raise nr_hugepages if short (default: false)
   HUGEPAGE_HEADROOM_PERCENT          Extra hugepages on top of computed minimum (default: 5)
 
+  # Parallelism mode
+  SERVING_MODE              Parallelism strategy (default: dp8ep8).
+                            dp8ep8: DP=8 + EP=8 with MoE A2A (mori) and dp-attention.
+                            tp8:    Pure TP=8, no DP/EP, no MoE A2A override.
+
+  # Benchmark control
+  RUN_BENCHMARK             Run benchmark after decode server starts (default: true).
+                            Set false to start servers only; benchmark can be run
+                            separately later via bench_multiturn.py.
+
   # Decode-specific
   MAX_RUNNING_REQUESTS      Max concurrent requests on decode (default: 128)
 
@@ -122,7 +132,7 @@ if [[ "$PD_ROLE" != "prefill" && "$PD_ROLE" != "decode" ]]; then
 fi
 
 # ---- Configurable parameters --------------------------------
-MODEL_PATH="${MODEL_PATH:-/nfs/DeepSeek-V3}"
+MODEL_PATH="${MODEL_PATH:-/nfs/data/DeepSeek-V3}"
 USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
@@ -206,6 +216,7 @@ UMBP_MASTER_BIN="${UMBP_MASTER_BIN:-}"
 UMBP_MASTER_LISTEN="${UMBP_MASTER_LISTEN:-}"
 
 # Benchmark params (decode node only)
+RUN_BENCHMARK="${RUN_BENCHMARK:-true}"
 NUM_ROUNDS="${NUM_ROUNDS:-130}"
 NUM_CLIENTS="${NUM_CLIENTS:-64}"
 MAX_PARALLEL="${MAX_PARALLEL:-64}"
@@ -230,6 +241,12 @@ PREFILL_WAIT_TIMEOUT="${PREFILL_WAIT_TIMEOUT:-6000}"
 
 MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+SERVING_MODE="${SERVING_MODE:-dp8ep8}"
+
+if [[ "$SERVING_MODE" != "dp8ep8" && "$SERVING_MODE" != "tp8" ]]; then
+    echo "ERROR: SERVING_MODE must be 'dp8ep8' or 'tp8', got '$SERVING_MODE'"
+    exit 1
+fi
 
 # Extra args forwarded verbatim to sglang.launch_server for both roles.  Split
 # on whitespace so flag+value pairs stay together
@@ -712,10 +729,14 @@ launch_pd_server() {
         --port "$port"
         --tp-size "$TP_SIZE"
         --page-size "$PAGE_SIZE"
-        --dp-size "$DP_SIZE"
-        --enable-dp-attention
-        --moe-a2a-backend "$MOE_A2A_BACKEND"
     )
+    if [[ "$SERVING_MODE" == "dp8ep8" ]]; then
+        cmd+=(
+            --dp-size "$DP_SIZE"
+            --enable-dp-attention
+            --moe-a2a-backend "$MOE_A2A_BACKEND"
+        )
+    fi
     if [[ -n "$KV_CACHE_DTYPE" ]]; then
         cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
     fi
@@ -778,6 +799,8 @@ launch_pd_server() {
     # `set -u` even when the array is empty).
     if bool_is_true "$USE_DUMMY_WEIGHTS"; then
         cmd+=(--load-format dummy)
+    else
+        cmd+=(--load-format auto)
     fi
     cmd+=(${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"})
 
@@ -814,7 +837,7 @@ cache_tier_label() {
 trap 'kill_router; kill_server; kill_master; exit 130' INT TERM
 
 CACHE_LABEL="$(cache_tier_label)"
-CASE_TAG="pd_${PD_ROLE}_${CACHE_LABEL}"
+CASE_TAG="pd_${PD_ROLE}_${CACHE_LABEL}_${SERVING_MODE}"
 
 mkdir -p "$RESULTS_DIR"
 SUMMARY_FILE="${RESULTS_DIR}/summary.txt"
@@ -822,9 +845,12 @@ SUMMARY_FILE="${RESULTS_DIR}/summary.txt"
 log "======================================================"
 log "PD Disaggregation Benchmark (${PD_ROLE})"
 log "  Model:       $MODEL_PATH"
+log "  Serving mode: $SERVING_MODE"
 log "  TP:          $TP_SIZE"
-log "  DP:          $DP_SIZE"
-log "  MoE A2A:     $MOE_A2A_BACKEND"
+if [[ "$SERVING_MODE" == "dp8ep8" ]]; then
+    log "  DP:          $DP_SIZE"
+    log "  MoE A2A:     $MOE_A2A_BACKEND"
+fi
 log "  KV dtype:    ${KV_CACHE_DTYPE:-auto}"
 log "  Disagg mode: $PD_ROLE"
 log "  Transfer:    $DISAGG_TRANSFER_BACKEND"
@@ -893,7 +919,11 @@ log "======================================================"
 {
     echo "PD Disaggregation Benchmark (${PD_ROLE})"
     echo "Started: $(date)"
-    echo "Model: $MODEL_PATH  TP: $TP_SIZE  DP: $DP_SIZE  MoE: $MOE_A2A_BACKEND"
+    if [[ "$SERVING_MODE" == "dp8ep8" ]]; then
+        echo "Model: $MODEL_PATH  TP: $TP_SIZE  DP: $DP_SIZE  MoE: $MOE_A2A_BACKEND  Mode: $SERVING_MODE"
+    else
+        echo "Model: $MODEL_PATH  TP: $TP_SIZE  Mode: $SERVING_MODE"
+    fi
     echo "Disagg: mode=${PD_ROLE} transfer=${DISAGG_TRANSFER_BACKEND}"
     echo "Cache: ${CACHE_LABEL}"
     if bool_is_true "$ENABLE_HICACHE"; then
@@ -994,35 +1024,42 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     # Probe all prefill servers in parallel so wall-clock is max(timeout)
     # instead of sum(timeout). Failures are collected via tmp marker files
     # because subshell exit codes are unreliable under set -e.
-    log "Probing ${#PREFILL_URLS_ARR[@]} prefill server(s) in parallel..."
-    _probe_dir="$(mktemp -d)"
-    declare -a _probe_pids=()
-    for url in "${PREFILL_URLS_ARR[@]}"; do
-        host="$(echo "$url" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
-        port="$(echo "$url" | sed -E 's|.*:([0-9]+).*|\1|')"
-        (
-            if wait_for_tcp "$host" "$port" "$PREFILL_WAIT_TIMEOUT" "Prefill ${url}"; then
-                :
-            else
-                # Sanitize url to a safe filename.
-                echo "$url" > "${_probe_dir}/$(echo "$url" | tr '/:' '__').fail"
-            fi
-        ) &
-        _probe_pids+=( "$!" )
-    done
-    for pid in "${_probe_pids[@]}"; do wait "$pid" || true; done
-
-    if compgen -G "${_probe_dir}/*.fail" > /dev/null; then
-        for f in "${_probe_dir}"/*.fail; do
-            log "FATAL: Prefill $(cat "$f") not reachable."
-            echo "FAILED (prefill $(cat "$f") not reachable)" >> "$SUMMARY_FILE"
+    # Set SKIP_PREFILL_PROBE=true to skip this wait and let decode start
+    # immediately (prefill availability is enforced later by
+    # SGLANG_DISAGGREGATION_WAITING_TIMEOUT during actual inference).
+    if bool_is_true "${SKIP_PREFILL_PROBE:-false}"; then
+        log "Skipping prefill probe (SKIP_PREFILL_PROBE=true); decode will start immediately."
+    else
+        log "Probing ${#PREFILL_URLS_ARR[@]} prefill server(s) in parallel..."
+        _probe_dir="$(mktemp -d)"
+        declare -a _probe_pids=()
+        for url in "${PREFILL_URLS_ARR[@]}"; do
+            host="$(echo "$url" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
+            port="$(echo "$url" | sed -E 's|.*:([0-9]+).*|\1|')"
+            (
+                if wait_for_tcp "$host" "$port" "$PREFILL_WAIT_TIMEOUT" "Prefill ${url}"; then
+                    :
+                else
+                    # Sanitize url to a safe filename.
+                    echo "$url" > "${_probe_dir}/$(echo "$url" | tr '/:' '__').fail"
+                fi
+            ) &
+            _probe_pids+=( "$!" )
         done
+        for pid in "${_probe_pids[@]}"; do wait "$pid" || true; done
+
+        if compgen -G "${_probe_dir}/*.fail" > /dev/null; then
+            for f in "${_probe_dir}"/*.fail; do
+                log "FATAL: Prefill $(cat "$f") not reachable."
+                echo "FAILED (prefill $(cat "$f") not reachable)" >> "$SUMMARY_FILE"
+            done
+            rm -rf "$_probe_dir"
+            kill_master
+            exit 1
+        fi
         rm -rf "$_probe_dir"
-        kill_master
-        exit 1
+        log "All ${#PREFILL_URLS_ARR[@]} prefill server(s) reachable."
     fi
-    rm -rf "$_probe_dir"
-    log "All ${#PREFILL_URLS_ARR[@]} prefill server(s) reachable."
 
     log "Launching decode server..."
     launch_pd_server decode "$DECODE_HOST" "$DECODE_PORT" \
@@ -1082,53 +1119,60 @@ if [[ "$PD_ROLE" == "decode" ]]; then
         fi
     fi
 
-    # Run benchmark
-    CASE_START=$(date +%s)
-    SERVER_CRASHED=false
+    if bool_is_true "$RUN_BENCHMARK"; then
+        # Run benchmark
+        CASE_START=$(date +%s)
+        SERVER_CRASHED=false
 
-    run_benchmark "$CASE_DIR" "$CASE_TAG" "$BENCH_PORT" &
-    BENCH_PID=$!
+        run_benchmark "$CASE_DIR" "$CASE_TAG" "$BENCH_PORT" &
+        BENCH_PID=$!
 
-    while kill -0 "$BENCH_PID" 2>/dev/null; do
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            log "ERROR: Decode server crashed during benchmark! Aborting..."
-            SERVER_CRASHED=true
-            pkill -TERM -P "$BENCH_PID" 2>/dev/null || true
-            kill -TERM "$BENCH_PID" 2>/dev/null || true
-            sleep 3
-            pkill -9 -P "$BENCH_PID" 2>/dev/null || true
-            kill -9 "$BENCH_PID" 2>/dev/null || true
-            break
+        while kill -0 "$BENCH_PID" 2>/dev/null; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                log "ERROR: Decode server crashed during benchmark! Aborting..."
+                SERVER_CRASHED=true
+                pkill -TERM -P "$BENCH_PID" 2>/dev/null || true
+                kill -TERM "$BENCH_PID" 2>/dev/null || true
+                sleep 3
+                pkill -9 -P "$BENCH_PID" 2>/dev/null || true
+                kill -9 "$BENCH_PID" 2>/dev/null || true
+                break
+            fi
+            sleep 10
+        done
+
+        BENCH_RC=0
+        wait "$BENCH_PID" 2>/dev/null || BENCH_RC=$?
+        CASE_END=$(date +%s)
+        CASE_ELAPSED=$(( CASE_END - CASE_START ))
+
+        if $SERVER_CRASHED; then
+            log "ERROR: Benchmark aborted — decode server crashed (${CASE_ELAPSED}s)."
+            echo "${CASE_TAG}: SERVER_CRASH (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        elif (( BENCH_RC == 0 )); then
+            log "Benchmark completed in ${CASE_ELAPSED}s."
+            echo "${CASE_TAG}: PASSED (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        elif (( BENCH_RC == 124 )); then
+            log "WARNING: Benchmark timed out after ${BENCHMARK_TIMEOUT}s (ran ${CASE_ELAPSED}s)."
+            echo "${CASE_TAG}: TIMEOUT (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        else
+            log "WARNING: Benchmark exited with code ${BENCH_RC} (${CASE_ELAPSED}s)."
+            echo "${CASE_TAG}: ERROR rc=${BENCH_RC} (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
         fi
-        sleep 10
-    done
 
-    BENCH_RC=0
-    wait "$BENCH_PID" 2>/dev/null || BENCH_RC=$?
-    CASE_END=$(date +%s)
-    CASE_ELAPSED=$(( CASE_END - CASE_START ))
+        # Cleanup
+        kill_router
+        kill_server
 
-    if $SERVER_CRASHED; then
-        log "ERROR: Benchmark aborted — decode server crashed (${CASE_ELAPSED}s)."
-        echo "${CASE_TAG}: SERVER_CRASH (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
-    elif (( BENCH_RC == 0 )); then
-        log "Benchmark completed in ${CASE_ELAPSED}s."
-        echo "${CASE_TAG}: PASSED (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
-    elif (( BENCH_RC == 124 )); then
-        log "WARNING: Benchmark timed out after ${BENCHMARK_TIMEOUT}s (ran ${CASE_ELAPSED}s)."
-        echo "${CASE_TAG}: TIMEOUT (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        if bool_is_true "$ENABLE_UMBP"; then
+            log "Cleaning UMBP SSD dir after benchmark."
+            clean_ssd_dir
+        fi
     else
-        log "WARNING: Benchmark exited with code ${BENCH_RC} (${CASE_ELAPSED}s)."
-        echo "${CASE_TAG}: ERROR rc=${BENCH_RC} (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
-    fi
-
-    # Cleanup
-    kill_router
-    kill_server
-
-    if bool_is_true "$ENABLE_UMBP"; then
-        log "Cleaning UMBP SSD dir after benchmark."
-        clean_ssd_dir
+        log "RUN_BENCHMARK=false — decode server and router running. Waiting (send SIGTERM to stop)."
+        log "Router: ${ROUTER_HOST}:${BENCH_PORT}  Decode server: localhost:${DECODE_PORT}"
+        log "Results dir: ${CASE_DIR}"
+        wait "$SERVER_PID" || true
     fi
 
     {
