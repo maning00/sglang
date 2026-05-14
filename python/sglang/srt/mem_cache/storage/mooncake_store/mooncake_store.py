@@ -325,11 +325,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
-                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
+                # standalone_storage requires a host buffer that mooncake can
+                # register for RDMA. Both MooncakeHostTensorAllocator and the
+                # UMBP huge-page allocator (UMBPHostTensorAllocator) produce
+                # such buffers (raw pointer + logical size, registered via
+                # register_buffer below). The default torch allocator is not
+                # supported because pinning is best-effort and not pre-pinned.
+                try:
+                    from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                        UMBPHostTensorAllocator,
+                    )
+                except ImportError:
+                    UMBPHostTensorAllocator = ()  # type: ignore[assignment]
+                if not isinstance(
+                    mem_pool.allocator,
+                    (MooncakeHostTensorAllocator, UMBPHostTensorAllocator),
+                ):
                     raise RuntimeError(
-                        "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
-                        "Please set standalone_storage=False "
-                        "or upgrade Mooncake by 'pip install mooncake --upgrade'."
+                        "MooncakeStore with standalone_storage=True requires "
+                        "MooncakeHostTensorAllocator or UMBPHostTensorAllocator. "
+                        "Please set standalone_storage=False, install mori with "
+                        "BUILD_UMBP=ON, or upgrade Mooncake by "
+                        "'pip install mooncake --upgrade'."
                     )
                 ret_code = self.store.setup_dummy(
                     mem_pool.size * mem_pool.size_per_token,

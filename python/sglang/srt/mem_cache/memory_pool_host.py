@@ -75,6 +75,25 @@ class HostTensorAllocator(abc.ABC):
 
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
+        # Prefer the UMBP huge-page allocator for the mooncake backend so the
+        # host KV buffer is backed by 2 MiB (or larger) pages. mooncake's RDMA
+        # registration only needs a (ptr, logical-size) pair (handled by
+        # MooncakeStore.register_buffer) and works with any externally-owned
+        # buffer, so we can swap the allocator transparently. Fall back to
+        # mooncake's own allocator if mori.umbp is unavailable, and finally to
+        # the default torch allocator.
+        try:
+            from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                UMBPHostTensorAllocator,
+            )
+
+            return UMBPHostTensorAllocator()
+        except (ImportError, RuntimeError, AttributeError) as exc:
+            logger.warning(
+                "UMBPHostTensorAllocator unavailable for mooncake backend (%s). "
+                "Falling back to MooncakeHostTensorAllocator (no huge pages).",
+                exc,
+            )
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeHostTensorAllocator,
@@ -95,7 +114,7 @@ def get_allocator_from_storage(allocator_type):
             )
 
             return UMBPHostTensorAllocator()
-        except (ImportError, RuntimeError) as exc:
+        except (ImportError, RuntimeError, AttributeError) as exc:
             logger.warning(
                 "UMBPHostTensorAllocator unavailable (%s). "
                 "Falling back to torch.empty-based allocator.",
