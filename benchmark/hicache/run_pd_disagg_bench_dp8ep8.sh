@@ -71,6 +71,7 @@ Environment variables (override defaults):
   SGLANG_HICACHE_HOST_NUMA_NODE      NUMA node to bind L2 to; -1 = no binding (default: unset)
   HUGEPAGE_AUTO_RESERVE              Try sysctl to raise nr_hugepages if short (default: false)
   HUGEPAGE_HEADROOM_PERCENT          Extra hugepages on top of computed minimum (default: 5)
+  UMBP_DRAM_USE_HUGEPAGES            Use anonymous hugepages for L3 UMBP DRAM pool (default: 1; 0=4 KiB anon)
 
   # Parallelism mode
   SERVING_MODE              Parallelism strategy (default: dp8ep8).
@@ -137,7 +138,7 @@ USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
 
 # PD Disaggregation
 DISAGG_TRANSFER_BACKEND="${DISAGG_TRANSFER_BACKEND:-mori}"
@@ -183,6 +184,9 @@ SGLANG_HICACHE_HOST_NUMA_NODE="${SGLANG_HICACHE_HOST_NUMA_NODE:-}"
 # case it tries `sysctl -w vm.nr_hugepages=<N>` (needs root or NOPASSWD sudo).
 HUGEPAGE_AUTO_RESERVE="${HUGEPAGE_AUTO_RESERVE:-false}"
 HUGEPAGE_HEADROOM_PERCENT="${HUGEPAGE_HEADROOM_PERCENT:-5}"
+# L3 UMBP DRAM pool hugepage backing (passed via env to UMBPConfig.from_environment).
+# Defaults to 1 (enabled) to match L2 hugepage policy.
+UMBP_DRAM_USE_HUGEPAGES="${UMBP_DRAM_USE_HUGEPAGES:-1}"
 
 # UMBP (L3) config
 UMBP_DRAM_BYTES="${UMBP_DRAM_BYTES:-68719476736}"
@@ -268,12 +272,17 @@ PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=6G
+# MORI_GLOBAL_LOG_LEVEL covers all spdlog modules (application/io/shmem/core/ops/umbp/metrics).
+# UMBP_LOG_LEVEL=0 covers the separate C-style UMBP logger in umbp/common/log.h (0=INFO).
+export MORI_GLOBAL_LOG_LEVEL=INFO
+export UMBP_LOG_LEVEL=0
 
 # Forward L2 hugepage knobs into sglang's child process. Only export NUMA_NODE
 # when explicitly set so the C++ default (-1 = no binding) wins on absence.
 export SGLANG_HICACHE_HOST_HUGEPAGE
 export SGLANG_HICACHE_HOST_HUGEPAGE_SIZE
 export SGLANG_HICACHE_HOST_PREFAULT
+export UMBP_DRAM_USE_HUGEPAGES
 [[ -n "$SGLANG_HICACHE_HOST_NUMA_NODE" ]] && export SGLANG_HICACHE_HOST_NUMA_NODE
 
 # ---- Helpers ------------------------------------------------
@@ -888,7 +897,7 @@ if bool_is_true "$ENABLE_HICACHE"; then
     fi
 fi
 if bool_is_true "$ENABLE_UMBP"; then
-    log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
+    log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank (hugepages=$(bool_is_true "$UMBP_DRAM_USE_HUGEPAGES" && echo on || echo off))"
     log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
     log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
     if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
