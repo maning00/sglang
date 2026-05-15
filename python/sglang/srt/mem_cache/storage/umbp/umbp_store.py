@@ -11,6 +11,7 @@ import logging
 import os
 import socket
 import threading
+import uuid
 from typing import Any, List, Optional
 
 import torch
@@ -23,6 +24,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
+
+# Stable per-process token that survives fork-after-import but is unique
+# across containers whose PID namespaces may alias the same PID numbers.
+_PROCESS_INSTANCE_TOKEN = uuid.uuid4().hex[:8]
 
 
 def _import_umbp_client():
@@ -323,6 +328,7 @@ class UMBPStore(HiCacheStorage):
                 dist_cfg.master_config.node_id = (
                     f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
                     f":pp{self.pp_rank}:tp{self.local_rank}"
+                    f":{_PROCESS_INSTANCE_TOKEN}"
                 )
             else:
                 dist_cfg.master_config.node_id = _select_rank_config_value(
