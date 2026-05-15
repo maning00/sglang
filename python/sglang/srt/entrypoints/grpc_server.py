@@ -33,6 +33,7 @@ import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
+    AllBlocksClearedAtTier,
     BlockRemoved,
     BlockStored,
     KVEventBatch,
@@ -684,19 +685,33 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             stored = common_pb2.KvBlocksStored(blocks=blocks)
             if event.parent_block_hash is not None:
                 stored.parent_block_hash = event.parent_block_hash
+            if event.medium is not None and hasattr(stored, "medium"):
+                stored.medium = event.medium
 
             return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
 
         elif isinstance(event, BlockRemoved):
+            removed = common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes)
+            if event.medium is not None and hasattr(removed, "medium"):
+                removed.medium = event.medium
             return common_pb2.KvCacheEvent(
                 event_id=event_id,
-                removed=common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes),
+                removed=removed,
             )
 
         elif isinstance(event, AllBlocksCleared):
             return common_pb2.KvCacheEvent(
                 event_id=event_id, cleared=common_pb2.KvCacheCleared()
             )
+
+        elif isinstance(event, AllBlocksClearedAtTier):
+            # TODO: extend common.proto KvCacheEvent with a KvCacheClearedAtTier
+            # variant.  Until then, gRPC SubscribeKvEvents consumers will *miss*
+            # storage clear/detach and host-pool reset signals (which the legacy
+            # AllBlocksCleared path used to convey via per-hash BlockRemoved).
+            # This is a known gRPC API gap; ZMQ subscribers (e.g. UMBP master)
+            # receive AllBlocksClearedAtTier directly and are unaffected.
+            return None
 
         return None
 

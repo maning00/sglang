@@ -1122,15 +1122,13 @@ class KVEventsSubscriber:
         self._dp_rank = dp_rank
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Track reported hashes so AllBlocksCleared can revoke them all.
-        self._reported_hashes: set = set()
-        self._hashes_lock = threading.Lock()
         # Cache UMBPTierType constants to avoid repeated attribute lookups.
         import mori.umbp as _umbp_mod
 
         _tier = _umbp_mod.UMBPTierType
         self._tier_hbm = _tier.HBM
         self._tier_dram = _tier.DRAM
+        self._tier_ssd = _tier.SSD
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1169,34 +1167,41 @@ class KVEventsSubscriber:
         """Map a KV event medium string to a UMBPTierType value.
 
         ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
-        All other values (CPU pinned, unknown) map to DRAM.
+        ``MEDIUM_CPU`` maps to DRAM. ``MEDIUM_STORAGE`` maps to SSD as
+        HiCache's L3 cost class, regardless of UMBP's internal placement.
         """
-        from sglang.srt.disaggregation.kv_events import MEDIUM_GPU
+        from sglang.srt.disaggregation.kv_events import (
+            MEDIUM_CPU,
+            MEDIUM_GPU,
+            MEDIUM_STORAGE,
+        )
 
-        return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
+        if medium == MEDIUM_GPU:
+            return self._tier_hbm
+        if medium == MEDIUM_CPU:
+            return self._tier_dram
+        if medium == MEDIUM_STORAGE:
+            return self._tier_ssd
+
+        logger.warning("Unknown KV event medium %r, defaulting to DRAM", medium)
+        return self._tier_dram
 
     def on_event(
         self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]
     ) -> None:
-        """Called once per individual KV cache event.
+        """Translate one SGLang KV cache event into the corresponding UMBP
+        master mutation.
 
-        Translates SGLang KV cache events into UMBP external KV block
-        report / revoke calls so the UMBP Master can track which GPU/CPU
-        blocks are available on each node for cross-node cache lookup.
-
-        Parameters
-        ----------
-        event:
-            One of :class:`~sglang.srt.disaggregation.kv_events.BlockStored`,
-            :class:`~sglang.srt.disaggregation.kv_events.BlockRemoved`, or
-            :class:`~sglang.srt.disaggregation.kv_events.AllBlocksCleared`.
-        batch_ts:
-            Unix timestamp of the :class:`KVEventBatch` that contained this event.
-        attn_dp_rank:
-            DP attention rank that produced the event, or ``None`` for rank 0.
+        The UMBP master uses an additive multi-tier model:
+        ``BlockStored(medium=X)`` adds the (node, hash) → tier-X bucket;
+        ``BlockRemoved(medium=X)`` drops only that tier bucket; other tier
+        copies of the same (node, hash) are untouched.  ``AllBlocksClearedA
+        tTier(medium=X)`` is the bulk equivalent: every hash reported by
+        this node at tier X is dropped in a single RPC.
         """
         from sglang.srt.disaggregation.kv_events import (
             AllBlocksCleared,
+            AllBlocksClearedAtTier,
             BlockRemoved,
             BlockStored,
         )
@@ -1209,38 +1214,49 @@ class KVEventsSubscriber:
         if isinstance(event, BlockStored):
             hashes = [str(h) for h in event.block_hashes]
             tier = self._medium_to_tier(event.medium)
-            ok = self._umbp_client.report_external_kv_blocks(hashes, tier)
-            if not ok:
+            if not self._umbp_client.report_external_kv_blocks(hashes, tier):
                 logger.warning(
-                    "report_external_kv_blocks failed for %d hashes (dp_rank=%s)",
+                    "report_external_kv_blocks failed: %d hashes tier=%s dp=%s",
                     len(hashes),
+                    event.medium,
                     attn_dp_rank,
                 )
-            with self._hashes_lock:
-                self._reported_hashes.update(hashes)
 
         elif isinstance(event, BlockRemoved):
             hashes = [str(h) for h in event.block_hashes]
-            ok = self._umbp_client.revoke_external_kv_blocks(hashes)
-            if not ok:
+            tier = self._medium_to_tier(event.medium)
+            if not self._umbp_client.revoke_external_kv_blocks(hashes, tier):
                 logger.warning(
-                    "revoke_external_kv_blocks failed for %d hashes (dp_rank=%s)",
+                    "revoke_external_kv_blocks failed: %d hashes tier=%s dp=%s",
                     len(hashes),
+                    event.medium,
                     attn_dp_rank,
                 )
-            with self._hashes_lock:
-                self._reported_hashes.difference_update(hashes)
+
+        elif isinstance(event, AllBlocksClearedAtTier):
+            tier = self._medium_to_tier(event.medium)
+            if not self._umbp_client.revoke_all_external_kv_blocks_at_tier(tier):
+                logger.warning(
+                    "revoke_all_external_kv_blocks_at_tier failed: tier=%s dp=%s",
+                    event.medium,
+                    attn_dp_rank,
+                )
 
         elif isinstance(event, AllBlocksCleared):
-            with self._hashes_lock:
-                all_hashes = list(self._reported_hashes)
-                self._reported_hashes.clear()
-            if all_hashes:
-                ok = self._umbp_client.revoke_external_kv_blocks(all_hashes)
-                if not ok:
+            # Base RadixCache reset has no tier info; drop every tier this
+            # node could have populated.  Each call is idempotent and skips
+            # tiers with no entries, so issuing all three is cheap.
+            for tier_name, tier in (
+                ("HBM", self._tier_hbm),
+                ("DRAM", self._tier_dram),
+                ("SSD", self._tier_ssd),
+            ):
+                if not self._umbp_client.revoke_all_external_kv_blocks_at_tier(tier):
                     logger.warning(
-                        "revoke_external_kv_blocks (all-clear) failed for %d hashes",
-                        len(all_hashes),
+                        "revoke_all_external_kv_blocks_at_tier failed during "
+                        "AllBlocksCleared: tier=%s dp=%s",
+                        tier_name,
+                        attn_dp_rank,
                     )
 
         else:
