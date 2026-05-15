@@ -97,8 +97,19 @@ class AllBlocksCleared(KVCacheEvent):
     pass
 
 
+class AllBlocksClearedAtTier(KVCacheEvent):
+    """All blocks at a specific tier on this node are gone (e.g. host pool
+    wipe on radix-cache reset, storage backend clear/detach).  Other tiers
+    on the same node are untouched — this is the bulk equivalent of issuing
+    one `BlockRemoved(medium=...)` per hash."""
+
+    medium: str
+
+
 class KVEventBatch(EventBatch):
-    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+    events: list[
+        Union[BlockStored, BlockRemoved, AllBlocksCleared, AllBlocksClearedAtTier]
+    ]
 
 
 class EventPublisher(ABC):
