@@ -89,6 +89,25 @@ def _parse_tag_values(value: Any) -> List[str]:
     return _clean([value])
 
 
+def _compute_kv_publisher_port(
+    extra: dict,
+    dp_rank_hint: Optional[int],
+    dp_size_hint: Optional[int],
+) -> int:
+    """Return the ZMQ KV-events publisher port this rank subscribes to.
+
+    Mirrors ZmqEventPublisher.offset_endpoint_port: in DP mode the base port
+    is incremented by dp_rank so each DP group gets an isolated channel.
+    """
+    base_endpoint = str(extra.get("kv_events_endpoint", "tcp://localhost:5557"))
+    try:
+        base_port = int(base_endpoint.rsplit(":", 1)[-1])
+    except (ValueError, IndexError):
+        base_port = 5557
+    is_dp = dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
+    return base_port + (dp_rank_hint if is_dp else 0)
+
+
 def _default_node_address() -> str:
     try:
         return socket.gethostbyname(socket.gethostname())
@@ -325,10 +344,11 @@ class UMBPStore(HiCacheStorage):
 
             node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
             if node_id is None:
+                _kv_port = _compute_kv_publisher_port(extra, dp_rank_hint, dp_size_hint)
                 dist_cfg.master_config.node_id = (
                     f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
                     f":pp{self.pp_rank}:tp{self.local_rank}"
-                    f":{_PROCESS_INSTANCE_TOKEN}"
+                    f":{_PROCESS_INSTANCE_TOKEN}:kvport={_kv_port}"
                 )
             else:
                 dist_cfg.master_config.node_id = _select_rank_config_value(

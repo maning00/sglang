@@ -83,6 +83,9 @@ Environment variables (override defaults):
                             Set false to start servers only; benchmark can be run
                             separately later via bench_multiturn.py.
 
+  # Prefill-specific
+  CHUNKED_PREFILL_SIZE      Chunked prefill chunk size for prefill node; unset = sglang auto-tune.
+
   # Decode-specific
   MAX_RUNNING_REQUESTS      Max concurrent requests on decode (default: 128)
 
@@ -229,6 +232,9 @@ SUB_QUESTION_INPUT_LENGTH="${SUB_QUESTION_INPUT_LENGTH:-430}"
 OUTPUT_LENGTH="${OUTPUT_LENGTH:-1}"
 REQUEST_RATE="${REQUEST_RATE:-10}"
 SEED="${SEED:-42}"
+
+# Prefill-specific
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 
 # Decode-specific
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
@@ -760,6 +766,9 @@ launch_pd_server() {
     )
     if [[ "$role" == "prefill" ]]; then
         cmd+=(--disaggregation-bootstrap-port "$DISAGG_BOOTSTRAP_PORT")
+        if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
+            cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+        fi
     fi
     if [[ "$role" == "decode" ]]; then
         cmd+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
@@ -866,6 +875,7 @@ log "  Transfer:    $DISAGG_TRANSFER_BACKEND"
 if [[ "$PD_ROLE" == "prefill" ]]; then
     log "  Bootstrap:   $DISAGG_BOOTSTRAP_PORT"
     log "  Bind:        ${PREFILL_HOST}:${PREFILL_PORT}"
+    log "  Chunked pf:  ${CHUNKED_PREFILL_SIZE:-auto}"
 else
     log "  Bind:        ${DECODE_HOST}:${DECODE_PORT}"
     if [[ -z "$PREFILL_URLS" ]]; then
