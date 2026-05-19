@@ -154,6 +154,7 @@ class HiRadixCache(RadixCache):
             enable_storage_metrics=self.enable_storage_metrics,
             extra_metric_labels=self.extra_metric_labels,
         )
+        self._refresh_umbp_telemetry()
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -201,6 +202,51 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+
+    def _refresh_umbp_telemetry(self) -> None:
+        """Enable UMBP HiCache transfer telemetry only for distributed UMBPStore."""
+        self._umbp_telemetry = None
+        self._umbp_transfer_enum = None
+
+        sb = getattr(self.cache_controller, "storage_backend", None)
+        if sb is None or type(sb).__name__ != "UMBPStore":
+            return
+
+        client = getattr(sb, "client", None)
+        if client is None:
+            return
+        try:
+            if not bool(client.is_distributed()):
+                return
+        except Exception:
+            logger.exception("UMBPStore is_distributed() raised; skipping telemetry")
+            return
+
+        try:
+            from mori.umbp import UMBPHiCacheTransfer
+        except Exception:
+            logger.exception(
+                "mori.umbp.UMBPHiCacheTransfer import failed; disabling transfer telemetry"
+            )
+            return
+
+        self._umbp_telemetry = client
+        self._umbp_transfer_enum = UMBPHiCacheTransfer
+
+    def _emit_transfer(self, direction_name: str, bytes_delta: int) -> None:
+        telemetry = getattr(self, "_umbp_telemetry", None)
+        if telemetry is None or bytes_delta <= 0:
+            return
+        enum_cls = getattr(self, "_umbp_transfer_enum", None)
+        if enum_cls is None:
+            return
+        direction = getattr(enum_cls, direction_name, None)
+        if direction is None:
+            return
+        try:
+            telemetry.report_hicache_transfer_bytes(direction, int(bytes_delta))
+        except Exception:
+            logger.exception("UMBP transfer telemetry emit failed; dropping sample")
 
     def _emit_clear_at_tier(self, medium: str) -> None:
         """Append an AllBlocksClearedAtTier event for bulk tier wipe paths
@@ -324,6 +370,7 @@ class HiRadixCache(RadixCache):
                         1 if hicache_write_policy == "write_through" else 2
                     )
                     logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+                self._refresh_umbp_telemetry()
                 return (
                     True,
                     "HiCache storage backend already enabled with same backend; policies updated.",
@@ -390,6 +437,7 @@ class HiRadixCache(RadixCache):
             enable_storage_metrics=self._enable_metrics_flag,
             extra_metric_labels=self.extra_metric_labels,
         )
+        self._refresh_umbp_telemetry()
         return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self) -> tuple[bool, str]:
@@ -423,6 +471,7 @@ class HiRadixCache(RadixCache):
         self._emit_clear_at_tier(MEDIUM_STORAGE)
         self.enable_storage = False
         self.enable_storage_metrics = False
+        self._refresh_umbp_telemetry()
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
@@ -530,6 +579,8 @@ class HiRadixCache(RadixCache):
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
+                backuped_tokens = int(operation.completed_tokens)
+                backuped_bytes = self._tokens_to_logical_bytes(backuped_tokens)
                 if entry is not None:
                     entry.release_host()
                     # Emit BlockStored(STORAGE) per page that actually made
@@ -548,11 +599,10 @@ class HiRadixCache(RadixCache):
                                 entry, page_index, medium=MEDIUM_STORAGE
                             )
                 if log_metrics and self.enable_storage_metrics:
-                    backuped_tokens = int(operation.completed_tokens)
                     self.storage_metrics_collector.log_backuped_tokens(backuped_tokens)
-                    self.storage_metrics_collector.log_backuped_bytes(
-                        self._tokens_to_logical_bytes(backuped_tokens)
-                    )
+                    self.storage_metrics_collector.log_backuped_bytes(backuped_bytes)
+                if backuped_tokens > 0 and entry is not None:
+                    self._emit_transfer("L2ToL3", backuped_bytes)
 
         def _drain_release():
             host_indices_list = []
@@ -768,6 +818,9 @@ class HiRadixCache(RadixCache):
                     self._observe_pcie_bandwidth(
                         start_event, finish_event, num_tokens, is_write=True
                     )
+                    self._emit_transfer(
+                        "L1ToL2", self._tokens_to_logical_bytes(num_tokens)
+                    )
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         # CPU mirror is now live — add the DRAM bucket on
@@ -811,6 +864,7 @@ class HiRadixCache(RadixCache):
             self._observe_pcie_bandwidth(
                 start_event, finish_event, num_tokens, is_write=True
             )
+            self._emit_transfer("L1ToL2", self._tokens_to_logical_bytes(num_tokens))
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
@@ -836,6 +890,7 @@ class HiRadixCache(RadixCache):
             self._observe_pcie_bandwidth(
                 start_event, finish_event, num_tokens, is_write=False
             )
+            self._emit_transfer("L2ToL1", self._tokens_to_logical_bytes(num_tokens))
             # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
                 loaded_nodes = self.ongoing_load_back.pop(ack_id)
@@ -1453,6 +1508,10 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
             self.storage_metrics_collector.log_prefetched_bytes(
                 self._tokens_to_logical_bytes(loaded_from_storage)
+            )
+        if loaded_from_storage > 0:
+            self._emit_transfer(
+                "L3ToL2", self._tokens_to_logical_bytes(loaded_from_storage)
             )
 
         return True
