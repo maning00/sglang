@@ -1407,8 +1407,11 @@ class HiRadixCache(RadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            if operation.first_poll_time is None:
+                operation.first_poll_time = time.monotonic()
             return False
 
+        terminate_time = time.monotonic()
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
@@ -1451,9 +1454,59 @@ class HiRadixCache(RadixCache):
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
-            self.storage_metrics_collector.log_prefetched_bytes(
-                self._tokens_to_logical_bytes(loaded_from_storage)
-            )
+            loaded_bytes = self._tokens_to_logical_bytes(loaded_from_storage)
+            self.storage_metrics_collector.log_prefetched_bytes(loaded_bytes)
+            # Total async prefetch duration: enqueue → IO aux thread finished
+            # _page_transfer. Skipped under best_effort because the scheduler
+            # terminates on the first poll while the transfer is still in
+            # flight — complete_time hasn't been stamped yet, so we'd record
+            # the enqueue-to-poll latency instead of the real I/O time.
+            end_time = operation.complete_time or terminate_time
+            if self.prefetch_stop_policy != "best_effort":
+                self.storage_metrics_collector.log_prefetch_duration(
+                    max(0.0, end_time - operation.start_time)
+                )
+            # Unoverlapped tail: the portion of the async prefetch that ran
+            # after the scheduler first observed it as not-yet-terminable.
+            # Anchored on end_time (not terminate_time) so it never includes
+            # scheduler polling latency that happens after the I/O is done.
+            # Always 0 under best_effort (the first poll terminates so
+            # first_poll_time is never set) — kept for cross-policy
+            # comparability of the metric series.
+            if operation.first_poll_time is not None:
+                critical_path = max(0.0, end_time - operation.first_poll_time)
+            else:
+                critical_path = 0.0
+            self.storage_metrics_collector.log_prefetch_critical_path(critical_path)
+            if critical_path > 0 and loaded_bytes > 0:
+                self.storage_metrics_collector.log_prefetch_critical_path_bandwidth(
+                    self._to_gb_per_second(loaded_bytes, critical_path)
+                )
+            # Stage breakdown of the critical-path window. For each stage
+            # [a, b] the contribution is clip([a, b], [first_poll, end_time]).
+            # Fallbacks: a missing per-stage timestamp collapses that stage to
+            # zero-length at the next available boundary (e.g. if io_start was
+            # never stamped because the scheduler terminated under timeout
+            # before _page_transfer began, io_transfer contributes 0 and the
+            # remaining time falls into io_queue_wait).
+            if operation.first_poll_time is not None:
+                fpt = operation.first_poll_time
+                hq_start = operation.hit_query_start_time or end_time
+                hq_done = operation.hit_query_done_time or hq_start
+                io_start = operation.io_start_time or hq_done
+
+                def _clip(stage_start: float, stage_end: float) -> float:
+                    return max(
+                        0.0,
+                        min(stage_end, end_time) - max(stage_start, fpt),
+                    )
+
+                self.storage_metrics_collector.log_prefetch_cp_stage_breakdown(
+                    queue_wait_seconds=_clip(operation.start_time, hq_start),
+                    hit_query_seconds=_clip(hq_start, hq_done),
+                    io_queue_wait_seconds=_clip(hq_done, io_start),
+                    io_transfer_seconds=_clip(io_start, end_time),
+                )
 
         return True
 

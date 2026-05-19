@@ -63,6 +63,10 @@ Environment variables (override defaults):
   ENABLE_HICACHE            Enable L2 DRAM cache (default: true)
   ENABLE_UMBP               Enable L3 UMBP (DRAM+SSD) (default: true)
   HICACHE_SIZE              L2 DRAM size in GB/rank (default: 128)
+  HICACHE_STORAGE_PREFETCH_POLICY  L3 prefetch policy: best_effort | wait_complete | timeout
+                            (default: best_effort). Forwarded as
+                            --hicache-storage-prefetch-policy; only takes effect when
+                            ENABLE_UMBP=true.
 
   # L2 hugepage backing (forwarded to sglang's UMBPHostTensorAllocator)
   SGLANG_HICACHE_HOST_HUGEPAGE       Use anonymous hugepages for L2 (default: 1; 0=4 KiB anon)
@@ -170,6 +174,13 @@ ENABLE_HICACHE="${ENABLE_HICACHE:-true}"
 ENABLE_UMBP="${ENABLE_UMBP:-true}"
 HICACHE_SIZE="${HICACHE_SIZE:-128}"
 WRITE_POLICY="write_through"
+HICACHE_STORAGE_PREFETCH_POLICY="${HICACHE_STORAGE_PREFETCH_POLICY:-best_effort}"
+case "$HICACHE_STORAGE_PREFETCH_POLICY" in
+    best_effort|wait_complete|timeout) ;;
+    *)
+        echo "ERROR: HICACHE_STORAGE_PREFETCH_POLICY must be one of best_effort|wait_complete|timeout, got '$HICACHE_STORAGE_PREFETCH_POLICY'"
+        exit 1 ;;
+esac
 
 # L2 hugepage backing — forwarded to sglang's UMBPHostTensorAllocator.
 # Defaults match the design: AnonymousHugetlb backing (2 MiB pages), prefault on,
@@ -809,6 +820,7 @@ launch_pd_server() {
             cmd+=(
                 --hicache-storage-backend umbp
                 --hicache-storage-backend-extra-config "$extra_config"
+                --hicache-storage-prefetch-policy "$HICACHE_STORAGE_PREFETCH_POLICY"
             )
         fi
     fi
@@ -910,6 +922,7 @@ if bool_is_true "$ENABLE_UMBP"; then
     log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank (hugepages=$(bool_is_true "$UMBP_DRAM_USE_HUGEPAGES" && echo on || echo off))"
     log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
     log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
+    log "  L3 prefetch: ${HICACHE_STORAGE_PREFETCH_POLICY}"
     if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
         log "  SPDK:        pci=${UMBP_SPDK_NVME_PCI:-auto}, auto_start=${UMBP_SPDK_PROXY_AUTO_START}"
     fi

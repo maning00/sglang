@@ -2113,6 +2113,581 @@
       ],
       "title": "HiCache L3 Prefetch Effectiveness",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "L3 prefetch latency. Total = full async duration from PrefetchOperation enqueue to IO aux thread finishing _page_transfer. Critical path = unoverlapped tail; the portion of the async prefetch that ran after the scheduler first observed it as not-yet-terminable. Critical path is always <= Total; the gap between them is the latency hidden by async overlap. Policy semantics: under wait_complete and timeout, both lines are meaningful. Under best_effort, Total has no samples (scheduler can't see true completion from the polling side) and Critical path is always 0 (scheduler never waits) — expect this panel to look empty/zero in best_effort mode.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 72
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:prefetch_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "Total P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:prefetch_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "Total P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:prefetch_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "Total P50",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:prefetch_critical_path_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "Critical-path P99",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:prefetch_critical_path_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "Critical-path P95",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:prefetch_critical_path_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "Critical-path P50",
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_duration_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "Total Avg",
+          "range": true,
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_critical_path_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "Critical-path Avg",
+          "range": true,
+          "refId": "H"
+        }
+      ],
+      "title": "HiCache L3 Prefetch Latency (Total vs Critical Path)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "Effective L3 prefetch bandwidth observed on the scheduler critical path: prefetched bytes / critical-path duration, in GB/s. Only sampled when critical_path > 0 (scheduler actually blocked on the prefetch) — always empty under best_effort. Critical_path starts at first_poll (possibly after I/O began) and ends at complete_time, so this is an upper bound on true backend throughput.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "unit": "Bps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:prefetch_critical_path_bandwidth_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1024 * 1024 * 1024",
+          "instant": false,
+          "legendFormat": "Critical-path BW P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:prefetch_critical_path_bandwidth_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1024 * 1024 * 1024",
+          "instant": false,
+          "legendFormat": "Critical-path BW P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:prefetch_critical_path_bandwidth_bucket{instance=~\"$instance\"}[$__rate_interval]))) * 1024 * 1024 * 1024",
+          "instant": false,
+          "legendFormat": "Critical-path BW P50",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "(sum(rate(sglang:prefetch_critical_path_bandwidth_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_bandwidth_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)) * 1024 * 1024 * 1024",
+          "instant": false,
+          "legendFormat": "Critical-path BW Avg",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "HiCache L3 Prefetch Critical-Path Bandwidth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "Stacked share of the L3 prefetch critical path by stage. Each line is rate(stage_seconds_sum) / rate(critical_path_seconds_sum), so the four stages sum to 100% of the unoverlapped critical path. Stages: queue-wait (op sitting in prefetch_queue before lookup thread picks it up), hit-query (_storage_hit_query: hashing + batch_exists + TP all_reduce), io-queue-wait (op sitting in prefetch_buffer between threads), io-transfer (_page_transfer: batched batch_get + host memcpy). Empty under best_effort (critical_path is always 0).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 50,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "percent"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      },
+      "id": 33,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_queue_wait_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_sum{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "queue_wait (prefetch_queue)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_hit_query_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_sum{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "hit_query (batch_exists+TP)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_io_queue_wait_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_sum{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "io_queue_wait (prefetch_buffer)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_io_transfer_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_sum{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "io_transfer (_page_transfer)",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "HiCache L3 Prefetch Critical-Path Stage Breakdown",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "Stacked average duration of the L3 prefetch critical path by stage, in seconds (per entire PrefetchOperation — already spans all internal storage_batch_size sub-batches inside _storage_hit_query and _page_transfer). Each line is rate(stage_seconds_sum) / rate(critical_path_seconds_count), so the four stages stack additively to the average critical_path_seconds per request. Stages: queue_wait (op in prefetch_queue), hit_query (_storage_hit_query: hashing + batch_exists + TP all_reduce, looped over batches internally), io_queue_wait (op in prefetch_buffer between threads), io_transfer (_page_transfer: looped batch_get + host memcpy). Empty under best_effort (critical_path is always 0).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 50,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "id": 34,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_queue_wait_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "queue_wait (prefetch_queue)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_hit_query_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "hit_query (batch_exists+TP)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_io_queue_wait_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "io_queue_wait (prefetch_buffer)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:prefetch_cp_io_transfer_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:prefetch_critical_path_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "io_transfer (_page_transfer)",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "HiCache L3 Prefetch Critical-Path Stage Duration (Avg per request)",
+      "type": "timeseries"
     }
   ],
   "preload": false,

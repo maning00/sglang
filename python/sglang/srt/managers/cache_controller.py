@@ -241,6 +241,27 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        # Per-stage timestamps for breaking down where prefetch time goes.
+        # Each is set by the worker that begins/ends that stage; None means
+        # the op never reached that stage (e.g. revoked, or scheduler
+        # terminated before IO started under timeout policy).
+        # Stage timeline:
+        #   start_time → hit_query_start → hit_query_done →
+        #   io_start → complete_time
+        self.hit_query_start_time: Optional[float] = None
+        self.hit_query_done_time: Optional[float] = None
+        self.io_start_time: Optional[float] = None
+        # Set by the IO aux thread once _page_transfer finishes (success or
+        # early break). Used together with start_time to report the total
+        # async L3 prefetch duration. None means the transfer hasn't completed
+        # yet — terminate_time is used as a fallback in that case.
+        self.complete_time: Optional[float] = None
+        # Set by the scheduler the first time check_prefetch_progress sees
+        # this op as not-yet-terminable. The delta between this and the
+        # terminate timestamp is the scheduler-observed critical-path wait
+        # (i.e. the part of the prefetch that wasn't overlapped with other
+        # work). Stays None when the very first poll already terminates.
+        self.first_poll_time: Optional[float] = None
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -900,7 +921,9 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                operation.io_start_time = time.monotonic()
                 self._page_transfer(operation)
+                operation.complete_time = time.monotonic()
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -964,6 +987,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                operation.hit_query_start_time = time.monotonic()
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -976,6 +1000,7 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
+                operation.hit_query_done_time = time.monotonic()
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
