@@ -936,8 +936,8 @@ class HiCacheController:
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         # cancel prefetch if too much memory is occupied
-        if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
-            return True
+        # if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+        #     return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
