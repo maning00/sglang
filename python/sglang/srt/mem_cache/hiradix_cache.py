@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.radix_cache import (
     TreeNode,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.storage.umbp._compat import get_umbp_client_or_none
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
@@ -216,12 +217,26 @@ class HiRadixCache(RadixCache):
 
         return getattr(_umbp_mod.UMBPTierType, tier_name)
 
+    @staticmethod
+    def _umbp_match_hashes(hashes) -> List[str]:
+        """Convert internal SHA256 page hashes to router-visible int64 keys."""
+        result = []
+        for h in hashes:
+            if isinstance(h, str):
+                try:
+                    result.append(str(hash_str_to_int64(h)))
+                    continue
+                except ValueError:
+                    pass
+            result.append(str(h))
+        return result
+
     def _umbp_bind(self, hashes, tier_name: str) -> None:
         client = self._umbp_client
         if client is None or not hashes:
             return
         client.bind_external_hashes(
-            hashes=list(hashes), tier=self._umbp_tier(tier_name)
+            hashes=self._umbp_match_hashes(hashes), tier=self._umbp_tier(tier_name)
         )
 
     def _umbp_unbind(self, hashes, tier_name: str) -> None:
@@ -229,7 +244,7 @@ class HiRadixCache(RadixCache):
         if client is None or not hashes:
             return
         client.unbind_external_hashes(
-            hashes=list(hashes), tier=self._umbp_tier(tier_name)
+            hashes=self._umbp_match_hashes(hashes), tier=self._umbp_tier(tier_name)
         )
 
     def _umbp_clear_at_tier(self, tier_name: str, flush: bool = False) -> None:
