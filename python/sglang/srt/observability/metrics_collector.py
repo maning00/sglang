@@ -434,6 +434,18 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
         )
+        self.kv_mori_rdma_latency_ms = Histogram(
+            name="sglang:kv_mori_rdma_latency_ms",
+            documentation="Histogram of mori-io RDMA transfer latency in ms (last chunk issue to all statuses complete), labeled per decode endpoint for P-D pair visibility.",
+            labelnames=list(labels.keys()) + ["decode_endpoint"],
+            buckets=(0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
+        )
+        self.kv_mori_rdma_speed_gb_s = Histogram(
+            name="sglang:kv_mori_rdma_speed_gb_s",
+            documentation="Histogram of mori-io RDMA transfer speed in GB/s (last chunk bytes / tail latency), labeled per decode endpoint for P-D pair visibility.",
+            labelnames=list(labels.keys()) + ["decode_endpoint"],
+            buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
+        )
 
         # Utilization
         self.utilization = Gauge(
@@ -871,6 +883,16 @@ class SchedulerMetricsCollector:
     ) -> None:
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
+
+    def observe_kv_mori_rdma_metrics(
+        self,
+        rdma_latency_ms: float,
+        rdma_speed_gb_s: float,
+        decode_endpoint: str,
+    ) -> None:
+        labels = {**self.labels, "decode_endpoint": decode_endpoint}
+        self.kv_mori_rdma_latency_ms.labels(**labels).observe(rdma_latency_ms)
+        self.kv_mori_rdma_speed_gb_s.labels(**labels).observe(rdma_speed_gb_s)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}

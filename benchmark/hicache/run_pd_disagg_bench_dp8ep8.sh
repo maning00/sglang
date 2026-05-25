@@ -90,6 +90,9 @@ Environment variables (override defaults):
   # Prefill-specific
   CHUNKED_PREFILL_SIZE      Chunked prefill chunk size for prefill node; unset = sglang auto-tune.
 
+  # Prefill-specific
+  PREFILL_MAX_RUNNING_REQUESTS  Max concurrent requests on prefill (default: unset = sglang default)
+
   # Decode-specific
   MAX_RUNNING_REQUESTS      Max concurrent requests on decode (default: 128)
 
@@ -246,6 +249,9 @@ SEED="${SEED:-42}"
 
 # Prefill-specific
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
+
+# Prefill-specific max running requests (empty = sglang default)
+PREFILL_MAX_RUNNING_REQUESTS="${PREFILL_MAX_RUNNING_REQUESTS:-}"
 
 # Decode-specific
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
@@ -779,6 +785,9 @@ launch_pd_server() {
         cmd+=(--disaggregation-bootstrap-port "$DISAGG_BOOTSTRAP_PORT")
         if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
             cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+        fi
+        if [[ -n "$PREFILL_MAX_RUNNING_REQUESTS" ]]; then
+            cmd+=(--max-running-requests "$PREFILL_MAX_RUNNING_REQUESTS")
         fi
     fi
     if [[ "$role" == "decode" ]]; then

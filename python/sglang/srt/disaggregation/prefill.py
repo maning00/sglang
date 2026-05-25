@@ -623,6 +623,22 @@ class SchedulerDisaggregationPrefillMixin:
                 if "speed_gb_s" in metrics:
                     self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
+            # Observe mori-io RDMA latency/bandwidth if the sender supports it
+            if self.enable_metrics and hasattr(req.disagg_kv_sender, "rdma_latency_ms"):
+                rdma_ms = req.disagg_kv_sender.rdma_latency_ms
+                if rdma_ms is not None and rdma_ms > 0:
+                    # Bandwidth uses last-chunk bytes paired with tail latency:
+                    # both measure the same chunk, so speed is always consistent.
+                    last_chunk_mb = req.disagg_kv_sender.rdma_last_chunk_bytes_mb
+                    rdma_speed_gb_s = 0.0
+                    if last_chunk_mb > 0:
+                        rdma_speed_gb_s = (last_chunk_mb / 1024) / (rdma_ms / 1000)
+                    self.metrics_collector.observe_kv_mori_rdma_metrics(
+                        rdma_latency_ms=rdma_ms,
+                        rdma_speed_gb_s=rdma_speed_gb_s,
+                        decode_endpoint=req.disagg_kv_sender.decode_endpoint,
+                    )
+
         # Stream requests which have finished transfer
         self.stream_output(
             done_reqs,

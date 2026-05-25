@@ -494,9 +494,9 @@ class MoriKVManager(CommonKVManager):
         kv_item_len: int,
         src_groups: List[List[int]],
         dst_groups: List[List[int]],
-    ) -> List[TransferStatus]:
+    ) -> Tuple[List[TransferStatus], int]:
         if not src_groups:
-            return []
+            return [], 0
         local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
         remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
         sizes = [len(src_group) * kv_item_len for src_group in src_groups]
@@ -511,7 +511,7 @@ class MoriKVManager(CommonKVManager):
             [sizes],
             [transfer_uid],
         )
-        return statuses
+        return statuses, sum(sizes)
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
@@ -615,7 +615,7 @@ class MoriKVManager(CommonKVManager):
         sizes = [tp_cfg.heads_bytes_per_token_to_send] * num_transfers
 
         if not local_offsets:
-            return []
+            return [], 0
 
         transfer_uid = self.engine.allocate_transfer_uid()
         statuses = self.engine.batch_write(
@@ -626,18 +626,19 @@ class MoriKVManager(CommonKVManager):
             [sizes],
             [transfer_uid],
         )
-        return statuses
+        return statuses, sum(sizes)
 
     def send_kvcache(
         self,
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
-    ) -> List[TransferStatus]:
+    ) -> Tuple[List[TransferStatus], int]:
         src_groups, dst_groups = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
         statuses = []
+        bytes_sent = 0
         kv_item_len = self.kv_args.kv_item_lens[0]
         if self.is_mla_backend:
             (
@@ -646,15 +647,15 @@ class MoriKVManager(CommonKVManager):
                 layers_current_pp_stage,
             ) = self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             for layer_id in range(layers_current_pp_stage):
-                statuses.extend(
-                    self._issue_layer_transfers(
-                        src_descs[layer_id],
-                        dst_descs[layer_id],
-                        kv_item_len,
-                        src_groups,
-                        dst_groups,
-                    )
+                s, b = self._issue_layer_transfers(
+                    src_descs[layer_id],
+                    dst_descs[layer_id],
+                    kv_item_len,
+                    src_groups,
+                    dst_groups,
                 )
+                statuses.extend(s)
+                bytes_sent += b
         else:
             tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
             (
@@ -668,49 +669,47 @@ class MoriKVManager(CommonKVManager):
             if tp_mismatch:
                 tp_cfg = self._build_tp_slice_config(peer_info)
                 for layer_id in range(layers_current_pp_stage):
-                    statuses.extend(
-                        self._issue_tp_slice_transfers(
-                            src_k_descs[layer_id],
-                            dst_k_descs[layer_id],
-                            prefill_kv_indices,
-                            dst_kv_indices,
-                            tp_cfg,
-                        )
+                    sk, bk = self._issue_tp_slice_transfers(
+                        src_k_descs[layer_id],
+                        dst_k_descs[layer_id],
+                        prefill_kv_indices,
+                        dst_kv_indices,
+                        tp_cfg,
                     )
-                    statuses.extend(
-                        self._issue_tp_slice_transfers(
-                            src_v_descs[layer_id],
-                            dst_v_descs[layer_id],
-                            prefill_kv_indices,
-                            dst_kv_indices,
-                            tp_cfg,
-                        )
+                    sv, bv = self._issue_tp_slice_transfers(
+                        src_v_descs[layer_id],
+                        dst_v_descs[layer_id],
+                        prefill_kv_indices,
+                        dst_kv_indices,
+                        tp_cfg,
                     )
+                    statuses.extend(sk)
+                    statuses.extend(sv)
+                    bytes_sent += bk + bv
             else:
                 src_groups, dst_groups = group_concurrent_contiguous(
                     prefill_kv_indices, dst_kv_indices
                 )
                 for layer_id in range(layers_current_pp_stage):
-                    statuses.extend(
-                        self._issue_layer_transfers(
-                            src_k_descs[layer_id],
-                            dst_k_descs[layer_id],
-                            kv_item_len,
-                            src_groups,
-                            dst_groups,
-                        )
+                    sk, bk = self._issue_layer_transfers(
+                        src_k_descs[layer_id],
+                        dst_k_descs[layer_id],
+                        kv_item_len,
+                        src_groups,
+                        dst_groups,
                     )
-                    statuses.extend(
-                        self._issue_layer_transfers(
-                            src_v_descs[layer_id],
-                            dst_v_descs[layer_id],
-                            kv_item_len,
-                            src_groups,
-                            dst_groups,
-                        )
+                    sv, bv = self._issue_layer_transfers(
+                        src_v_descs[layer_id],
+                        dst_v_descs[layer_id],
+                        kv_item_len,
+                        src_groups,
+                        dst_groups,
                     )
+                    statuses.extend(sk)
+                    statuses.extend(sv)
+                    bytes_sent += bk + bv
 
-        return statuses
+        return statuses, bytes_sent
 
     def send_aux(
         self,
@@ -799,7 +798,7 @@ class MoriKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
+    ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]], int]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         transfer_infos = self.transfer_infos.get(bootstrap_room)
         if not transfer_infos:
@@ -807,6 +806,7 @@ class MoriKVManager(CommonKVManager):
                 f"No transfer info found for bootstrap_room={bootstrap_room}"
             )
         result_statuses = []
+        total_bytes_sent = 0
         target_infos_snapshot: Optional[List[TransferInfo]] = None
         with self.transfer_lock:
             self.update_status(bootstrap_room, KVPoll.Transferring)
@@ -822,10 +822,11 @@ class MoriKVManager(CommonKVManager):
                     )
                 if not info.is_dummy:
                     dst_indices_chunk = info.dst_kv_indices[index_slice]
-                    statuses = self.send_kvcache(
+                    statuses, bytes_sent = self.send_kvcache(
                         peer_info, kv_indices, dst_indices_chunk
                     )
                     result_statuses.extend(statuses)
+                    total_bytes_sent += bytes_sent
                 if (
                     is_last
                     and aux_index is not None
@@ -841,7 +842,7 @@ class MoriKVManager(CommonKVManager):
                 self.update_status(bootstrap_room, KVPoll.Success)
                 target_infos_snapshot = list(transfer_infos.values())
                 self.transfer_infos.pop(bootstrap_room, None)
-        return result_statuses, target_infos_snapshot
+        return result_statuses, target_infos_snapshot, total_bytes_sent
 
 
 class MoriKVSender(CommonKVSender):
@@ -860,6 +861,16 @@ class MoriKVSender(CommonKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self.status_notified = False
         self.init_time = time.time()
+        # Mori RDMA timing.
+        # _rdma_first_issue_time: when the first send() call enters add_transfer_request.
+        # _rdma_last_issue_time:  updated on every send() — when the last chunk was issued.
+        # _rdma_complete_time:    when all TransferStatus objects report done.
+        # Tail latency = complete - last_issue (excludes prefill-compute gaps between chunks).
+        self._rdma_first_issue_time: float = 0.0
+        self._rdma_last_issue_time: float = 0.0
+        self._rdma_complete_time: float = 0.0
+        self._rdma_bytes_sent: int = 0        # total across all chunks
+        self._rdma_last_chunk_bytes: int = 0  # bytes of the last chunk only
 
     def send(
         self,
@@ -883,7 +894,11 @@ class MoriKVSender(CommonKVSender):
             else:
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
-        statuses, infos = self.kv_mgr.add_transfer_request(
+        t_issue = time.perf_counter()
+        if self._rdma_first_issue_time == 0.0:
+            self._rdma_first_issue_time = t_issue
+        self._rdma_last_issue_time = t_issue
+        statuses, infos, bytes_sent = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
@@ -891,6 +906,8 @@ class MoriKVSender(CommonKVSender):
             aux_index=self.aux_index if is_last else None,
         )
         self.transfer_statuses.extend(statuses)
+        self._rdma_bytes_sent += bytes_sent
+        self._rdma_last_chunk_bytes = bytes_sent
         if infos is not None:
             self.pending_infos = infos
             self.sent_last_chunk = True
@@ -919,6 +936,8 @@ class MoriKVSender(CommonKVSender):
 
         transfers_done = self._all_transfers_finished()
         if transfers_done:
+            if self._rdma_complete_time == 0.0:
+                self._rdma_complete_time = time.perf_counter()
             if self._has_transfer_error():
                 reason = self._collect_failure_reason()
                 self.kv_mgr.record_failure(self.bootstrap_room, reason)
@@ -945,6 +964,32 @@ class MoriKVSender(CommonKVSender):
             if status.Failed():
                 return f"KV transfer failed: {status.Message()}"
         return "KV transfer failed due to unknown reason"
+
+    @property
+    def rdma_latency_ms(self) -> Optional[float]:
+        """Tail RDMA latency: from last chunk's issue to all statuses done.
+        Excludes prefill-compute gaps between chunks."""
+        if self._rdma_last_issue_time > 0.0 and self._rdma_complete_time > 0.0:
+            return (self._rdma_complete_time - self._rdma_last_issue_time) * 1000.0
+        return None
+
+    @property
+    def rdma_last_chunk_bytes_mb(self) -> float:
+        """Bytes submitted in the last send() call, in MB.
+        Pairs with rdma_latency_ms (tail) for a consistent bandwidth calculation.
+        For non-chunked prefill this equals total bytes sent."""
+        return self._rdma_last_chunk_bytes / (1024 * 1024)
+
+    @property
+    def decode_endpoint(self) -> str:
+        """Comma-separated sorted unique endpoints of non-dummy decode peers.
+        Available after the last chunk is sent (pending_infos is set)."""
+        if not self.pending_infos:
+            return "unknown"
+        endpoints = sorted(
+            {info.endpoint for info in self.pending_infos if not info.is_dummy}
+        )
+        return ",".join(endpoints) if endpoints else "unknown"
 
     def _notify_decode(
         self, status: KVPoll, failure_reason: Optional[str] = None
