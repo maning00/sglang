@@ -1000,7 +1000,8 @@ class UMBPStore(HiCacheStorage):
         return self.client.exists(key)
 
     def clear(self) -> None:
-        self.client.clear()
+        if not self.client.clear():
+            raise RuntimeError("UMBP clear full-sync failed")
 
     def flush(self) -> bool:
         if self.client is None or not hasattr(self.client, "flush"):
