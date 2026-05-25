@@ -13,9 +13,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
-    MEDIUM_CPU,
-    MEDIUM_GPU,
-    MEDIUM_STORAGE,
     AllBlocksClearedAtTier,
 )
 from sglang.srt.environ import envs
@@ -48,6 +45,7 @@ from sglang.srt.mem_cache.radix_cache import (
     TreeNode,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.storage.umbp._compat import get_umbp_client_or_none
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
@@ -207,6 +205,40 @@ class HiRadixCache(RadixCache):
         (storage clear/detach, radix-cache reset)."""
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksClearedAtTier(medium=medium))
+
+    @property
+    def _umbp_client(self):
+        return get_umbp_client_or_none(self.cache_controller)
+
+    @staticmethod
+    def _umbp_tier(tier_name: str):
+        import mori.umbp as _umbp_mod
+
+        return getattr(_umbp_mod.UMBPTierType, tier_name)
+
+    def _umbp_bind(self, hashes, tier_name: str) -> None:
+        client = self._umbp_client
+        if client is None or not hashes:
+            return
+        client.bind_external_hashes(
+            hashes=list(hashes), tier=self._umbp_tier(tier_name)
+        )
+
+    def _umbp_unbind(self, hashes, tier_name: str) -> None:
+        client = self._umbp_client
+        if client is None or not hashes:
+            return
+        client.unbind_external_hashes(
+            hashes=list(hashes), tier=self._umbp_tier(tier_name)
+        )
+
+    def _umbp_clear_at_tier(self, tier_name: str, flush: bool = False) -> None:
+        client = self._umbp_client
+        if client is None:
+            return
+        client.unbind_all_external_hashes_at_tier(self._umbp_tier(tier_name))
+        if flush and hasattr(client, "flush_external_queue"):
+            client.flush_external_queue()
 
     def is_storage_idle(self) -> bool:
         cc = self.cache_controller
@@ -397,6 +429,12 @@ class HiRadixCache(RadixCache):
 
         Caller must ensure there are no running/queued requests to avoid races.
         """
+        umbp_client = get_umbp_client_or_none(self.cache_controller)
+        if umbp_client is not None:
+            umbp_client.unbind_all_external_hashes_at_tier(self._umbp_tier("SSD"))
+            if hasattr(umbp_client, "flush_external_queue"):
+                umbp_client.flush_external_queue()
+
         try:
             if self.enable_storage:
                 drain_pending_storage_acks(self)
@@ -419,8 +457,7 @@ class HiRadixCache(RadixCache):
         # leftover pending ops (e.g., async prefetch/backup that didn't get a revoke/ack).
         self._force_release_pending_storage_ops()
 
-        # Storage backend gone — drop the STORAGE bucket on master in one RPC.
-        self._emit_clear_at_tier(MEDIUM_STORAGE)
+        # Storage backend gone; SSD bucket was dropped before teardown above.
         self.enable_storage = False
         self.enable_storage_metrics = False
         return True, "Detached HiCache storage backend successfully."
@@ -536,16 +573,12 @@ class HiRadixCache(RadixCache):
                     # it to the storage backend (backup may partially
                     # succeed; only completed pages get a tier bucket).
                     completed_pages = operation.completed_tokens // self.page_size
-                    if (
-                        completed_pages > 0
-                        and entry.hash_value is not None
-                        and self.enable_kv_cache_events
-                    ):
+                    if completed_pages > 0 and entry.hash_value is not None:
                         for page_index in range(
                             min(completed_pages, len(entry.hash_value))
                         ):
-                            self._record_store_event_for_page(
-                                entry, page_index, medium=MEDIUM_STORAGE
+                            self._umbp_bind(
+                                [entry.hash_value[page_index]], tier_name="SSD"
                             )
                 if log_metrics and self.enable_storage_metrics:
                     backuped_tokens = int(operation.completed_tokens)
@@ -652,8 +685,8 @@ class HiRadixCache(RadixCache):
         if emit_events:
             if self.enable_storage:
                 drain_pending_storage_acks(self, deadline_seconds=2.0)
-            self._emit_clear_at_tier(MEDIUM_GPU)
-            self._emit_clear_at_tier(MEDIUM_CPU)
+            self._umbp_clear_at_tier("HBM")
+            self._umbp_clear_at_tier("DRAM")
 
         # Save events before super().reset() emits its own AllBlocksCleared,
         # which we want to discard (we already issued tier-scoped clears).
@@ -693,8 +726,8 @@ class HiRadixCache(RadixCache):
             # Check if the storage backend has a clear method (for nixl backends)
             if hasattr(self.cache_controller.storage_backend, "clear"):
                 self.cache_controller.storage_backend.clear()
-                # Drop the STORAGE bucket on master in one bulk RPC.
-                self._emit_clear_at_tier(MEDIUM_STORAGE)
+                # Drop the STORAGE bucket on master in one bulk event.
+                self._umbp_clear_at_tier("SSD", flush=True)
                 logger.info("Hierarchical cache storage backend cleared successfully!")
                 return True
             else:
@@ -772,7 +805,7 @@ class HiRadixCache(RadixCache):
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         # CPU mirror is now live — add the DRAM bucket on
                         # the master.  GPU bucket (if any) is untouched.
-                        self._record_store_event(backuped_node, medium=MEDIUM_CPU)
+                        self._umbp_bind(backuped_node.hash_value, tier_name="DRAM")
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -816,7 +849,7 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(backuped_node)
                 # CPU mirror is now live — add the DRAM bucket on the
                 # master.  GPU bucket (if any) is untouched.
-                self._record_store_event(backuped_node, medium=MEDIUM_CPU)
+                self._umbp_bind(backuped_node.hash_value, tier_name="DRAM")
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
@@ -842,7 +875,7 @@ class HiRadixCache(RadixCache):
                 # CPU→GPU promotion is additive — add the HBM bucket and
                 # leave the existing DRAM (CPU) bucket alone.
                 for node in loaded_nodes:
-                    self._record_store_event(node, medium=MEDIUM_GPU)
+                    self._umbp_bind(node.hash_value, tier_name="HBM")
                 self.dec_lock_ref(loaded_nodes[-1])
 
         # ACK until all events are processed
@@ -1141,7 +1174,7 @@ class HiRadixCache(RadixCache):
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
-        self._record_remove_event(node, medium=MEDIUM_GPU)
+        self._umbp_unbind(node.hash_value, tier_name="HBM")
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
         self._update_leaf_status(node.parent)
@@ -1151,7 +1184,7 @@ class HiRadixCache(RadixCache):
         # GPU evicted with no host backup — the block was only on HBM, so
         # removing the HBM bucket leaves the (node, hash) entry empty and
         # the master drops it entirely.
-        self._record_remove_event(node, medium=MEDIUM_GPU)
+        self._umbp_unbind(node.hash_value, tier_name="HBM")
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -1194,7 +1227,7 @@ class HiRadixCache(RadixCache):
             # backend has a copy of the same hash, master keeps the SSD
             # bucket (per-tier additive); otherwise the (node, hash) entry
             # disappears entirely.  No need to inspect storage state here.
-            self._record_remove_event(x, medium=MEDIUM_CPU)
+            self._umbp_unbind(x.hash_value, tier_name="DRAM")
             num_evicted += self.cache_controller.evict_host(x.host_value)
             x.host_value = None
 
@@ -1652,7 +1685,7 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(node)
             # Storage prefetch landed in host pool — add the DRAM bucket.
             # SSD bucket (still valid in storage backend) is untouched.
-            self._record_store_event(new_node, medium=MEDIUM_CPU)
+            self._umbp_bind(new_node.hash_value, tier_name="DRAM")
 
         return matched_length
 
@@ -1751,7 +1784,7 @@ class HiRadixCache(RadixCache):
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
-                    self._record_store_event(node, medium=MEDIUM_GPU)
+                    self._umbp_bind(node.hash_value, tier_name="HBM")
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
@@ -1767,7 +1800,7 @@ class HiRadixCache(RadixCache):
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
-                    self._record_store_event(new_node, medium=MEDIUM_GPU)
+                    self._umbp_bind(new_node.hash_value, tier_name="HBM")
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
@@ -1798,7 +1831,7 @@ class HiRadixCache(RadixCache):
                 self._ensure_node_hash_value(new_node)
 
             # Emit BlockStored so the router indexes this block.
-            self._record_store_event(new_node, medium=MEDIUM_GPU)
+            self._umbp_bind(new_node.hash_value, tier_name="HBM")
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)

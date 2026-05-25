@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import socket
-import threading
 import uuid
 from typing import Any, List, Optional
 
@@ -87,25 +86,6 @@ def _parse_tag_values(value: Any) -> List[str]:
         return _clean(value)
 
     return _clean([value])
-
-
-def _compute_kv_publisher_port(
-    extra: dict,
-    dp_rank_hint: Optional[int],
-    dp_size_hint: Optional[int],
-) -> int:
-    """Return the ZMQ KV-events publisher port this rank subscribes to.
-
-    Mirrors ZmqEventPublisher.offset_endpoint_port: in DP mode the base port
-    is incremented by dp_rank so each DP group gets an isolated channel.
-    """
-    base_endpoint = str(extra.get("kv_events_endpoint", "tcp://localhost:5557"))
-    try:
-        base_port = int(base_endpoint.rsplit(":", 1)[-1])
-    except (ValueError, IndexError):
-        base_port = 5557
-    is_dp = dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
-    return base_port + (dp_rank_hint if is_dp else 0)
 
 
 def _default_node_address() -> str:
@@ -344,11 +324,10 @@ class UMBPStore(HiCacheStorage):
 
             node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
             if node_id is None:
-                _kv_port = _compute_kv_publisher_port(extra, dp_rank_hint, dp_size_hint)
                 dist_cfg.master_config.node_id = (
                     f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
                     f":pp{self.pp_rank}:tp{self.local_rank}"
-                    f":{_PROCESS_INSTANCE_TOKEN}:kvport={_kv_port}"
+                    f":{_PROCESS_INSTANCE_TOKEN}"
                 )
             else:
                 dist_cfg.master_config.node_id = _select_rank_config_value(
@@ -669,42 +648,6 @@ class UMBPStore(HiCacheStorage):
             self.local_rank,
             cfg.ssd_backend,
         )
-
-        # ------------------------------------------------------------------
-        # Optional KV events subscriber
-        # Enabled via extra_config["kv_events_subscriber"] = True/1/"true".
-        # Extra knobs:
-        #   kv_events_endpoint — ZMQ connect address (default "tcp://localhost:5557")
-        #   kv_events_topic    — topic filter matching the server's topic (default "")
-        # ------------------------------------------------------------------
-        _is_dp_mode = (
-            dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
-        )
-        _dp_rank = dp_rank_hint if dp_rank_hint is not None else 0
-
-        self._kv_events_subscriber: Optional[KVEventsSubscriber] = None
-        if _bool_from_any(extra.get("kv_events_subscriber", False)):
-            # DP mode: all DP clients subscribe (filter by dp_rank in on_event).
-            # TP-only mode: only rank 0 subscribes.
-            if _is_dp_mode or self.local_rank == 0:
-                from sglang.srt.disaggregation.kv_events import ZmqEventPublisher
-
-                kv_endpoint_base = str(
-                    extra.get("kv_events_endpoint", "tcp://localhost:5557")
-                )
-                kv_endpoint = (
-                    ZmqEventPublisher.offset_endpoint_port(kv_endpoint_base, _dp_rank)
-                    if _is_dp_mode
-                    else kv_endpoint_base
-                )
-                kv_topic = str(extra.get("kv_events_topic", ""))
-                self._kv_events_subscriber = KVEventsSubscriber(
-                    umbp_client=self.client,
-                    endpoint=kv_endpoint,
-                    topic=kv_topic,
-                    dp_rank=_dp_rank if _is_dp_mode else None,
-                )
-                self._kv_events_subscriber.start()
 
     # ------------------------------------------------------------------
     # Host memory pool registration
@@ -1065,12 +1008,6 @@ class UMBPStore(HiCacheStorage):
         return bool(self.client.flush())
 
     def close(self) -> None:
-        if getattr(self, "_kv_events_subscriber", None) is not None:
-            try:
-                self._kv_events_subscriber.stop()
-            except Exception:
-                logger.exception("KVEventsSubscriber stop during close failed")
-            self._kv_events_subscriber = None
         if getattr(self, "client", None) is None:
             return
         try:
@@ -1078,228 +1015,3 @@ class UMBPStore(HiCacheStorage):
         except Exception:
             logger.exception("UMBPStore flush during close failed")
         self.client = None
-
-
-class KVEventsSubscriber:
-    """Subscribe to SGLang KV cache events published over ZMQ and forward
-    them to the UMBP Master via ``umbp_client``.
-
-    Runs a background thread that receives :class:`KVEventBatch` messages
-    from a ``ZmqEventPublisher`` and dispatches each individual event to
-    :meth:`on_event`.
-
-    Parameters
-    ----------
-    umbp_client:
-        The ``UMBPClient`` instance owned by the parent ``UMBPStore``.
-        Will be used to publish events to the UMBP Master.
-    endpoint:
-        ZMQ endpoint of the SGLang publisher, e.g. ``"tcp://localhost:5557"``.
-        For DP attention rank *N*, the port is offset by *N* (rank 0 → 5557,
-        rank 1 → 5558, …).
-    topic:
-        Topic filter passed to ``zmq.SUBSCRIBE``.  Must match the ``topic``
-        set in ``KVEventsConfig`` on the server side.  Empty string subscribes
-        to everything.
-    poll_timeout_ms:
-        How long (in milliseconds) the receiver thread waits for a message
-        before looping and checking the stop flag.
-    """
-
-    def __init__(
-        self,
-        umbp_client: Any,
-        endpoint: str = "tcp://localhost:5557",
-        topic: str = "",
-        poll_timeout_ms: int = 100,
-        dp_rank: Optional[int] = None,
-    ) -> None:
-        self._umbp_client = umbp_client
-        self._endpoint = endpoint
-        self._topic = topic
-        self._poll_timeout_ms = poll_timeout_ms
-        # When set, only process events whose attn_dp_rank matches (DP mode).
-        self._dp_rank = dp_rank
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        # Cache UMBPTierType constants to avoid repeated attribute lookups.
-        import mori.umbp as _umbp_mod
-
-        _tier = _umbp_mod.UMBPTierType
-        self._tier_hbm = _tier.HBM
-        self._tier_dram = _tier.DRAM
-        self._tier_ssd = _tier.SSD
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def start(self) -> None:
-        """Start the subscriber background thread."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="kv-events-subscriber",
-        )
-        self._thread.start()
-        logger.info(
-            "KVEventsSubscriber started: endpoint=%s, topic=%r",
-            self._endpoint,
-            self._topic,
-        )
-
-    def stop(self, timeout: float = 2.0) -> None:
-        """Signal the subscriber thread to stop and wait for it to finish."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
-        logger.info("KVEventsSubscriber stopped")
-
-    # ------------------------------------------------------------------
-    # Event handler
-    # ------------------------------------------------------------------
-
-    def _medium_to_tier(self, medium: Optional[str]) -> Any:
-        """Map a KV event medium string to a UMBPTierType value.
-
-        ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
-        ``MEDIUM_CPU`` maps to DRAM. ``MEDIUM_STORAGE`` maps to SSD as
-        HiCache's L3 cost class, regardless of UMBP's internal placement.
-        """
-        from sglang.srt.disaggregation.kv_events import (
-            MEDIUM_CPU,
-            MEDIUM_GPU,
-            MEDIUM_STORAGE,
-        )
-
-        if medium == MEDIUM_GPU:
-            return self._tier_hbm
-        if medium == MEDIUM_CPU:
-            return self._tier_dram
-        if medium == MEDIUM_STORAGE:
-            return self._tier_ssd
-
-        logger.warning("Unknown KV event medium %r, defaulting to DRAM", medium)
-        return self._tier_dram
-
-    def on_event(
-        self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]
-    ) -> None:
-        """Translate one SGLang KV cache event into the corresponding UMBP
-        master mutation.
-
-        The UMBP master uses an additive multi-tier model:
-        ``BlockStored(medium=X)`` adds the (node, hash) → tier-X bucket;
-        ``BlockRemoved(medium=X)`` drops only that tier bucket; other tier
-        copies of the same (node, hash) are untouched.  ``AllBlocksClearedA
-        tTier(medium=X)`` is the bulk equivalent: every hash reported by
-        this node at tier X is dropped in a single RPC.
-        """
-        from sglang.srt.disaggregation.kv_events import (
-            AllBlocksCleared,
-            AllBlocksClearedAtTier,
-            BlockRemoved,
-            BlockStored,
-        )
-
-        if self._dp_rank is not None:
-            event_dp_rank = attn_dp_rank if attn_dp_rank is not None else 0
-            if event_dp_rank != self._dp_rank:
-                return
-
-        if isinstance(event, BlockStored):
-            hashes = [str(h) for h in event.block_hashes]
-            tier = self._medium_to_tier(event.medium)
-            if not self._umbp_client.report_external_kv_blocks(hashes, tier):
-                logger.warning(
-                    "report_external_kv_blocks failed: %d hashes tier=%s dp=%s",
-                    len(hashes),
-                    event.medium,
-                    attn_dp_rank,
-                )
-
-        elif isinstance(event, BlockRemoved):
-            hashes = [str(h) for h in event.block_hashes]
-            tier = self._medium_to_tier(event.medium)
-            if not self._umbp_client.revoke_external_kv_blocks(hashes, tier):
-                logger.warning(
-                    "revoke_external_kv_blocks failed: %d hashes tier=%s dp=%s",
-                    len(hashes),
-                    event.medium,
-                    attn_dp_rank,
-                )
-
-        elif isinstance(event, AllBlocksClearedAtTier):
-            tier = self._medium_to_tier(event.medium)
-            if not self._umbp_client.revoke_all_external_kv_blocks_at_tier(tier):
-                logger.warning(
-                    "revoke_all_external_kv_blocks_at_tier failed: tier=%s dp=%s",
-                    event.medium,
-                    attn_dp_rank,
-                )
-
-        elif isinstance(event, AllBlocksCleared):
-            # Base RadixCache reset has no tier info; drop every tier this
-            # node could have populated.  Each call is idempotent and skips
-            # tiers with no entries, so issuing all three is cheap.
-            for tier_name, tier in (
-                ("HBM", self._tier_hbm),
-                ("DRAM", self._tier_dram),
-                ("SSD", self._tier_ssd),
-            ):
-                if not self._umbp_client.revoke_all_external_kv_blocks_at_tier(tier):
-                    logger.warning(
-                        "revoke_all_external_kv_blocks_at_tier failed during "
-                        "AllBlocksCleared: tier=%s dp=%s",
-                        tier_name,
-                        attn_dp_rank,
-                    )
-
-        else:
-            logger.debug(
-                "KVEventsSubscriber: unhandled event type %s", type(event).__name__
-            )
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _run(self) -> None:
-        import zmq
-        from msgspec.msgpack import Decoder
-
-        from sglang.srt.disaggregation.kv_events import KVEventBatch
-
-        decoder = Decoder(type=KVEventBatch)
-        ctx = zmq.Context.instance()
-        sub = ctx.socket(zmq.SUB)
-        sub.connect(self._endpoint)
-        sub.setsockopt_string(zmq.SUBSCRIBE, self._topic)
-        logger.debug(
-            "KVEventsSubscriber connected to %s, topic=%r", self._endpoint, self._topic
-        )
-
-        try:
-            while not self._stop_event.is_set():
-                if not sub.poll(self._poll_timeout_ms):
-                    continue
-                try:
-                    parts = sub.recv_multipart()
-                    # Publisher sends: [topic, seq_bytes, payload]
-                    if len(parts) != 3:
-                        logger.warning(
-                            "Unexpected frame count %d from publisher", len(parts)
-                        )
-                        continue
-                    _, _seq_bytes, payload = parts
-                    batch = decoder.decode(payload)
-                    for event in batch.events:
-                        self.on_event(event, batch.ts, batch.attn_dp_rank)
-                except Exception:
-                    logger.exception("KVEventsSubscriber error decoding message")
-        finally:
-            sub.close(linger=0)

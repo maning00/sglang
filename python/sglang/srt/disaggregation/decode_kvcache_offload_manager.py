@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.storage.umbp._compat import get_umbp_client_or_none
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -107,6 +108,16 @@ class DecodeKVCacheOffloadManager:
         self.offloaded_state = {}
         logger.info("Enable offload kv cache for decode side")
 
+    @property
+    def _umbp_client(self):
+        return get_umbp_client_or_none(self.cache_controller)
+
+    @staticmethod
+    def _umbp_tier(tier_name: str):
+        import mori.umbp as _umbp_mod
+
+        return getattr(_umbp_mod.UMBPTierType, tier_name)
+
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
 
@@ -153,6 +164,7 @@ class DecodeKVCacheOffloadManager:
         end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
+        page_hashes = self._compute_prefix_hash(incremental_tokens, state.last_hash)
 
         # Early free prefill-offloaded GPU memory
         if state.prefill_len > 0 and state.inc_len == 0:
@@ -173,11 +185,16 @@ class DecodeKVCacheOffloadManager:
             req,
             host_indices,
             incremental_tokens,
+            page_hashes,
             time.time(),
             start,
             end,
         )
         state.inc_len += incremental_aligned_len
+        if page_hashes:
+            # Keep the hash chain in step with inc_len for pipelined offloads.
+            # The async copy ack still gates DRAM/SSD bind visibility.
+            state.last_hash = page_hashes[-1]
         return True
 
     def check_offload_progress(self):
@@ -212,10 +229,17 @@ class DecodeKVCacheOffloadManager:
                     req,
                     host_indices,
                     incremental_tokens,
+                    page_hashes,
                     start_time,
                     start,
                     end,
                 ) = self.ongoing_offload.pop(ack_id)
+
+                if self._umbp_client is not None and page_hashes:
+                    self._umbp_client.bind_external_hashes(
+                        hashes=page_hashes,
+                        tier=self._umbp_tier("DRAM"),
+                    )
 
                 if req.finished():
                     self._release_finished_req(req, start)
@@ -225,16 +249,9 @@ class DecodeKVCacheOffloadManager:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
 
-                prior_hash = (
-                    self.offloaded_state[req.rid].last_hash
-                    if req.rid in self.offloaded_state
-                    else None
+                self._trigger_backup(
+                    req, host_indices, incremental_tokens, page_hashes, start_time
                 )
-                last_hash = self._trigger_backup(
-                    req, host_indices, incremental_tokens, start_time, prior_hash
-                )
-                if req.rid in self.offloaded_state:
-                    self.offloaded_state[req.rid].last_hash = last_hash
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):
@@ -266,27 +283,41 @@ class DecodeKVCacheOffloadManager:
         for _ in range(finish_count):
             storage_operation = self.cache_controller.ack_backup_queue.get()
             ack_id = storage_operation.id
-            req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
+            req_id, host_indices, page_hashes, start_time = self.ongoing_backup.pop(
+                ack_id
+            )
+            completed_pages = storage_operation.completed_tokens // self.page_size
+            completed_hashes = page_hashes[: min(completed_pages, len(page_hashes))]
+
+            if self._umbp_client is not None and completed_hashes:
+                self._umbp_client.bind_external_hashes(
+                    hashes=completed_hashes,
+                    tier=self._umbp_tier("SSD"),
+                )
 
             # Release host memory
             self.decode_host_mem_pool.free(host_indices)
+
+            if self._umbp_client is not None and page_hashes:
+                self._umbp_client.unbind_external_hashes(
+                    hashes=page_hashes,
+                    tier=self._umbp_tier("DRAM"),
+                )
 
             logger.info(
                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
             )
 
     def _trigger_backup(
-        self, req, host_indices, incremental_tokens, start_time, prior_hash
+        self, req, host_indices, incremental_tokens, page_hashes, start_time
     ):
         """Trigger async backup from host to storage."""
-        page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
             hash_value=page_hashes,
         )
-        self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
-        return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
+        self.ongoing_backup[ack_id] = (req.rid, host_indices, page_hashes, start_time)
 
     def _compute_prefix_hash(self, tokens, prior_hash=""):
         page_hashes = []
