@@ -93,7 +93,7 @@ SGL_DEVICE auto load_vec(const void* __restrict__ src) {
   return vec;
 }
 
-template <int64_t kBytes, uint32_t kNumThreads, typename Storage>
+template <int64_t kBytes, uint32_t kNumThreads, typene Storage>
 SGL_DEVICE void store_vec(void* __restrict__ dst, const Storage& vec) {
   using Package = std::decay_t<decltype(vec.data[0])>;
   constexpr uint32_t kBytesPerLoop = sizeof(Package) * kNumThreads;

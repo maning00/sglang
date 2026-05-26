@@ -63,6 +63,10 @@ Environment variables (override defaults):
   ENABLE_HICACHE            Enable L2 DRAM cache (default: true)
   ENABLE_UMBP               Enable L3 UMBP (DRAM+SSD) (default: true)
   HICACHE_SIZE              L2 DRAM size in GB/rank (default: 128)
+  HICACHE_IO_BACKEND        IO backend for KV cache transfer between CPU and GPU:
+                            direct | kernel | kernel_ascend (default: kernel).
+                            Forwarded as --hicache-io-backend; only takes effect when
+                            ENABLE_HICACHE=true.
   HICACHE_STORAGE_PREFETCH_POLICY  L3 prefetch policy: best_effort | wait_complete | timeout
                             (default: best_effort). Forwarded as
                             --hicache-storage-prefetch-policy; only takes effect when
@@ -177,6 +181,13 @@ ENABLE_HICACHE="${ENABLE_HICACHE:-true}"
 ENABLE_UMBP="${ENABLE_UMBP:-true}"
 HICACHE_SIZE="${HICACHE_SIZE:-128}"
 WRITE_POLICY="write_through"
+HICACHE_IO_BACKEND="${HICACHE_IO_BACKEND:-kernel}"
+case "$HICACHE_IO_BACKEND" in
+    direct|kernel|kernel_ascend) ;;
+    *)
+        echo "ERROR: HICACHE_IO_BACKEND must be one of direct|kernel|kernel_ascend, got '$HICACHE_IO_BACKEND'"
+        exit 1 ;;
+esac
 HICACHE_STORAGE_PREFETCH_POLICY="${HICACHE_STORAGE_PREFETCH_POLICY:-best_effort}"
 case "$HICACHE_STORAGE_PREFETCH_POLICY" in
     best_effort|wait_complete|timeout) ;;
@@ -803,6 +814,13 @@ launch_pd_server() {
     fi
 
     # Hierarchical cache / decode offload args
+    # direct io backend requires page_first_direct layout; kernel uses page_first.
+    local _hicache_mem_layout
+    if [[ "$HICACHE_IO_BACKEND" == "direct" ]]; then
+        _hicache_mem_layout="page_first_direct"
+    else
+        _hicache_mem_layout="page_first"
+    fi
     if bool_is_true "$ENABLE_HICACHE"; then
         if [[ "$role" == "prefill" ]]; then
             # Prefill: full hierarchical cache (HiRadixCache)
@@ -810,7 +828,8 @@ launch_pd_server() {
                 --enable-hierarchical-cache
                 --hicache-size "$HICACHE_SIZE"
                 --hicache-write-policy "$WRITE_POLICY"
-                --hicache-mem-layout page_first
+                --hicache-io-backend "$HICACHE_IO_BACKEND"
+                --hicache-mem-layout "$_hicache_mem_layout"
             )
         else
             # Decode: offload KV to host/storage via offload manager
@@ -820,7 +839,8 @@ launch_pd_server() {
             cmd+=(
                 --disaggregation-decode-enable-offload-kvcache
                 --hicache-size "$HICACHE_SIZE"
-                --hicache-mem-layout page_first
+                --hicache-io-backend "$HICACHE_IO_BACKEND"
+                --hicache-mem-layout "$_hicache_mem_layout"
             )
         fi
         if bool_is_true "$ENABLE_UMBP"; then
@@ -921,6 +941,7 @@ if bool_is_true "$ENABLE_HICACHE"; then
         log "  Cache mode:  decode offload (disaggregation-decode-enable-offload-kvcache)"
     fi
     log "  L2 size:     ${HICACHE_SIZE} GB/rank"
+    log "  L2 IO:       ${HICACHE_IO_BACKEND}"
     if bool_is_true "$SGLANG_HICACHE_HOST_HUGEPAGE"; then
         log "  L2 backing:  AnonymousHugetlb ($((SGLANG_HICACHE_HOST_HUGEPAGE_SIZE/1024/1024)) MiB pages, prefault=$(bool_is_true "$SGLANG_HICACHE_HOST_PREFAULT" && echo on || echo off), numa_node=${SGLANG_HICACHE_HOST_NUMA_NODE:-default})"
     else

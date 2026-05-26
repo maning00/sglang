@@ -838,7 +838,7 @@
           "editorMode": "code",
           "expr": "(sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "\u603b\u547d\u4e2d\u7387 (L1+L2+L3)",
+          "legendFormat": "总命中率 (L1+L2+L3)",
           "range": true,
           "refId": "A"
         },
@@ -850,7 +850,7 @@
           "editorMode": "code",
           "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "L1 \u547d\u4e2d\u7387 (GPU)",
+          "legendFormat": "L1 命中率 (GPU)",
           "range": true,
           "refId": "B"
         },
@@ -862,7 +862,7 @@
           "editorMode": "code",
           "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "L2 \u547d\u4e2d\u7387 (Host DRAM)",
+          "legendFormat": "L2 命中率 (Host DRAM)",
           "range": true,
           "refId": "C"
         },
@@ -874,14 +874,14 @@
           "editorMode": "code",
           "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_miss_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "L3 \u547d\u4e2d\u7387 (Storage)",
+          "legendFormat": "L3 命中率 (Storage)",
           "range": true,
           "refId": "D"
         }
       ],
-      "title": "Cache Hit Rate (\u5206\u5c42)",
+      "title": "Cache Hit Rate (分层)",
       "type": "timeseries",
-      "description": "\u5206\u5c42 Cache \u547d\u4e2d\u7387\u3002\u603b\u547d\u4e2d\u7387 = (L1+L2+L3) / (L1+L2+L3+Miss)\u3002\u5404\u5c42\u5360\u6bd4\u4f7f\u7528\u65e0 page \u5bf9\u9f50\u7684\u539f\u59cb token \u6570\u3002"
+      "description": "分层 Cache 命中率。总命中率 = (L1+L2+L3) / (L1+L2+L3+Miss)。各层占比使用无 page 对齐的原始 token 数。"
     },
     {
       "datasource": {
@@ -1005,7 +1005,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "Host \u5c42 KV cache \u4f7f\u7528\u7387 (0\u20131)\u3002\u4ec5\u5f53\u542f\u7528 HiCache \u65f6\u6709\u6570\u636e\u3002",
+      "description": "Host 层 KV cache 使用率 (0–1)。仅当启用 HiCache 时有数据。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1088,12 +1088,12 @@
           "editorMode": "code",
           "expr": "sglang:hicache_host_used_tokens{instance=~\"$instance\",model_name=~\"$model_name\"} / sglang:hicache_host_total_tokens{instance=~\"$instance\",model_name=~\"$model_name\"}",
           "instant": false,
-          "legendFormat": "HiCache host \u4f7f\u7528\u7387",
+          "legendFormat": "HiCache host 使用率",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "HiCache Host \u4f7f\u7528\u7387",
+      "title": "HiCache Host 使用率",
       "type": "timeseries"
     },
     {
@@ -1101,7 +1101,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "Host \u5c42\u5df2\u7528 / \u603b\u5bb9\u91cf (tokens)\u3002\u4ec5\u5f53\u542f\u7528 HiCache \u65f6\u6709\u6570\u636e\u3002",
+      "description": "Host 层已用 / 总容量 (tokens)。仅当启用 HiCache 时有数据。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1181,7 +1181,7 @@
           "editorMode": "code",
           "expr": "sglang:hicache_host_used_tokens{instance=~\"$instance\",model_name=~\"$model_name\"}",
           "instant": false,
-          "legendFormat": "Host \u5df2\u7528 (tokens)",
+          "legendFormat": "Host 已用 (tokens)",
           "range": true,
           "refId": "A"
         },
@@ -1193,12 +1193,12 @@
           "editorMode": "code",
           "expr": "sglang:hicache_host_total_tokens{instance=~\"$instance\",model_name=~\"$model_name\"}",
           "instant": false,
-          "legendFormat": "Host \u603b\u5bb9\u91cf (tokens)",
+          "legendFormat": "Host 总容量 (tokens)",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "HiCache Host \u5df2\u7528 / \u603b\u5bb9\u91cf (tokens)",
+      "title": "HiCache Host 已用 / 总容量 (tokens)",
       "type": "timeseries"
     },
     {
@@ -1206,7 +1206,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L3 \u5b58\u50a8\u5c42\u9884\u53d6\u4e0e\u56de\u5199\u901f\u7387\uff08tokens/s\uff09\uff1a\u9884\u53d6 (L3\u2192Host DRAM)\uff0c\u56de\u5199 (Host DRAM\u2192L3)\u3002",
+      "description": "L3 存储层预取与回写速率（tokens/s）：预取 (L3→Host DRAM)，回写 (Host DRAM→L3)。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1288,7 +1288,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:prefetched_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "\u9884\u53d6 L3\u2192Host",
+          "legendFormat": "预取 L3→Host",
           "range": true,
           "refId": "A"
         },
@@ -1300,12 +1300,12 @@
           "editorMode": "code",
           "expr": "rate(sglang:backuped_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "\u56de\u5199 Host\u2192L3",
+          "legendFormat": "回写 Host→L3",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "HiCache L3 \u9884\u53d6 / \u56de\u5199\u901f\u7387 (Host\u2194Storage)",
+      "title": "HiCache L3 预取 / 回写速率 (Host↔Storage)",
       "type": "timeseries"
     },
     {
@@ -1313,7 +1313,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L1 (GPU) KV cache \u6dd8\u6c70\u4e0e\u52a0\u8f7d\u56de\u901f\u7387\uff08tokens/s\uff09\uff1a\u6dd8\u6c70\uff08\u65e0 HiCache \u65f6\u4e22\u5f03\uff0c\u6709 HiCache \u65f6\u5199\u5165 L2\uff09\uff0c\u4ee5\u53ca\u4ece L2 (Host) \u52a0\u8f7d\u56de GPU\u3002",
+      "description": "L1 (GPU) KV cache 淘汰与加载回速率（tokens/s）：淘汰（无 HiCache 时丢弃，有 HiCache 时写入 L2），以及从 L2 (Host) 加载回 GPU。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1395,7 +1395,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:evicted_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "L1 \u6dd8\u6c70 (total)",
+          "legendFormat": "L1 淘汰 (total)",
           "range": true,
           "refId": "A"
         },
@@ -1407,7 +1407,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:evicted_backuped_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "L1 \u6dd8\u6c70-backuped (\u6570\u636e\u7559L2)",
+          "legendFormat": "L1 淘汰-backuped (数据留L2)",
           "range": true,
           "refId": "C"
         },
@@ -1419,7 +1419,7 @@
           "editorMode": "code",
           "expr": "rate(sglang:evicted_regular_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "L1 \u6dd8\u6c70-regular (\u76f4\u63a5\u5220\u9664)",
+          "legendFormat": "L1 淘汰-regular (直接删除)",
           "range": true,
           "refId": "D"
         },
@@ -1431,12 +1431,12 @@
           "editorMode": "code",
           "expr": "rate(sglang:load_back_tokens_total{instance=~\"$instance\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "L2\u2192L1 \u52a0\u8f7d\u56de GPU",
+          "legendFormat": "L2→L1 加载回 GPU",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "HiCache L1\u2194L2 \u6dd8\u6c70 / \u52a0\u8f7d\u56de GPU \u901f\u7387",
+      "title": "HiCache L1↔L2 淘汰 / 加载回 GPU 速率",
       "type": "timeseries"
     },
     {
@@ -1444,7 +1444,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "\u547d\u4e2d\u7f13\u5b58\u7684 token \u901f\u7387 (tokens/s)\uff0c\u542b HiCache \u547d\u4e2d\u3002",
+      "description": "命中缓存的 token 速率 (tokens/s)，含 HiCache 命中。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1524,12 +1524,12 @@
           "editorMode": "code",
           "expr": "rate(sglang:cached_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])",
           "instant": false,
-          "legendFormat": "\u547d\u4e2d tokens/s ({{cache_source}})",
+          "legendFormat": "命中 tokens/s ({{cache_source}})",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Cached Tokens \u901f\u7387 (\u547d\u4e2d token/s)",
+      "title": "Cached Tokens 速率 (命中 token/s)",
       "type": "timeseries"
     },
     {
@@ -1537,7 +1537,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "GPU KV cache \u4f7f\u7528\u7387 (0\u20131)\u3002\u9ad8\u65f6 HiCache \u66f4\u6613\u53d1\u6325\u4f5c\u7528\u3002",
+      "description": "GPU KV cache 使用率 (0–1)。高时 HiCache 更易发挥作用。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1620,7 +1620,7 @@
           "editorMode": "code",
           "expr": "avg without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (sglang:gpu_kv_cache_occupancy{instance=~\"$instance\",model_name=~\"$model_name\",engine_type=~\"decode|unified\"})",
           "instant": false,
-          "legendFormat": "L1 \u5360\u7528\u7387 (locked+cached)",
+          "legendFormat": "L1 占用率 (locked+cached)",
           "range": true,
           "refId": "C"
         },
@@ -1632,12 +1632,12 @@
           "editorMode": "code",
           "expr": "avg without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (sglang:token_usage{instance=~\"$instance\",model_name=~\"$model_name\",engine_type=~\"decode|unified\"})",
           "instant": false,
-          "legendFormat": "L1 \u9501\u5b9a\u7387 (locked only)",
+          "legendFormat": "L1 锁定率 (locked only)",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "GPU KV Cache \u4f7f\u7528\u7387",
+      "title": "GPU KV Cache 使用率",
       "type": "timeseries"
     },
     {
@@ -1645,7 +1645,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L1\u2192L2 PCIe \u5199\u5165\u5e26\u5bbd\u5206\u5e03\uff08logical KV bytes / CUDA event \u8017\u65f6\uff09\uff0c\u5355\u4f4d GB/s\u3002\u53cd\u6620 GPU\u2192Host \u771f\u5b9e\u4f20\u8f93\u901f\u7387\u3002",
+      "description": "L1→L2 PCIe 写入带宽分布（logical KV bytes / CUDA event 耗时），单位 GB/s。反映 GPU→Host 真实传输速率。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1767,7 +1767,7 @@
           "refId": "D"
         }
       ],
-      "title": "HiCache L1\u2192L2 PCIe \u5199\u5165\u5e26\u5bbd (GB/s)",
+      "title": "HiCache L1→L2 PCIe 写入带宽 (GB/s)",
       "type": "timeseries"
     },
     {
@@ -1775,7 +1775,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L2\u2192L1 PCIe \u52a0\u8f7d\u5e26\u5bbd\u5206\u5e03\uff08logical KV bytes / CUDA event \u8017\u65f6\uff09\uff0c\u5355\u4f4d GB/s\u3002\u53cd\u6620 Host\u2192GPU \u771f\u5b9e\u4f20\u8f93\u901f\u7387\u3002",
+      "description": "L2→L1 PCIe 加载带宽分布（logical KV bytes / CUDA event 耗时），单位 GB/s。反映 Host→GPU 真实传输速率。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1897,7 +1897,7 @@
           "refId": "D"
         }
       ],
-      "title": "HiCache L2\u2192L1 PCIe \u52a0\u8f7d\u5e26\u5bbd (GB/s)",
+      "title": "HiCache L2→L1 PCIe 加载带宽 (GB/s)",
       "type": "timeseries"
     },
     {
@@ -1905,7 +1905,137 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L3 Storage \u8bfb\u5199\u5e26\u5bbd\u3002Write = Host\u2192Storage (backup)\uff0cRead = Storage\u2192Host (prefetch)\u3002",
+      "description": "L2→L1 加载关键路径延迟：前向计算流等待 Host→GPU 传输完成的累计时间（不与计算重叠的部分）。值越低越好，0 表示完全重叠。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "id": 39,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:load_back_critical_path_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:load_back_critical_path_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:load_back_critical_path_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:load_back_critical_path_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(sglang:load_back_critical_path_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "instant": false,
+          "legendFormat": "Avg",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "HiCache L2→L1 Forward Stall (Critical Path)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "L3 Storage 读写带宽。Write = Host→Storage (backup)，Read = Storage→Host (prefetch)。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1961,7 +2091,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 72
       },
       "id": 29,
       "options": {
@@ -1989,7 +2119,7 @@
           "editorMode": "code",
           "expr": "sum(rate(sglang:backuped_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
           "instant": false,
-          "legendFormat": "Write (Host\u2192Storage)",
+          "legendFormat": "Write (Host→Storage)",
           "range": true,
           "refId": "A"
         },
@@ -2001,12 +2131,12 @@
           "editorMode": "code",
           "expr": "sum(rate(sglang:prefetched_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
           "instant": false,
-          "legendFormat": "Read (Storage\u2192Host)",
+          "legendFormat": "Read (Storage→Host)",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "HiCache L3 Storage \u8bfb\u5199\u5e26\u5bbd",
+      "title": "HiCache L3 Storage 读写带宽",
       "type": "timeseries"
     },
     {
@@ -2078,7 +2208,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 72
       },
       "id": 30,
       "options": {
@@ -2119,7 +2249,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "L3 prefetch latency. Total = full async duration from PrefetchOperation enqueue to IO aux thread finishing _page_transfer. Critical path = unoverlapped tail; the portion of the async prefetch that ran after the scheduler first observed it as not-yet-terminable. Critical path is always <= Total; the gap between them is the latency hidden by async overlap. Policy semantics: under wait_complete and timeout, both lines are meaningful. Under best_effort, Total has no samples (scheduler can't see true completion from the polling side) and Critical path is always 0 (scheduler never waits) \u2014 expect this panel to look empty/zero in best_effort mode.",
+      "description": "L3 prefetch latency. Total = full async duration from PrefetchOperation enqueue to IO aux thread finishing _page_transfer. Critical path = unoverlapped tail; the portion of the async prefetch that ran after the scheduler first observed it as not-yet-terminable. Critical path is always <= Total; the gap between them is the latency hidden by async overlap. Policy semantics: under wait_complete and timeout, both lines are meaningful. Under best_effort, Total has no samples (scheduler can't see true completion from the polling side) and Critical path is always 0 (scheduler never waits) — expect this panel to look empty/zero in best_effort mode.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2175,7 +2305,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 80
       },
       "id": 31,
       "options": {
@@ -2300,7 +2430,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "Effective L3 prefetch bandwidth observed on the scheduler critical path: prefetched bytes / critical-path duration, in GB/s. Only sampled when critical_path > 0 (scheduler actually blocked on the prefetch) \u2014 always empty under best_effort. Critical_path starts at first_poll (possibly after I/O began) and ends at complete_time, so this is an upper bound on true backend throughput.",
+      "description": "Effective L3 prefetch bandwidth observed on the scheduler critical path: prefetched bytes / critical-path duration, in GB/s. Only sampled when critical_path > 0 (scheduler actually blocked on the prefetch) — always empty under best_effort. Critical_path starts at first_poll (possibly after I/O began) and ends at complete_time, so this is an upper bound on true backend throughput.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2356,7 +2486,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 80
+        "y": 88
       },
       "id": 32,
       "options": {
@@ -2487,7 +2617,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 96
       },
       "id": 33,
       "options": {
@@ -2564,7 +2694,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "Stacked average duration of the L3 prefetch critical path by stage, in seconds (per entire PrefetchOperation \u2014 already spans all internal storage_batch_size sub-batches inside _storage_hit_query and _page_transfer). Each line is rate(stage_seconds_sum) / rate(critical_path_seconds_count), so the four stages stack additively to the average critical_path_seconds per request. Stages: queue_wait (op in prefetch_queue), hit_query (_storage_hit_query: hashing + batch_exists + TP all_reduce, looped over batches internally), io_queue_wait (op in prefetch_buffer between threads), io_transfer (_page_transfer: looped batch_get + host memcpy). Empty under best_effort (critical_path is always 0).",
+      "description": "Stacked average duration of the L3 prefetch critical path by stage, in seconds (per entire PrefetchOperation — already spans all internal storage_batch_size sub-batches inside _storage_hit_query and _page_transfer). Each line is rate(stage_seconds_sum) / rate(critical_path_seconds_count), so the four stages stack additively to the average critical_path_seconds per request. Stages: queue_wait (op in prefetch_queue), hit_query (_storage_hit_query: hashing + batch_exists + TP all_reduce, looped over batches internally), io_queue_wait (op in prefetch_buffer between threads), io_transfer (_page_transfer: looped batch_get + host memcpy). Empty under best_effort (critical_path is always 0).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2617,7 +2747,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 104
       },
       "id": 34,
       "options": {
@@ -2694,7 +2824,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "Mori-io RDMA tail latency per P-D pair (instance = prefill server, decode_endpoint = decode server). Each line is one prefill\u2192decode path.",
+      "description": "Mori-io RDMA tail latency per P-D pair (instance = prefill server, decode_endpoint = decode server). Each line is one prefill→decode path.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2754,7 +2884,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 104
+        "y": 112
       },
       "id": 35,
       "options": {
@@ -2786,7 +2916,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P99 {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "P99 {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "A",
           "useBackend": false
@@ -2802,7 +2932,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P90 {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "P90 {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "B",
           "useBackend": false
@@ -2818,7 +2948,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P50 {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "P50 {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "C",
           "useBackend": false
@@ -2832,7 +2962,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "Mori-io RDMA bandwidth per P-D pair (last-chunk bytes / tail latency). Each line is one prefill\u2192decode path.",
+      "description": "Mori-io RDMA bandwidth per P-D pair (last-chunk bytes / tail latency). Each line is one prefill→decode path.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2892,7 +3022,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 104
+        "y": 112
       },
       "id": 36,
       "options": {
@@ -2924,7 +3054,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P99 {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "P99 {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "A",
           "useBackend": false
@@ -2940,7 +3070,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P90 {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "P90 {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "B",
           "useBackend": false
@@ -2956,7 +3086,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P50 {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "P50 {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "C",
           "useBackend": false
@@ -3030,7 +3160,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 112
+        "y": 120
       },
       "id": 37,
       "options": {
@@ -3094,7 +3224,7 @@
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "mori RDMA {{instance}} \u2192 {{decode_endpoint}}",
+          "legendFormat": "mori RDMA {{instance}} → {{decode_endpoint}}",
           "range": true,
           "refId": "C",
           "useBackend": false
@@ -3184,7 +3314,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 112
+        "y": 120
       },
       "id": 38,
       "options": {

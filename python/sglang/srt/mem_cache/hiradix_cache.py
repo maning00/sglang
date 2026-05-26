@@ -142,6 +142,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            enable_critical_path=params.enable_metrics,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -169,6 +170,7 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        self._pending_critical_path: list = []
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -715,6 +717,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_prefetch.clear()
         self.ongoing_backup.clear()
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self._pending_critical_path.clear()
         self.evictable_host_leaves.clear()
         self.pinned_size_ = 0
         super().reset()
@@ -869,32 +872,52 @@ class HiRadixCache(RadixCache):
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
+    def _try_report_critical_path(self, loading_event) -> bool:
+        """Try to compute and report critical path from a LayerLoadingEvent.
+        Returns True if reported (or nothing to report), False if deferred."""
+        if loading_event is None:
+            return True
+        if not loading_event.critical_path_ready():
+            return False
+        cp_ms = loading_event.get_critical_path_ms()
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_load_back_critical_path(cp_ms / 1000.0)
+        return True
+
     def loading_check(self):
+        cc = self.cache_controller
         finish_count = 0
-        for (
+        for i, (
             start_event,
             finish_event,
             ack_list,
             num_tokens,
-        ) in self.cache_controller.ack_load_queue:
+        ) in enumerate(cc.ack_load_queue):
             if not finish_event.query():
-                # the KV cache loading is still ongoing
                 break
             finish_count += 1
             self._observe_pcie_bandwidth(
                 start_event, finish_event, num_tokens, is_write=False
             )
-            # no need to sync across TP workers as batch forwarding is synced
+            if i < len(cc.ack_load_critical_path):
+                loading_event = cc.ack_load_critical_path[i]
+                if not self._try_report_critical_path(loading_event):
+                    self._pending_critical_path.append(loading_event)
             for ack_id in ack_list:
                 loaded_nodes = self.ongoing_load_back.pop(ack_id)
-                # CPU→GPU promotion is additive — add the HBM bucket and
-                # leave the existing DRAM (CPU) bucket alone.
                 for node in loaded_nodes:
                     self._umbp_bind(node.hash_value, tier_name="HBM")
                 self.dec_lock_ref(loaded_nodes[-1])
 
-        # ACK until all events are processed
-        del self.cache_controller.ack_load_queue[:finish_count]
+        del cc.ack_load_queue[:finish_count]
+        del cc.ack_load_critical_path[:finish_count]
+
+        if self._pending_critical_path:
+            still_pending = []
+            for ev in self._pending_critical_path:
+                if not self._try_report_critical_path(ev):
+                    still_pending.append(ev)
+            self._pending_critical_path = still_pending
 
     def evictable_size(self):
         return self.evictable_size_

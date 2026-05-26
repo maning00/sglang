@@ -1912,6 +1912,16 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth_gb_s,
         )
+        self.load_back_critical_path_seconds = Histogram(
+            name="sglang:load_back_critical_path_seconds",
+            documentation=(
+                "L2→L1 load-back critical-path latency in seconds: "
+                "the sum of per-layer forward-stream stalls waiting for "
+                "host→GPU transfer (not overlapped with compute)."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
@@ -1942,3 +1952,8 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
         self.load_back_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
+
+    def observe_load_back_critical_path(self, duration_seconds: float) -> None:
+        self.load_back_critical_path_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )
