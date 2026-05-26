@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.storage.umbp._compat import get_umbp_client_or_none
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
@@ -117,6 +118,20 @@ class DecodeKVCacheOffloadManager:
         import mori.umbp as _umbp_mod
 
         return getattr(_umbp_mod.UMBPTierType, tier_name)
+
+    @staticmethod
+    def _umbp_match_hashes(hashes) -> list[str]:
+        """Convert internal SHA256 page hashes to router-visible int64 keys."""
+        result = []
+        for h in hashes:
+            if isinstance(h, str):
+                try:
+                    result.append(str(hash_str_to_int64(h)))
+                    continue
+                except ValueError:
+                    pass
+            result.append(str(h))
+        return result
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -237,7 +252,7 @@ class DecodeKVCacheOffloadManager:
 
                 if self._umbp_client is not None and page_hashes:
                     self._umbp_client.bind_external_hashes(
-                        hashes=page_hashes,
+                        hashes=self._umbp_match_hashes(page_hashes),
                         tier=self._umbp_tier("DRAM"),
                     )
 
@@ -291,7 +306,7 @@ class DecodeKVCacheOffloadManager:
 
             if self._umbp_client is not None and completed_hashes:
                 self._umbp_client.bind_external_hashes(
-                    hashes=completed_hashes,
+                    hashes=self._umbp_match_hashes(completed_hashes),
                     tier=self._umbp_tier("SSD"),
                 )
 
@@ -300,7 +315,7 @@ class DecodeKVCacheOffloadManager:
 
             if self._umbp_client is not None and page_hashes:
                 self._umbp_client.unbind_external_hashes(
-                    hashes=page_hashes,
+                    hashes=self._umbp_match_hashes(page_hashes),
                     tier=self._umbp_tier("DRAM"),
                 )
 
