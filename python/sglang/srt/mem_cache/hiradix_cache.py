@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -45,7 +46,6 @@ from sglang.srt.mem_cache.radix_cache import (
     TreeNode,
     split_node_hash_value,
 )
-from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.storage.umbp._compat import get_umbp_client_or_none
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
@@ -237,7 +237,7 @@ class HiRadixCache(RadixCache):
         client = self._umbp_client
         if client is None or not hashes:
             return
-        client.bind_external_hashes(
+        client.report_external_kv_blocks(
             hashes=self._umbp_match_hashes(hashes), tier=self._umbp_tier(tier_name)
         )
 
@@ -245,17 +245,15 @@ class HiRadixCache(RadixCache):
         client = self._umbp_client
         if client is None or not hashes:
             return
-        client.unbind_external_hashes(
+        client.revoke_external_kv_blocks(
             hashes=self._umbp_match_hashes(hashes), tier=self._umbp_tier(tier_name)
         )
 
-    def _umbp_clear_at_tier(self, tier_name: str, flush: bool = False) -> None:
+    def _umbp_clear_at_tier(self, tier_name: str) -> None:
         client = self._umbp_client
         if client is None:
             return
-        client.unbind_all_external_hashes_at_tier(self._umbp_tier(tier_name))
-        if flush and hasattr(client, "flush_external_queue"):
-            client.flush_external_queue()
+        client.revoke_all_external_kv_blocks_at_tier(self._umbp_tier(tier_name))
 
     def is_storage_idle(self) -> bool:
         cc = self.cache_controller
@@ -448,9 +446,7 @@ class HiRadixCache(RadixCache):
         """
         umbp_client = get_umbp_client_or_none(self.cache_controller)
         if umbp_client is not None:
-            umbp_client.unbind_all_external_hashes_at_tier(self._umbp_tier("SSD"))
-            if hasattr(umbp_client, "flush_external_queue"):
-                umbp_client.flush_external_queue()
+            umbp_client.revoke_all_external_kv_blocks_at_tier(self._umbp_tier("SSD"))
 
         try:
             if self.enable_storage:
@@ -745,7 +741,7 @@ class HiRadixCache(RadixCache):
             if hasattr(self.cache_controller.storage_backend, "clear"):
                 self.cache_controller.storage_backend.clear()
                 # Drop the STORAGE bucket on master in one bulk event.
-                self._umbp_clear_at_tier("SSD", flush=True)
+                self._umbp_clear_at_tier("SSD")
                 logger.info("Hierarchical cache storage backend cleared successfully!")
                 return True
             else:
@@ -1561,7 +1557,7 @@ class HiRadixCache(RadixCache):
             # before _page_transfer began, io_transfer contributes 0 and the
             # remaining time falls into io_queue_wait).
             if operation.first_poll_time is not None:
-                fpt = operation.first_poll_time
+                first_poll_time = operation.first_poll_time
                 hq_start = operation.hit_query_start_time or end_time
                 hq_done = operation.hit_query_done_time or hq_start
                 io_start = operation.io_start_time or hq_done
@@ -1569,7 +1565,7 @@ class HiRadixCache(RadixCache):
                 def _clip(stage_start: float, stage_end: float) -> float:
                     return max(
                         0.0,
-                        min(stage_end, end_time) - max(stage_start, fpt),
+                        min(stage_end, end_time) - max(stage_start, first_poll_time),
                     )
 
                 self.storage_metrics_collector.log_prefetch_cp_stage_breakdown(
