@@ -446,6 +446,23 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["decode_endpoint"],
             buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
         )
+        # Diagnostic: upper bound on the lag between mori-io marking RDMA
+        # complete (C++ side) and the prefill scheduler thread observing it
+        # via poll(). With the async observer enabled this should be small;
+        # if it's still large, the scheduler isn't even managing to drain
+        # the inflight queue between collective barriers.
+        self.kv_mori_poll_observation_lag_ms = Histogram(
+            name="sglang:kv_mori_poll_observation_lag_ms",
+            documentation="Histogram of upper-bound poll-observation lag in ms (time between the last two poll() calls when completion was first observed).",
+            labelnames=list(labels.keys()) + ["decode_endpoint"],
+            buckets=(0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
+        )
+        self.kv_mori_poll_max_gap_ms = Histogram(
+            name="sglang:kv_mori_poll_max_gap_ms",
+            documentation="Histogram of the maximum poll() interval seen for each completed mori-io PD transfer.",
+            labelnames=list(labels.keys()) + ["decode_endpoint"],
+            buckets=(0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
+        )
 
         # Utilization
         self.utilization = Gauge(
@@ -889,10 +906,18 @@ class SchedulerMetricsCollector:
         rdma_latency_ms: float,
         rdma_speed_gb_s: float,
         decode_endpoint: str,
+        poll_observation_lag_ms: Optional[float] = None,
+        poll_max_gap_ms: Optional[float] = None,
     ) -> None:
         labels = {**self.labels, "decode_endpoint": decode_endpoint}
         self.kv_mori_rdma_latency_ms.labels(**labels).observe(rdma_latency_ms)
         self.kv_mori_rdma_speed_gb_s.labels(**labels).observe(rdma_speed_gb_s)
+        if poll_observation_lag_ms is not None and poll_observation_lag_ms >= 0:
+            self.kv_mori_poll_observation_lag_ms.labels(**labels).observe(
+                poll_observation_lag_ms
+            )
+        if poll_max_gap_ms is not None and poll_max_gap_ms >= 0:
+            self.kv_mori_poll_max_gap_ms.labels(**labels).observe(poll_max_gap_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -1594,8 +1619,7 @@ class StorageMetricsCollector:
             name="sglang:prefetch_cp_queue_wait_seconds",
             documentation=(
                 "Time the PrefetchOperation sat in cache_controller.prefetch_queue "
-                "waiting for prefetch_thread_func to dequeue it."
-                + cp_stage_doc_suffix
+                "waiting for prefetch_thread_func to dequeue it." + cp_stage_doc_suffix
             ),
             labelnames=labels.keys(),
             buckets=bucket_prefetch_duration,
@@ -1616,8 +1640,7 @@ class StorageMetricsCollector:
             name="sglang:prefetch_cp_io_queue_wait_seconds",
             documentation=(
                 "Time the op sat in cache_controller.prefetch_buffer between "
-                "the lookup thread and prefetch_io_aux_thread."
-                + cp_stage_doc_suffix
+                "the lookup thread and prefetch_io_aux_thread." + cp_stage_doc_suffix
             ),
             labelnames=labels.keys(),
             buckets=bucket_prefetch_duration,

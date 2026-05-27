@@ -356,6 +356,11 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        import os
+        import time as _time
+
+        _wd_thr_ms = float(os.environ.get("SGLANG_PREFILL_LOOP_WATCHDOG_MS", "100"))
+        _last_iter_ts = _time.perf_counter()
 
         while True:
             # Receive requests
@@ -381,9 +386,35 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+            # Watchdog: detect prefill scheduler iterations that exceed
+            # SGLANG_PREFILL_LOOP_WATCHDOG_MS. Long iterations directly delay
+            # process_disagg_prefill_inflight_queue() and inflate the
+            # observed kv_mori_rdma_latency_ms (unless the async observer is
+            # enabled, in which case _rdma_complete_time is captured early
+            # and the metric stays accurate).
+            _now = _time.perf_counter()
+            _iter_ms = (_now - _last_iter_ts) * 1000.0
+            if _iter_ms >= _wd_thr_ms:
+                logger.warning(
+                    "[prefill-loop-watchdog] iteration took %.1fms (>%dms); "
+                    "batch=%s, inflight=%d, waiting=%d, bootstrap=%d",
+                    _iter_ms,
+                    int(_wd_thr_ms),
+                    "1" if batch else "0",
+                    len(self.disagg_prefill_inflight_queue),
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            _last_iter_ts = _now
+
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        import os
+        import time as _time
+
+        _wd_thr_ms = float(os.environ.get("SGLANG_PREFILL_LOOP_WATCHDOG_MS", "100"))
+        _last_iter_ts = _time.perf_counter()
 
         while True:
             # Receive requests
@@ -413,6 +444,22 @@ class SchedulerDisaggregationPrefillMixin:
                 self.self_check_during_idle()
 
             self.process_disagg_prefill_inflight_queue()
+
+            # See event_loop_normal_disagg_prefill comment.
+            _now = _time.perf_counter()
+            _iter_ms = (_now - _last_iter_ts) * 1000.0
+            if _iter_ms >= _wd_thr_ms:
+                logger.warning(
+                    "[prefill-loop-watchdog] iteration took %.1fms (>%dms); "
+                    "batch=%s, inflight=%d, waiting=%d, bootstrap=%d",
+                    _iter_ms,
+                    int(_wd_thr_ms),
+                    "1" if batch else "0",
+                    len(self.disagg_prefill_inflight_queue),
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            _last_iter_ts = _now
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -633,10 +680,18 @@ class SchedulerDisaggregationPrefillMixin:
                     rdma_speed_gb_s = 0.0
                     if last_chunk_mb > 0:
                         rdma_speed_gb_s = (last_chunk_mb / 1024) / (rdma_ms / 1000)
+                    poll_lag_ms = getattr(
+                        req.disagg_kv_sender, "poll_observation_lag_ms", None
+                    )
+                    poll_max_gap_ms = getattr(
+                        req.disagg_kv_sender, "poll_max_gap_ms", None
+                    )
                     self.metrics_collector.observe_kv_mori_rdma_metrics(
                         rdma_latency_ms=rdma_ms,
                         rdma_speed_gb_s=rdma_speed_gb_s,
                         decode_endpoint=req.disagg_kv_sender.decode_endpoint,
+                        poll_observation_lag_ms=poll_lag_ms,
+                        poll_max_gap_ms=poll_max_gap_ms,
                     )
 
         # Stream requests which have finished transfer

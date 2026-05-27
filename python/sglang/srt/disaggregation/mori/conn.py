@@ -196,8 +196,42 @@ class MoriKVManager(CommonKVManager):
         self.state_mem_descs: List[MemoryDesc] = []
         self.transfer_lock = threading.Lock()
         self._register_local_buffers()
+
+        # ── Async PD-transfer status observer ──────────────────────────────
+        # Decouples MoriKVSender.poll() from the prefill scheduler main loop.
+        # Background thread continuously polls TransferStatus across active
+        # senders; on completion it stamps _rdma_complete_time and notifies the
+        # decode side immediately, instead of waiting for the scheduler to
+        # finish whatever GLOO collective it's stuck on.
+        # Toggle via SGLANG_MORI_USE_ASYNC_OBSERVER (default on for prefill).
+        # Cadence via SGLANG_MORI_OBSERVER_INTERVAL_US (default 100us).
+        self._use_async_observer = (
+            get_int_env_var("SGLANG_MORI_USE_ASYNC_OBSERVER", 1) != 0
+        )
+        self._observer_interval_s = (
+            get_int_env_var("SGLANG_MORI_OBSERVER_INTERVAL_US", 100) / 1e6
+        )
+        # When no senders are active, sleep longer to save CPU.
+        self._observer_idle_interval_s = max(self._observer_interval_s, 1e-3)
+        self._observer_active: set = set()
+        self._observer_lock = threading.Lock()
+        self._observer_stop = threading.Event()
+        self._observer_thread: Optional[threading.Thread] = None
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
+            if self._use_async_observer:
+                self._observer_thread = threading.Thread(
+                    target=self._observer_loop,
+                    daemon=True,
+                    name=f"mori-pd-observer-dp{self.system_dp_rank}-tp{self.attn_tp_rank}",
+                )
+                self._observer_thread.start()
+                logger.info(
+                    "MoriKVManager: async PD-transfer observer started "
+                    "(interval=%dus)",
+                    int(self._observer_interval_s * 1e6),
+                )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
@@ -365,6 +399,19 @@ class MoriKVManager(CommonKVManager):
                     if len(payload) < 3:
                         logger.warning("Incomplete status payload received")
                         continue
+                    # DIAGNOSTIC: dump raw multipart frames if first frame post-GUARD looks
+                    # like another GUARD (i.e. malformed). Helps trace who sent it.
+                    if payload[0] == MORI_GUARD:
+                        logger.error(
+                            "[decode_worker] MALFORMED MSG (double-GUARD)! "
+                            "frames=%d  hex_repr=%s",
+                            len(msg),
+                            [
+                                b.hex() if len(b) < 64 else b.hex()[:128] + "..."
+                                for b in msg
+                            ],
+                        )
+                        continue
                     bootstrap_room = int(payload[0].decode("ascii"))
                     status_code = int(payload[1].decode("ascii"))
                     prefill_rank = int(payload[2].decode("ascii"))
@@ -446,6 +493,126 @@ class MoriKVManager(CommonKVManager):
             register_info.endpoint,
             register_info.dst_port,
         )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Async PD-transfer status observer
+    # ──────────────────────────────────────────────────────────────────────
+    def _register_observer(self, sender: "MoriKVSender") -> None:
+        """Called by MoriKVSender once its last chunk has been issued."""
+        if not self._use_async_observer:
+            return
+        with self._observer_lock:
+            self._observer_active.add(sender)
+
+    def _unregister_observer(self, sender: "MoriKVSender") -> None:
+        """Called by MoriKVSender.clear() (idempotent)."""
+        if not self._use_async_observer:
+            return
+        with self._observer_lock:
+            self._observer_active.discard(sender)
+
+    def _observer_loop(self) -> None:
+        """Background loop. Iterates active senders at ~observer_interval_us
+        cadence, observes TransferStatus → SUCCESS/FAILED transitions, stamps
+        _rdma_complete_time at the *true* observation point (within the
+        cadence), and fires decode-side ZMQ notifications immediately so
+        decode does not have to wait for the prefill scheduler main loop.
+
+        Performance budget: N active senders × K transfer_statuses each per
+        100us. With N≤128, K≤8 that's ~1M pybind atomic loads/sec; trivial.
+
+        Thread-safety contract:
+          - sender.sent_last_chunk is checked *before* sender.transfer_statuses
+            is iterated. send() in scheduler thread sets sent_last_chunk=True
+            *after* the final extend() of transfer_statuses, so observer only
+            iterates a frozen list.
+          - sender.pending_infos is set *before* sent_last_chunk=True, so when
+            observer fires notify_decode, pending_infos is guaranteed present.
+          - Publish order on terminal: _rdma_complete_time → _observed_state
+            → _observed_failure_reason → _observed_terminal (last). Scheduler
+            poll() reads _observed_terminal first; under GIL all writes are
+            visible by the time _observed_terminal becomes True.
+        """
+        while not self._observer_stop.is_set():
+            with self._observer_lock:
+                if not self._observer_active:
+                    senders: tuple = ()
+                else:
+                    senders = tuple(self._observer_active)
+            if not senders:
+                self._observer_stop.wait(self._observer_idle_interval_s)
+                continue
+
+            now = None  # lazy timestamp
+            for sender in senders:
+                if sender._observed_terminal:
+                    continue
+                # Volatile read; safe to skip if not yet last chunk.
+                if not sender.sent_last_chunk:
+                    continue
+                ts_list = sender.transfer_statuses
+                try:
+                    if ts_list:
+                        all_done = all(not s.InProgress() for s in ts_list)
+                    else:
+                        all_done = True
+                except Exception:
+                    # status object may be in mid-construction; retry later.
+                    continue
+                if not all_done:
+                    continue
+
+                # Transition observed by this thread.
+                if now is None:
+                    now = time.perf_counter()
+                if sender._rdma_complete_time == 0.0:
+                    sender._rdma_complete_time = now
+
+                failed = False
+                fail_reason: Optional[str] = None
+                try:
+                    if ts_list:
+                        failed = any(s.Failed() for s in ts_list)
+                        if failed:
+                            for s in ts_list:
+                                if s.Failed():
+                                    fail_reason = f"KV transfer failed: {s.Message()}"
+                                    break
+                except Exception:
+                    fail_reason = "KV transfer failed (status read error)"
+                    failed = True
+
+                # Publish state & notify decode side *before* setting the
+                # terminal flag, so scheduler thread never observes
+                # terminal=True with stale siblings.
+                if failed:
+                    self.record_failure(
+                        sender.bootstrap_room,
+                        fail_reason or "KV transfer failed",
+                    )
+                    self.update_status(sender.bootstrap_room, KVPoll.Failed)
+                    sender._observed_failure_reason = fail_reason
+                    sender._observed_state = KVPoll.Failed
+                else:
+                    sender._observed_state = KVPoll.Success
+
+                try:
+                    # _notify_decode is idempotent (status_notified flag).
+                    # notify_decode_status itself is thread-safe (fresh ZMQ
+                    # socket per call, see CommonKVManager._connect).
+                    sender._notify_decode(
+                        sender._observed_state, sender._observed_failure_reason
+                    )
+                except Exception:
+                    logger.exception(
+                        "observer: notify_decode failed for room %s",
+                        sender.bootstrap_room,
+                    )
+
+                # Last write: publish terminal flag (release semantics under GIL).
+                sender._observed_terminal = True
+
+            self._observer_stop.wait(self._observer_interval_s)
 
     def _get_mha_mem_desc_slices(
         self, dst_mem_descs: List[MemoryDesc]
@@ -869,8 +1036,29 @@ class MoriKVSender(CommonKVSender):
         self._rdma_first_issue_time: float = 0.0
         self._rdma_last_issue_time: float = 0.0
         self._rdma_complete_time: float = 0.0
-        self._rdma_bytes_sent: int = 0        # total across all chunks
+        self._rdma_bytes_sent: int = 0  # total across all chunks
         self._rdma_last_chunk_bytes: int = 0  # bytes of the last chunk only
+
+        # Scheduler poll diagnostics — used as a cross-check for the async
+        # observer. If the observer is doing its job, poll_observation_lag_ms
+        # should be small (≈ time between scheduler poll() calls), and
+        # rdma_latency_ms should reflect the *real* C++ completion time.
+        self._last_poll_ts: float = 0.0
+        self._poll_observation_lag_ms: float = 0.0
+        self._poll_count: int = 0
+        self._poll_max_gap_ms: float = 0.0
+
+        # ── Async observer fast path ──────────────────────────────────────
+        # Written by MoriKVManager._observer_loop; read by this.poll().
+        # Publish order in the observer: _rdma_complete_time → _observed_state
+        # → _observed_failure_reason → _observed_terminal (last).
+        self._observed_terminal: bool = False
+        self._observed_state: Optional[KVPoll] = None
+        self._observed_failure_reason: Optional[str] = None
+        self._observer_registered: bool = False
+        # Guards _notify_decode against concurrent invocation from the
+        # observer thread and the scheduler main thread.
+        self._notify_lock = threading.Lock()
 
     def send(
         self,
@@ -909,12 +1097,31 @@ class MoriKVSender(CommonKVSender):
         self._rdma_bytes_sent += bytes_sent
         self._rdma_last_chunk_bytes = bytes_sent
         if infos is not None:
+            # Memory-order critical: pending_infos *before* sent_last_chunk so
+            # the observer thread (which checks sent_last_chunk first) is
+            # guaranteed to see pending_infos when it fires _notify_decode.
             self.pending_infos = infos
             self.sent_last_chunk = True
+            # Register exactly once. Observer is a no-op if disabled.
+            if not self._observer_registered:
+                self.kv_mgr._register_observer(self)
+                self._observer_registered = True
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
+
+        # Diagnostics: track poll() call cadence. With the async observer
+        # enabled, poll_observation_lag_ms below should be small (it just
+        # measures how often the scheduler thread gets to call poll()).
+        now_poll = time.perf_counter()
+        prev_poll = self._last_poll_ts
+        self._last_poll_ts = now_poll
+        self._poll_count += 1
+        if prev_poll > 0.0:
+            gap_ms = (now_poll - prev_poll) * 1000.0
+            if gap_ms > self._poll_max_gap_ms:
+                self._poll_max_gap_ms = gap_ms
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
@@ -934,10 +1141,33 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure()
             return KVPoll.Failed
 
+        # ── Async observer fast path (O(1) flag read) ──────────────────────
+        # The observer thread already stamped _rdma_complete_time at the true
+        # C++-side completion point and notified decode. Scheduler just reads
+        # the terminal flag and returns.
+        if self._observed_terminal:
+            if prev_poll > 0.0 and self._poll_observation_lag_ms == 0.0:
+                self._poll_observation_lag_ms = (now_poll - prev_poll) * 1000.0
+            if self._observed_state == KVPoll.Failed:
+                self._finalize_failure(self._observed_failure_reason)
+                return KVPoll.Failed
+            # SUCCESS: _notify_decode is idempotent (observer may already have
+            # sent it; status_notified guard makes this a no-op).
+            self._notify_decode(KVPoll.Success)
+            self.conclude_state = KVPoll.Success
+            return KVPoll.Success
+
+        # ── Fallback path (when observer disabled or hasn't caught up yet) ─
+        # If the observer thread is enabled and active, the in-line poll below
+        # is the redundant path; the observer will almost always win the race
+        # to set _observed_terminal first. This branch still works correctly
+        # if the scheduler happens to be quick enough.
         transfers_done = self._all_transfers_finished()
         if transfers_done:
             if self._rdma_complete_time == 0.0:
-                self._rdma_complete_time = time.perf_counter()
+                self._rdma_complete_time = now_poll
+                if prev_poll > 0.0:
+                    self._poll_observation_lag_ms = (now_poll - prev_poll) * 1000.0
             if self._has_transfer_error():
                 reason = self._collect_failure_reason()
                 self.kv_mgr.record_failure(self.bootstrap_room, reason)
@@ -981,6 +1211,24 @@ class MoriKVSender(CommonKVSender):
         return self._rdma_last_chunk_bytes / (1024 * 1024)
 
     @property
+    def poll_observation_lag_ms(self) -> float:
+        """Upper bound on the time between the C++ side completing the RDMA
+        and Python's scheduler thread observing it via poll(). Equals the
+        interval between the last two poll() calls when transfers_done is
+        first seen. With the async observer enabled this should be small."""
+        return self._poll_observation_lag_ms
+
+    @property
+    def poll_max_gap_ms(self) -> float:
+        """Max interval between two consecutive poll() calls observed during
+        this sender's inflight period."""
+        return self._poll_max_gap_ms
+
+    @property
+    def poll_count(self) -> int:
+        return self._poll_count
+
+    @property
     def decode_endpoint(self) -> str:
         """Comma-separated sorted unique endpoints of non-dummy decode peers.
         Available after the last chunk is sent (pending_infos is set)."""
@@ -994,13 +1242,23 @@ class MoriKVSender(CommonKVSender):
     def _notify_decode(
         self, status: KVPoll, failure_reason: Optional[str] = None
     ) -> None:
-        if self.status_notified:
-            return
-        if self.pending_infos:
-            self.kv_mgr.notify_decode_status(
-                self.pending_infos, self.bootstrap_room, status, failure_reason
-            )
-        self.status_notified = True
+        # The async observer and the scheduler main thread can race here:
+        # both check status_notified, both find it False, both call
+        # notify_decode_status, two well-formed ZMQ messages are sent. ZMQ
+        # frame boundaries are preserved per send_multipart, so the receiver
+        # parses each correctly — but rapid concurrent socket churn can
+        # interact badly with libzmq context init under heavy load (we
+        # observed [GUARD, GUARD, ...] frames downstream). Serialise this
+        # whole block to (a) guarantee at-most-once-notify per sender, and
+        # (b) keep socket creation pattern single-threaded per sender.
+        with self._notify_lock:
+            if self.status_notified:
+                return
+            if self.pending_infos:
+                self.kv_mgr.notify_decode_status(
+                    self.pending_infos, self.bootstrap_room, status, failure_reason
+                )
+            self.status_notified = True
 
     def _finalize_failure(self, failure_reason: Optional[str] = None) -> None:
         if self.conclude_state == KVPoll.Failed:
@@ -1013,6 +1271,8 @@ class MoriKVSender(CommonKVSender):
         self.conclude_state = KVPoll.Failed
 
     def clear(self) -> None:
+        # Unregister from the async observer first (idempotent, fast).
+        self.kv_mgr._unregister_observer(self)
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
