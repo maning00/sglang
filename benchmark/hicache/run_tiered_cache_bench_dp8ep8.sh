@@ -461,7 +461,22 @@ launch_server_case3() {
     if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
         ssd_enabled_json="false"
     fi
-    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    # Optional override of the general distributed staging buffer size (bytes).
+    # This buffer is allocated unconditionally for generic remote put/get.
+    local staging_fields=""
+    if [[ -n "${UMBP_STAGING_BYTES:-}" ]]; then
+        staging_fields=", \"staging_buffer_size\": ${UMBP_STAGING_BYTES}"
+    fi
+    # Dedicated SSD read staging (bytes); per-slot = size / ssd_read_slots must
+    # be >= one key's page KV (~4.5MB for full DeepSeek-R1). Default 256MiB.
+    if [[ -n "${UMBP_SSD_STAGING_BYTES:-}" ]]; then
+        staging_fields="${staging_fields}, \"ssd_staging_buffer_size\": ${UMBP_SSD_STAGING_BYTES}"
+    fi
+    # SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
+    if [[ -n "${UMBP_SSD_READ_SLOTS:-}" ]]; then
+        staging_fields="${staging_fields}, \"ssd_read_slots\": ${UMBP_SSD_READ_SLOTS}"
+    fi
+    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${staging_fields}}"
 
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \

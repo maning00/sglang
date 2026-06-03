@@ -751,7 +751,15 @@ build_umbp_extra_config() {
     if bool_is_true "$ENABLE_KV_EVENTS"; then
         kv_events_fields=", \"kv_events_subscriber\": true"
     fi
-    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${kv_events_fields}}"
+    # Optional staging overrides; SSD read per-slot = ssd_staging_buffer_size / ssd_read_slots.
+    local staging_fields=""
+    [[ -n "${UMBP_STAGING_BYTES:-}" ]] && \
+        staging_fields+=", \"staging_buffer_size\": ${UMBP_STAGING_BYTES}"
+    [[ -n "${UMBP_SSD_STAGING_BYTES:-}" ]] && \
+        staging_fields+=", \"ssd_staging_buffer_size\": ${UMBP_SSD_STAGING_BYTES}"
+    [[ -n "${UMBP_SSD_READ_SLOTS:-}" ]] && \
+        staging_fields+=", \"ssd_read_slots\": ${UMBP_SSD_READ_SLOTS}"
+    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${kv_events_fields}${staging_fields}}"
 }
 
 # ---- Launch server (unified for both roles) -----------------

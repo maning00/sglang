@@ -379,6 +379,12 @@ class UMBPStore(HiCacheStorage):
             if "staging_buffer_size" in extra:
                 dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
 
+            if "ssd_staging_buffer_size" in extra:
+                dist_cfg.ssd_staging_buffer_size = int(extra["ssd_staging_buffer_size"])
+
+            if "ssd_read_slots" in extra:
+                dist_cfg.ssd_read_slots = int(extra["ssd_read_slots"])
+
             peer_service_port = extra.get(
                 "peer_service_port", _optional_env_str("UMBP_PEER_SERVICE_PORT")
             )
