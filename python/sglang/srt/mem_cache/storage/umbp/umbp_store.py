@@ -382,8 +382,10 @@ class UMBPStore(HiCacheStorage):
             if "ssd_staging_buffer_size" in extra:
                 dist_cfg.ssd_staging_buffer_size = int(extra["ssd_staging_buffer_size"])
 
-            if "ssd_read_slots" in extra:
-                dist_cfg.ssd_read_slots = int(extra["ssd_read_slots"])
+            if "ssd_staging_buffer_slots" in extra:
+                dist_cfg.ssd_staging_buffer_slots = int(
+                    extra["ssd_staging_buffer_slots"]
+                )
 
             peer_service_port = extra.get(
                 "peer_service_port", _optional_env_str("UMBP_PEER_SERVICE_PORT")
@@ -557,7 +559,9 @@ class UMBPStore(HiCacheStorage):
                         # Validate: total tenant quotas must fit within SSD
                         # capacity after allocator rounding.
                         if dp_size > 1:
-                            total_quota = cfg.ssd.spdk_proxy_tenant_quota_bytes * dp_size
+                            total_quota = (
+                                cfg.ssd.spdk_proxy_tenant_quota_bytes * dp_size
+                            )
                             if total_quota > cfg.ssd.capacity_bytes:
                                 old_quota = cfg.ssd.spdk_proxy_tenant_quota_bytes
                                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
