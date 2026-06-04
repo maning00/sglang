@@ -40,18 +40,62 @@ Environment variables (override defaults):
   PREFILL_PORT              Prefill server port (default: 30000)
   DECODE_HOST               Decode server bind address (default: 0.0.0.0)
   DECODE_PORT               Decode server port (default: 30001)
-  PREFILL_URL               Full URL to prefill server (decode needs this,
-                            e.g. http://10.0.0.1:30000)
+  PREFILL_URLS              Space-separated prefill URLs for multi-prefill
+                            (xP1D), e.g.
+                            "http://10.0.0.1:30000 http://10.0.0.2:30000".
+                            Used by the decode node to fan out --prefill flags
+                            to sglang_router. MUST use spaces, not commas.
+  PREFILL_URL               [DEPRECATED] Single-prefill shortcut for 1P1D
+                            (back-compat). Folded into PREFILL_URLS if set.
 
   # Router (decode node only)
   ENABLE_ROUTER             Auto-start router on decode node (default: true)
   ROUTER_HOST               Router bind address (default: 0.0.0.0)
   ROUTER_PORT               Router port (default: 8000)
 
+  # KV Events (ZMQ publisher on SGLang + subscriber in UMBP)
+  ENABLE_KV_EVENTS          Enable KV events publisher on sglang server (default: true)
+  KV_EVENTS_PUBLISHER       Publisher backend (default: zmq)
+  KV_EVENTS_ENDPOINT        ZMQ bind endpoint (default: tcp://*:5557)
+  KV_EVENTS_TOPIC           ZMQ topic prefix (default: empty)
+
   # Cache tiers
   ENABLE_HICACHE            Enable L2 DRAM cache (default: true)
   ENABLE_UMBP               Enable L3 UMBP (DRAM+SSD) (default: true)
   HICACHE_SIZE              L2 DRAM size in GB/rank (default: 128)
+  HICACHE_IO_BACKEND        IO backend for KV cache transfer between CPU and GPU:
+                            direct | kernel | kernel_ascend (default: kernel).
+                            Forwarded as --hicache-io-backend; only takes effect when
+                            ENABLE_HICACHE=true.
+  HICACHE_STORAGE_PREFETCH_POLICY  L3 prefetch policy: best_effort | wait_complete | timeout
+                            (default: best_effort). Forwarded as
+                            --hicache-storage-prefetch-policy; only takes effect when
+                            ENABLE_UMBP=true.
+
+  # L2 hugepage backing (forwarded to sglang's UMBPHostTensorAllocator)
+  SGLANG_HICACHE_HOST_HUGEPAGE       Use anonymous hugepages for L2 (default: 1; 0=4 KiB anon)
+  SGLANG_HICACHE_HOST_HUGEPAGE_SIZE  Hugepage size in bytes (default: 2097152 = 2 MiB)
+  SGLANG_HICACHE_HOST_PREFAULT       Eagerly commit pages via MADV_POPULATE_WRITE (default: 1)
+  SGLANG_HICACHE_HOST_NUMA_NODE      NUMA node to bind L2 to; -1 = no binding (default: unset)
+  HUGEPAGE_AUTO_RESERVE              Try sysctl to raise nr_hugepages if short (default: false)
+  HUGEPAGE_HEADROOM_PERCENT          Extra hugepages on top of computed minimum (default: 5)
+  UMBP_DRAM_USE_HUGEPAGES            Use anonymous hugepages for L3 UMBP DRAM pool (default: 1; 0=4 KiB anon)
+
+  # Parallelism mode
+  SERVING_MODE              Parallelism strategy (default: dp8ep8).
+                            dp8ep8: DP=8 + EP=8 with MoE A2A (mori) and dp-attention.
+                            tp8:    Pure TP=8, no DP/EP, no MoE A2A override.
+
+  # Benchmark control
+  RUN_BENCHMARK             Run benchmark after decode server starts (default: true).
+                            Set false to start servers only; benchmark can be run
+                            separately later via bench_multiturn.py.
+
+  # Prefill-specific
+  CHUNKED_PREFILL_SIZE      Chunked prefill chunk size for prefill node; unset = sglang auto-tune.
+
+  # Prefill-specific
+  PREFILL_MAX_RUNNING_REQUESTS  Max concurrent requests on prefill (default: unset = sglang default)
 
   # Decode-specific
   MAX_RUNNING_REQUESTS      Max concurrent requests on decode (default: 128)
@@ -65,8 +109,12 @@ Examples:
   # Prefill node with all cache tiers:
   ./run_pd_disagg_bench_dp8ep8.sh --role prefill
 
-  # Decode node, connecting to prefill at 10.0.0.1:
+  # Decode node (1P1D), connecting to prefill at 10.0.0.1:
   PREFILL_URL=http://10.0.0.1:30000 \\
+    ./run_pd_disagg_bench_dp8ep8.sh --role decode
+
+  # Decode node (2P1D), router fans out to two prefill servers:
+  PREFILL_URLS="http://10.0.0.1:30000 http://10.0.0.2:30000" \\
     ./run_pd_disagg_bench_dp8ep8.sh --role decode
 
   # Prefill node, HBM only (no tiered cache):
@@ -99,10 +147,12 @@ if [[ "$PD_ROLE" != "prefill" && "$PD_ROLE" != "decode" ]]; then
 fi
 
 # ---- Configurable parameters --------------------------------
-MODEL_PATH="${MODEL_PATH:-/nfs/DeepSeek-V3}"
+MODEL_PATH="${MODEL_PATH:-/nfs/data/DeepSeek-V3}"
+USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
 
 # PD Disaggregation
 DISAGG_TRANSFER_BACKEND="${DISAGG_TRANSFER_BACKEND:-mori}"
@@ -112,6 +162,14 @@ PREFILL_PORT="${PREFILL_PORT:-30000}"
 DECODE_HOST="${DECODE_HOST:-0.0.0.0}"
 DECODE_PORT="${DECODE_PORT:-30001}"
 PREFILL_URL="${PREFILL_URL:-}"
+# Multi-prefill (xP1D) endpoints. Space-separated list, used by the decode
+# node to fan out --prefill flags to sglang_router. PREFILL_URL is kept for
+# back-compat with single-prefill (1P1D) callers and is folded in here.
+# DEPRECATED: PREFILL_URL kept for back-compat, prefer PREFILL_URLS.
+# NOTE: do not call `read -a` at top-level; under `set -e`, an empty value
+# (the prefill-role normal case) can abort the script before role dispatch.
+# The array is parsed lazily inside the decode branch.
+PREFILL_URLS="${PREFILL_URLS:-${PREFILL_URL:-}}"
 
 # Router (decode node only)
 ENABLE_ROUTER="${ENABLE_ROUTER:-true}"
@@ -123,6 +181,40 @@ ENABLE_HICACHE="${ENABLE_HICACHE:-true}"
 ENABLE_UMBP="${ENABLE_UMBP:-true}"
 HICACHE_SIZE="${HICACHE_SIZE:-128}"
 WRITE_POLICY="write_through"
+HICACHE_IO_BACKEND="${HICACHE_IO_BACKEND:-kernel}"
+case "$HICACHE_IO_BACKEND" in
+    direct|kernel|kernel_ascend) ;;
+    *)
+        echo "ERROR: HICACHE_IO_BACKEND must be one of direct|kernel|kernel_ascend, got '$HICACHE_IO_BACKEND'"
+        exit 1 ;;
+esac
+HICACHE_STORAGE_PREFETCH_POLICY="${HICACHE_STORAGE_PREFETCH_POLICY:-best_effort}"
+case "$HICACHE_STORAGE_PREFETCH_POLICY" in
+    best_effort|wait_complete|timeout) ;;
+    *)
+        echo "ERROR: HICACHE_STORAGE_PREFETCH_POLICY must be one of best_effort|wait_complete|timeout, got '$HICACHE_STORAGE_PREFETCH_POLICY'"
+        exit 1 ;;
+esac
+
+# L2 hugepage backing — forwarded to sglang's UMBPHostTensorAllocator.
+# Defaults match the design: AnonymousHugetlb backing (2 MiB pages), prefault on,
+# no NUMA binding. Set SGLANG_HICACHE_HOST_HUGEPAGE=0 to fall back to 4 KiB anon
+# (useful for A/B comparisons or hosts without hugepage reservations).
+SGLANG_HICACHE_HOST_HUGEPAGE="${SGLANG_HICACHE_HOST_HUGEPAGE:-1}"
+SGLANG_HICACHE_HOST_HUGEPAGE_SIZE="${SGLANG_HICACHE_HOST_HUGEPAGE_SIZE:-2097152}"
+SGLANG_HICACHE_HOST_PREFAULT="${SGLANG_HICACHE_HOST_PREFAULT:-1}"
+SGLANG_HICACHE_HOST_NUMA_NODE="${SGLANG_HICACHE_HOST_NUMA_NODE:-}"
+
+# Hugepage pool sizing for the L2 KV cache.
+# When ENABLE_HICACHE=true and SGLANG_HICACHE_HOST_HUGEPAGE=1, the script
+# verifies HugePages_Free covers HICACHE_SIZE × DP_SIZE × (1 + headroom%).
+# If short, the script fails fast unless HUGEPAGE_AUTO_RESERVE=true, in which
+# case it tries `sysctl -w vm.nr_hugepages=<N>` (needs root or NOPASSWD sudo).
+HUGEPAGE_AUTO_RESERVE="${HUGEPAGE_AUTO_RESERVE:-false}"
+HUGEPAGE_HEADROOM_PERCENT="${HUGEPAGE_HEADROOM_PERCENT:-5}"
+# L3 UMBP DRAM pool hugepage backing (passed via env to UMBPConfig.from_environment).
+# Defaults to 1 (enabled) to match L2 hugepage policy.
+UMBP_DRAM_USE_HUGEPAGES="${UMBP_DRAM_USE_HUGEPAGES:-1}"
 
 # UMBP (L3) config
 UMBP_DRAM_BYTES="${UMBP_DRAM_BYTES:-68719476736}"
@@ -133,7 +225,7 @@ UMBP_COPY_TO_SSD_ASYNC="${UMBP_COPY_TO_SSD_ASYNC:-true}"
 UMBP_SSD_WRITER_THREADS="${UMBP_SSD_WRITER_THREADS:-4}"
 
 # SPDK backend
-UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"
+UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-file}"
 UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-}"
 UMBP_SPDK_PROXY_AUTO_START="${UMBP_SPDK_PROXY_AUTO_START:-true}"
 UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS="${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS:-60000}"
@@ -146,10 +238,17 @@ UMBP_IO_ENGINE_PORT="${UMBP_IO_ENGINE_PORT:-}"
 UMBP_PEER_SERVICE_PORT="${UMBP_PEER_SERVICE_PORT:-}"
 UMBP_CACHE_REMOTE_FETCHES="${UMBP_CACHE_REMOTE_FETCHES:-true}"
 UMBP_MASTER_AUTO_START="${UMBP_MASTER_AUTO_START:-true}"
+
+# KV Events
+ENABLE_KV_EVENTS="${ENABLE_KV_EVENTS:-true}"
+KV_EVENTS_PUBLISHER="${KV_EVENTS_PUBLISHER:-zmq}"
+KV_EVENTS_ENDPOINT="${KV_EVENTS_ENDPOINT:-tcp://*:5557}"
+KV_EVENTS_TOPIC="${KV_EVENTS_TOPIC:-}"
 UMBP_MASTER_BIN="${UMBP_MASTER_BIN:-}"
 UMBP_MASTER_LISTEN="${UMBP_MASTER_LISTEN:-}"
 
 # Benchmark params (decode node only)
+RUN_BENCHMARK="${RUN_BENCHMARK:-true}"
 NUM_ROUNDS="${NUM_ROUNDS:-130}"
 NUM_CLIENTS="${NUM_CLIENTS:-64}"
 MAX_PARALLEL="${MAX_PARALLEL:-64}"
@@ -158,6 +257,12 @@ SUB_QUESTION_INPUT_LENGTH="${SUB_QUESTION_INPUT_LENGTH:-430}"
 OUTPUT_LENGTH="${OUTPUT_LENGTH:-1}"
 REQUEST_RATE="${REQUEST_RATE:-10}"
 SEED="${SEED:-42}"
+
+# Prefill-specific
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
+
+# Prefill-specific max running requests (empty = sglang default)
+PREFILL_MAX_RUNNING_REQUESTS="${PREFILL_MAX_RUNNING_REQUESTS:-}"
 
 # Decode-specific
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
@@ -174,6 +279,17 @@ PREFILL_WAIT_TIMEOUT="${PREFILL_WAIT_TIMEOUT:-6000}"
 
 MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+SERVING_MODE="${SERVING_MODE:-dp8ep8}"
+
+if [[ "$SERVING_MODE" != "dp8ep8" && "$SERVING_MODE" != "tp8" ]]; then
+    echo "ERROR: SERVING_MODE must be 'dp8ep8' or 'tp8', got '$SERVING_MODE'"
+    exit 1
+fi
+
+# Extra args forwarded verbatim to sglang.launch_server for both roles.  Split
+# on whitespace so flag+value pairs stay together
+# (e.g. EXTRA_SERVER_ARGS="--max-total-tokens 20000").
+read -r -a EXTRA_SERVER_ARGS_ARR <<< "${EXTRA_SERVER_ARGS:-}"
 
 # ---- Sanity: UMBP requires HICACHE ---------------------------
 if bool_is_true "$ENABLE_UMBP" && ! bool_is_true "$ENABLE_HICACHE"; then
@@ -190,6 +306,18 @@ PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=6G
+# MORI_GLOBAL_LOG_LEVEL covers all spdlog modules (application/io/shmem/core/ops/umbp/metrics).
+# UMBP_LOG_LEVEL=0 covers the separate C-style UMBP logger in umbp/common/log.h (0=INFO).
+export MORI_GLOBAL_LOG_LEVEL=INFO
+export UMBP_LOG_LEVEL=0
+
+# Forward L2 hugepage knobs into sglang's child process. Only export NUMA_NODE
+# when explicitly set so the C++ default (-1 = no binding) wins on absence.
+export SGLANG_HICACHE_HOST_HUGEPAGE
+export SGLANG_HICACHE_HOST_HUGEPAGE_SIZE
+export SGLANG_HICACHE_HOST_PREFAULT
+export UMBP_DRAM_USE_HUGEPAGES
+[[ -n "$SGLANG_HICACHE_HOST_NUMA_NODE" ]] && export SGLANG_HICACHE_HOST_NUMA_NODE
 
 # ---- Helpers ------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -398,6 +526,125 @@ clean_ssd_dir() {
     log "WARNING: Could not fully remove $UMBP_SSD_DIR, proceeding anyway."
 }
 
+# ----------------------------------------------------------------------------
+# ensure_hugepages: verify (and optionally raise) the system hugepage pool so
+# sglang's UMBPHostTensorAllocator gets AnonymousHugetlb backing for the L2 KV
+# buffer. Without enough free pages, mmap(MAP_HUGETLB) silently falls back to
+# 4 KiB anonymous pages — the allocator logs a WARN and the AINIC single-MR
+# benefit (registering the entire L2 buffer as one RDMA MR) is lost.
+#
+# Required pages per rank = ceil(HICACHE_SIZE GB / hugepage_size).
+# Total                   = pages_per_rank × DP_SIZE × (1 + HUGEPAGE_HEADROOM_PERCENT/100).
+#
+# Behavior:
+#   - Skips if ENABLE_HICACHE=false or SGLANG_HICACHE_HOST_HUGEPAGE=0.
+#   - If HugePages_Free is sufficient: returns 0 (logs the budget).
+#   - If short and HUGEPAGE_AUTO_RESERVE=false: fails with the exact sysctl
+#     command the operator should run.
+#   - If short and HUGEPAGE_AUTO_RESERVE=true: tries sysctl, then re-checks.
+#     Memory fragmentation on a long-running host can still defeat this; in
+#     that case the user must reboot with hugepages= on the kernel cmdline.
+# ----------------------------------------------------------------------------
+ensure_hugepages() {
+    if ! bool_is_true "$ENABLE_HICACHE"; then
+        return 0
+    fi
+    if ! bool_is_true "$SGLANG_HICACHE_HOST_HUGEPAGE"; then
+        log "Hugepage backing disabled (SGLANG_HICACHE_HOST_HUGEPAGE=0); skipping pool check."
+        return 0
+    fi
+
+    local hp_size_bytes="$SGLANG_HICACHE_HOST_HUGEPAGE_SIZE"
+    if (( hp_size_bytes <= 0 )); then
+        log "ERROR: SGLANG_HICACHE_HOST_HUGEPAGE_SIZE must be > 0, got $hp_size_bytes"
+        return 1
+    fi
+    local hp_size_kb=$(( hp_size_bytes / 1024 ))
+    local hp_size_mb=$(( hp_size_bytes / 1024 / 1024 ))
+
+    # Round up: ceil(HICACHE_SIZE * GiB / hp_size_bytes)
+    local bytes_per_rank=$(( HICACHE_SIZE * 1024 * 1024 * 1024 ))
+    local pages_per_rank=$(( (bytes_per_rank + hp_size_bytes - 1) / hp_size_bytes ))
+    # Apply headroom, then round up again.
+    local pages_needed=$(( pages_per_rank * DP_SIZE ))
+    pages_needed=$(( (pages_needed * (100 + HUGEPAGE_HEADROOM_PERCENT) + 99) / 100 ))
+
+    local sys_default_kb cur_total cur_free
+    sys_default_kb=$(grep -oP '^Hugepagesize:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    cur_total=$(grep -oP '^HugePages_Total:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    cur_free=$(grep -oP '^HugePages_Free:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+
+    log "Hugepage check:"
+    log "  Need:    ${pages_needed} pages × ${hp_size_mb} MiB = $((pages_needed * hp_size_mb / 1024)) GiB"
+    log "           (HICACHE_SIZE=${HICACHE_SIZE} GiB × DP_SIZE=${DP_SIZE} + ${HUGEPAGE_HEADROOM_PERCENT}% headroom)"
+    log "  Current: HugePages_Total=${cur_total}, HugePages_Free=${cur_free}, default Hugepagesize=${sys_default_kb} KiB"
+
+    # Warn (but don't fail) if the system default size differs from the
+    # requested size. Mixed-size pools live under /sys/kernel/mm/hugepages/...
+    # and require operator-managed allocation per size; the script only
+    # touches the default pool via vm.nr_hugepages.
+    if (( sys_default_kb != hp_size_kb )); then
+        log "  WARNING: requested hugepage_size=${hp_size_kb} KiB ≠ system default ${sys_default_kb} KiB."
+        log "           For non-default sizes, manually reserve under"
+        log "           /sys/kernel/mm/hugepages/hugepages-${hp_size_kb}kB/nr_hugepages."
+        log "           This script's pool checks/sysctl only target the default size."
+    fi
+
+    if (( cur_free >= pages_needed )); then
+        log "  OK: HugePages_Free=${cur_free} >= required=${pages_needed}"
+        return 0
+    fi
+
+    log "  SHORT: HugePages_Free=${cur_free} < required=${pages_needed} (deficit $(( pages_needed - cur_free )) pages)"
+
+    if ! bool_is_true "$HUGEPAGE_AUTO_RESERVE"; then
+        log "FATAL: insufficient hugepages and HUGEPAGE_AUTO_RESERVE=false."
+        log "  To fix manually:"
+        log "    sudo sysctl -w vm.nr_hugepages=${pages_needed}"
+        log "    grep -i huge /proc/meminfo   # verify HugePages_Free"
+        log ""
+        log "  Or set HUGEPAGE_AUTO_RESERVE=true to let this script try sysctl."
+        log ""
+        log "  Or set SGLANG_HICACHE_HOST_HUGEPAGE=0 to disable hugepage backing"
+        log "  (degrades L2 to 4 KiB anonymous pages; AINIC single-MR registration"
+        log "   of the full L2 buffer will fail and fall back to staging copy)."
+        return 1
+    fi
+
+    log "Auto-reserving hugepages: sysctl -w vm.nr_hugepages=${pages_needed}"
+    local sysctl_cmd
+    if [[ "$(id -u)" == "0" ]]; then
+        sysctl_cmd=(sysctl -w "vm.nr_hugepages=${pages_needed}")
+    else
+        sysctl_cmd=(sudo -n sysctl -w "vm.nr_hugepages=${pages_needed}")
+    fi
+    if ! "${sysctl_cmd[@]}" >/dev/null 2>&1; then
+        log "FATAL: sysctl to raise nr_hugepages failed."
+        log "  Likely cause: missing root / NOPASSWD sudo, or memory fragmentation."
+        log "  Try one of:"
+        log "    1) Run this script as root."
+        log "    2) Drop caches first:  echo 3 | sudo tee /proc/sys/vm/drop_caches"
+        log "    3) Reboot with kernel cmdline:"
+        log "         default_hugepagesz=${hp_size_mb}M hugepagesz=${hp_size_mb}M hugepages=${pages_needed}"
+        return 1
+    fi
+
+    cur_total=$(grep -oP '^HugePages_Total:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    cur_free=$(grep -oP '^HugePages_Free:\s+\K[0-9]+' /proc/meminfo 2>/dev/null || echo 0)
+    log "  After sysctl: HugePages_Total=${cur_total}, HugePages_Free=${cur_free}"
+
+    if (( cur_free < pages_needed )); then
+        log "FATAL: even after sysctl, HugePages_Free=${cur_free} < required=${pages_needed}."
+        log "  Memory fragmentation prevents kernel from allocating contiguous huge pages."
+        log "  Reboot with kernel cmdline:"
+        log "    default_hugepagesz=${hp_size_mb}M hugepagesz=${hp_size_mb}M hugepages=${pages_needed}"
+        return 1
+    fi
+
+    log "  Hugepage reservation OK: HugePages_Free=${cur_free}."
+    return 0
+}
+
 wait_for_server() {
     local port="$1"
     local host="${2:-localhost}"
@@ -412,6 +659,26 @@ wait_for_server() {
         sleep "$interval"; elapsed=$(( elapsed + interval ))
     done
     log "ERROR: Server did not become ready within ${SERVER_READY_TIMEOUT}s."
+    return 1
+}
+
+wait_for_decode_fired_up() {
+    local log_file="$1"
+    local timeout="${2:-600}"
+    local interval=10 elapsed=0
+    if [[ -z "$log_file" ]]; then
+        return 0
+    fi
+    log "Waiting for decode log ${log_file} to report 'fired up' (timeout ${timeout}s)..."
+    while (( elapsed < timeout )); do
+        if [[ -f "$log_file" ]] && grep -q "fired up" "$log_file"; then
+            log "Decode server reported 'fired up' (took ${elapsed}s)."
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$(( elapsed + interval ))
+    done
+    log "WARNING: Decode server did not log 'fired up' within ${timeout}s; continuing."
     return 1
 }
 
@@ -445,7 +712,7 @@ run_benchmark() {
 # ---- Build UMBP extra config JSON ---------------------------
 build_umbp_extra_config() {
     local spdk_fields=""
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         spdk_fields=", \"ssd_backend\": \"${UMBP_SSD_BACKEND}\""
         [[ -n "$UMBP_SPDK_NVME_PCI" ]] && \
             spdk_fields+=", \"spdk_nvme_pci_addr\": \"${UMBP_SPDK_NVME_PCI}\""
@@ -465,8 +732,34 @@ build_umbp_extra_config() {
         [[ -n "$UMBP_PEER_SERVICE_PORT" ]] && \
             dist_fields+=", \"peer_service_port\": \"${UMBP_PEER_SERVICE_PORT}\""
         dist_fields+=", \"cache_remote_fetches\": ${UMBP_CACHE_REMOTE_FETCHES}"
+        # Optional override for master's PageBitmapAllocator page_size.
+        # When set, takes precedence over UMBPStore's auto-probe (Path A).
+        [[ -n "${UMBP_DRAM_PAGE_SIZE:-}" ]] && \
+            dist_fields+=", \"dram_page_size\": ${UMBP_DRAM_PAGE_SIZE}"
     fi
-    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": true, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    # Auto-disable SSD when capacity is zero so UMBPConfig::Validate() does
+    # not reject the config (ssd_enabled=true requires ssd_capacity_bytes>0).
+    # Note: mori's dual-scheme DistributedClient does not currently use the
+    # SSD tier at all (only DRAM is registered with the master), so setting
+    # UMBP_SSD_BYTES=0 is the supported way to fully turn SSD off until SSD
+    # support lands in dual-scheme.
+    local ssd_enabled_json="true"
+    if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
+        ssd_enabled_json="false"
+    fi
+    local kv_events_fields=""
+    if bool_is_true "$ENABLE_KV_EVENTS"; then
+        kv_events_fields=", \"kv_events_subscriber\": true"
+    fi
+    # Optional staging overrides; SSD read per-slot = ssd_staging_buffer_size / ssd_staging_buffer_slots.
+    local staging_fields=""
+    [[ -n "${UMBP_STAGING_BYTES:-}" ]] && \
+        staging_fields+=", \"staging_buffer_size\": ${UMBP_STAGING_BYTES}"
+    [[ -n "${UMBP_SSD_STAGING_BYTES:-}" ]] && \
+        staging_fields+=", \"ssd_staging_buffer_size\": ${UMBP_SSD_STAGING_BYTES}"
+    [[ -n "${UMBP_SSD_STAGING_SLOTS:-}" ]] && \
+        staging_fields+=", \"ssd_staging_buffer_slots\": ${UMBP_SSD_STAGING_SLOTS}"
+    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${kv_events_fields}${staging_fields}}"
 }
 
 # ---- Launch server (unified for both roles) -----------------
@@ -487,12 +780,19 @@ launch_pd_server() {
         --port "$port"
         --tp-size "$TP_SIZE"
         --page-size "$PAGE_SIZE"
-        --dp-size "$DP_SIZE"
-        --enable-dp-attention
-        --moe-a2a-backend "$MOE_A2A_BACKEND"
     )
+    if [[ "$SERVING_MODE" == "dp8ep8" ]]; then
+        cmd+=(
+            --dp-size "$DP_SIZE"
+            --enable-dp-attention
+            --moe-a2a-backend "$MOE_A2A_BACKEND"
+        )
+    fi
     if [[ -n "$KV_CACHE_DTYPE" ]]; then
         cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+    fi
+    if [[ -n "$MEM_FRACTION_STATIC" ]]; then
+        cmd+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
     fi
 
     # Disaggregation args
@@ -502,6 +802,12 @@ launch_pd_server() {
     )
     if [[ "$role" == "prefill" ]]; then
         cmd+=(--disaggregation-bootstrap-port "$DISAGG_BOOTSTRAP_PORT")
+        if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
+            cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+        fi
+        if [[ -n "$PREFILL_MAX_RUNNING_REQUESTS" ]]; then
+            cmd+=(--max-running-requests "$PREFILL_MAX_RUNNING_REQUESTS")
+        fi
     fi
     if [[ "$role" == "decode" ]]; then
         cmd+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
@@ -516,6 +822,13 @@ launch_pd_server() {
     fi
 
     # Hierarchical cache / decode offload args
+    # direct io backend requires page_first_direct layout; kernel uses page_first.
+    local _hicache_mem_layout
+    if [[ "$HICACHE_IO_BACKEND" == "direct" ]]; then
+        _hicache_mem_layout="page_first_direct"
+    else
+        _hicache_mem_layout="page_first"
+    fi
     if bool_is_true "$ENABLE_HICACHE"; then
         if [[ "$role" == "prefill" ]]; then
             # Prefill: full hierarchical cache (HiRadixCache)
@@ -523,7 +836,8 @@ launch_pd_server() {
                 --enable-hierarchical-cache
                 --hicache-size "$HICACHE_SIZE"
                 --hicache-write-policy "$WRITE_POLICY"
-                --hicache-mem-layout page_first
+                --hicache-io-backend "$HICACHE_IO_BACKEND"
+                --hicache-mem-layout "$_hicache_mem_layout"
             )
         else
             # Decode: offload KV to host/storage via offload manager
@@ -533,7 +847,8 @@ launch_pd_server() {
             cmd+=(
                 --disaggregation-decode-enable-offload-kvcache
                 --hicache-size "$HICACHE_SIZE"
-                --hicache-mem-layout page_first
+                --hicache-io-backend "$HICACHE_IO_BACKEND"
+                --hicache-mem-layout "$_hicache_mem_layout"
             )
         fi
         if bool_is_true "$ENABLE_UMBP"; then
@@ -542,11 +857,36 @@ launch_pd_server() {
             cmd+=(
                 --hicache-storage-backend umbp
                 --hicache-storage-backend-extra-config "$extra_config"
+                --hicache-storage-prefetch-policy "$HICACHE_STORAGE_PREFETCH_POLICY"
             )
         fi
     fi
 
-    "${cmd[@]}"
+    # Append any extra args forwarded from EXTRA_SERVER_ARGS env (safe under
+    # `set -u` even when the array is empty).
+    if bool_is_true "$USE_DUMMY_WEIGHTS"; then
+        cmd+=(--load-format dummy)
+    else
+        cmd+=(--load-format auto)
+    fi
+    cmd+=(${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"})
+
+    if bool_is_true "$ENABLE_KV_EVENTS"; then
+        cmd+=(--kv-events-config "{\"publisher\": \"${KV_EVENTS_PUBLISHER}\", \"endpoint\": \"${KV_EVENTS_ENDPOINT}\", \"topic\": \"${KV_EVENTS_TOPIC}\"}")
+    fi
+
+    local -a launch_env=()
+    if bool_is_true "$ENABLE_UMBP"; then
+        if [[ -z "${SGLANG_UMBP_TAGS:-}" ]] && [[ "$role" == "prefill" || "$role" == "decode" ]]; then
+            launch_env+=(SGLANG_UMBP_TAGS="sgl_role=${role}")
+        fi
+    fi
+
+    if (( ${#launch_env[@]} > 0 )); then
+        env "${launch_env[@]}" "${cmd[@]}"
+    else
+        "${cmd[@]}"
+    fi
 }
 
 # ---- Determine cache tier label -----------------------------
@@ -564,7 +904,7 @@ cache_tier_label() {
 trap 'kill_router; kill_server; kill_master; exit 130' INT TERM
 
 CACHE_LABEL="$(cache_tier_label)"
-CASE_TAG="pd_${PD_ROLE}_${CACHE_LABEL}"
+CASE_TAG="pd_${PD_ROLE}_${CACHE_LABEL}_${SERVING_MODE}"
 
 mkdir -p "$RESULTS_DIR"
 SUMMARY_FILE="${RESULTS_DIR}/summary.txt"
@@ -572,18 +912,32 @@ SUMMARY_FILE="${RESULTS_DIR}/summary.txt"
 log "======================================================"
 log "PD Disaggregation Benchmark (${PD_ROLE})"
 log "  Model:       $MODEL_PATH"
+log "  Serving mode: $SERVING_MODE"
 log "  TP:          $TP_SIZE"
-log "  DP:          $DP_SIZE"
-log "  MoE A2A:     $MOE_A2A_BACKEND"
+if [[ "$SERVING_MODE" == "dp8ep8" ]]; then
+    log "  DP:          $DP_SIZE"
+    log "  MoE A2A:     $MOE_A2A_BACKEND"
+fi
 log "  KV dtype:    ${KV_CACHE_DTYPE:-auto}"
 log "  Disagg mode: $PD_ROLE"
 log "  Transfer:    $DISAGG_TRANSFER_BACKEND"
 if [[ "$PD_ROLE" == "prefill" ]]; then
     log "  Bootstrap:   $DISAGG_BOOTSTRAP_PORT"
     log "  Bind:        ${PREFILL_HOST}:${PREFILL_PORT}"
+    log "  Chunked pf:  ${CHUNKED_PREFILL_SIZE:-auto}"
 else
     log "  Bind:        ${DECODE_HOST}:${DECODE_PORT}"
-    log "  Prefill URL: ${PREFILL_URL:-<not set>}"
+    if [[ -z "$PREFILL_URLS" ]]; then
+        log "  Prefill URLs: <not set>"
+    else
+        # Word-split in a subshell so set -e / outer $@ are untouched.
+        _count=$(set -- $PREFILL_URLS; echo $#)
+        log "  Prefill URLs: ${_count} node(s)"
+        for url in $PREFILL_URLS; do
+            log "    - $url (bootstrap=${DISAGG_BOOTSTRAP_PORT})"
+        done
+        unset _count
+    fi
     log "  Router:      $(bool_is_true "$ENABLE_ROUTER" && echo "enabled (port $ROUTER_PORT)" || echo "disabled")"
     log "  Max running: $MAX_RUNNING_REQUESTS"
 fi
@@ -595,12 +949,19 @@ if bool_is_true "$ENABLE_HICACHE"; then
         log "  Cache mode:  decode offload (disaggregation-decode-enable-offload-kvcache)"
     fi
     log "  L2 size:     ${HICACHE_SIZE} GB/rank"
+    log "  L2 IO:       ${HICACHE_IO_BACKEND}"
+    if bool_is_true "$SGLANG_HICACHE_HOST_HUGEPAGE"; then
+        log "  L2 backing:  AnonymousHugetlb ($((SGLANG_HICACHE_HOST_HUGEPAGE_SIZE/1024/1024)) MiB pages, prefault=$(bool_is_true "$SGLANG_HICACHE_HOST_PREFAULT" && echo on || echo off), numa_node=${SGLANG_HICACHE_HOST_NUMA_NODE:-default})"
+    else
+        log "  L2 backing:  Anonymous (4 KiB pages — hugepage backing disabled)"
+    fi
 fi
 if bool_is_true "$ENABLE_UMBP"; then
-    log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
+    log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank (hugepages=$(bool_is_true "$UMBP_DRAM_USE_HUGEPAGES" && echo on || echo off))"
     log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
     log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    log "  L3 prefetch: ${HICACHE_STORAGE_PREFETCH_POLICY}"
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         log "  SPDK:        pci=${UMBP_SPDK_NVME_PCI:-auto}, auto_start=${UMBP_SPDK_PROXY_AUTO_START}"
     fi
     if [[ -n "$UMBP_MASTER_ADDRESS" ]]; then
@@ -628,7 +989,11 @@ log "======================================================"
 {
     echo "PD Disaggregation Benchmark (${PD_ROLE})"
     echo "Started: $(date)"
-    echo "Model: $MODEL_PATH  TP: $TP_SIZE  DP: $DP_SIZE  MoE: $MOE_A2A_BACKEND"
+    if [[ "$SERVING_MODE" == "dp8ep8" ]]; then
+        echo "Model: $MODEL_PATH  TP: $TP_SIZE  DP: $DP_SIZE  MoE: $MOE_A2A_BACKEND  Mode: $SERVING_MODE"
+    else
+        echo "Model: $MODEL_PATH  TP: $TP_SIZE  Mode: $SERVING_MODE"
+    fi
     echo "Disagg: mode=${PD_ROLE} transfer=${DISAGG_TRANSFER_BACKEND}"
     echo "Cache: ${CACHE_LABEL}"
     if bool_is_true "$ENABLE_HICACHE"; then
@@ -645,6 +1010,15 @@ log "======================================================"
 
 # ---- Cleanup before start ----------------------------------
 kill_server
+
+# Reserve hugepages for L2 BEFORE launching the server so a shortage is caught
+# early and surfaced as a clear sysctl recommendation rather than a silent
+# fallback to 4 KiB anon pages inside the server's startup logs.
+if ! ensure_hugepages; then
+    echo "FAILED (hugepage reservation insufficient — see log)" >> "$SUMMARY_FILE"
+    kill_master
+    exit 1
+fi
 
 if bool_is_true "$ENABLE_UMBP"; then
     log "Cleaning UMBP SSD dir: $UMBP_SSD_DIR"
@@ -697,24 +1071,65 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     mkdir -p "$CASE_DIR"
     SERVER_LOG="${CASE_DIR}/server_decode.log"
 
-    # Validate PREFILL_URL
-    if [[ -z "$PREFILL_URL" ]]; then
-        log "ERROR: PREFILL_URL must be set for decode node (e.g. PREFILL_URL=http://10.0.0.1:30000)"
+    # Validate PREFILL_URLS (decode role only).
+    if [[ -z "$PREFILL_URLS" ]]; then
+        log "ERROR: PREFILL_URLS (or PREFILL_URL) must be set for decode node"
+        log "  e.g. PREFILL_URLS=\"http://10.0.0.1:30000 http://10.0.0.2:30000\""
+        exit 1
+    fi
+    # Reject comma-separated form up front; the router would otherwise see
+    # one bogus URL and fail with a confusing connection error.
+    if [[ "$PREFILL_URLS" == *","* ]]; then
+        log "ERROR: PREFILL_URLS must be SPACE-separated, got commas: '$PREFILL_URLS'"
+        log "  Correct form: PREFILL_URLS=\"http://p1:30000 http://p2:30000\""
+        exit 1
+    fi
+    # Parse into array. `|| true` shields `read`'s EOF non-zero from set -e.
+    read -r -a PREFILL_URLS_ARR <<< "$PREFILL_URLS" || true
+    if (( ${#PREFILL_URLS_ARR[@]} == 0 )); then
+        log "ERROR: PREFILL_URLS parsed to 0 entries: '$PREFILL_URLS'"
         exit 1
     fi
 
-    # Extract prefill host/port from URL for TCP check
-    PREFILL_CHECK_HOST="$(echo "$PREFILL_URL" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
-    PREFILL_CHECK_PORT="$(echo "$PREFILL_URL" | sed -E 's|.*:([0-9]+).*|\1|')"
+    # Probe all prefill servers in parallel so wall-clock is max(timeout)
+    # instead of sum(timeout). Failures are collected via tmp marker files
+    # because subshell exit codes are unreliable under set -e.
+    # Set SKIP_PREFILL_PROBE=true to skip this wait and let decode start
+    # immediately (prefill availability is enforced later by
+    # SGLANG_DISAGGREGATION_WAITING_TIMEOUT during actual inference).
+    if bool_is_true "${SKIP_PREFILL_PROBE:-false}"; then
+        log "Skipping prefill probe (SKIP_PREFILL_PROBE=true); decode will start immediately."
+    else
+        log "Probing ${#PREFILL_URLS_ARR[@]} prefill server(s) in parallel..."
+        _probe_dir="$(mktemp -d)"
+        declare -a _probe_pids=()
+        for url in "${PREFILL_URLS_ARR[@]}"; do
+            host="$(echo "$url" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
+            port="$(echo "$url" | sed -E 's|.*:([0-9]+).*|\1|')"
+            (
+                if wait_for_tcp "$host" "$port" "$PREFILL_WAIT_TIMEOUT" "Prefill ${url}"; then
+                    :
+                else
+                    # Sanitize url to a safe filename.
+                    echo "$url" > "${_probe_dir}/$(echo "$url" | tr '/:' '__').fail"
+                fi
+            ) &
+            _probe_pids+=( "$!" )
+        done
+        for pid in "${_probe_pids[@]}"; do wait "$pid" || true; done
 
-    log "Waiting for prefill server at ${PREFILL_CHECK_HOST}:${PREFILL_CHECK_PORT}..."
-    if ! wait_for_tcp "$PREFILL_CHECK_HOST" "$PREFILL_CHECK_PORT" "$PREFILL_WAIT_TIMEOUT" "Prefill server"; then
-        log "FATAL: Prefill server not reachable. Start prefill node first."
-        echo "FAILED (prefill not reachable)" >> "$SUMMARY_FILE"
-        kill_master
-        exit 1
+        if compgen -G "${_probe_dir}/*.fail" > /dev/null; then
+            for f in "${_probe_dir}"/*.fail; do
+                log "FATAL: Prefill $(cat "$f") not reachable."
+                echo "FAILED (prefill $(cat "$f") not reachable)" >> "$SUMMARY_FILE"
+            done
+            rm -rf "$_probe_dir"
+            kill_master
+            exit 1
+        fi
+        rm -rf "$_probe_dir"
+        log "All ${#PREFILL_URLS_ARR[@]} prefill server(s) reachable."
     fi
-    log "Prefill server is reachable."
 
     log "Launching decode server..."
     launch_pd_server decode "$DECODE_HOST" "$DECODE_PORT" \
@@ -730,6 +1145,8 @@ if [[ "$PD_ROLE" == "decode" ]]; then
         exit 1
     fi
 
+    wait_for_decode_fired_up "$SERVER_LOG"
+
     # Determine benchmark target port
     BENCH_PORT="$DECODE_PORT"
 
@@ -737,13 +1154,27 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     if bool_is_true "$ENABLE_ROUTER"; then
         ROUTER_LOG="${CASE_DIR}/router.log"
         log "Launching router at ${ROUTER_HOST}:${ROUTER_PORT}..."
-        python -m sglang_router.launch_router \
-            --pd-disaggregation \
-            --prefill "$PREFILL_URL" "$DISAGG_BOOTSTRAP_PORT" \
-            --decode "http://localhost:${DECODE_PORT}" \
-            --host "$ROUTER_HOST" \
-            --port "$ROUTER_PORT" \
-            > "$ROUTER_LOG" 2>&1 &
+        # Health check tuning: default timeout=5s fails under high-concurrency
+        # stress because prefill's uvicorn /health shares its event loop with
+        # /generate (which is running 2048-token forwards).  Bump timeout to
+        # 120s and failure threshold to 20 so legitimate slow health responses
+        # aren't treated as the worker being dead.  Tunable via env.
+        # Build router command as an array so we can fan out one --prefill
+        # per entry of PREFILL_URLS_ARR (xP1D). All prefills share the same
+        # DISAGG_BOOTSTRAP_PORT (different hosts, no port collision).
+        router_cmd=( python -m sglang_router.launch_router --pd-disaggregation )
+        for url in "${PREFILL_URLS_ARR[@]}"; do
+            router_cmd+=( --prefill "$url" "$DISAGG_BOOTSTRAP_PORT" )
+        done
+        router_cmd+=(
+            --decode "http://localhost:${DECODE_PORT}"
+            --host "$ROUTER_HOST"
+            --port "$ROUTER_PORT"
+            --health-check-timeout-secs "${ROUTER_HEALTH_TIMEOUT_SECS:-120}"
+            --health-check-interval-secs "${ROUTER_HEALTH_INTERVAL_SECS:-60}"
+            --health-failure-threshold "${ROUTER_HEALTH_FAILURE_THRESHOLD:-20}"
+        )
+        "${router_cmd[@]}" > "$ROUTER_LOG" 2>&1 &
         ROUTER_PID=$!
         log "Router PID: $ROUTER_PID"
 
@@ -758,53 +1189,60 @@ if [[ "$PD_ROLE" == "decode" ]]; then
         fi
     fi
 
-    # Run benchmark
-    CASE_START=$(date +%s)
-    SERVER_CRASHED=false
+    if bool_is_true "$RUN_BENCHMARK"; then
+        # Run benchmark
+        CASE_START=$(date +%s)
+        SERVER_CRASHED=false
 
-    run_benchmark "$CASE_DIR" "$CASE_TAG" "$BENCH_PORT" &
-    BENCH_PID=$!
+        run_benchmark "$CASE_DIR" "$CASE_TAG" "$BENCH_PORT" &
+        BENCH_PID=$!
 
-    while kill -0 "$BENCH_PID" 2>/dev/null; do
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            log "ERROR: Decode server crashed during benchmark! Aborting..."
-            SERVER_CRASHED=true
-            pkill -TERM -P "$BENCH_PID" 2>/dev/null || true
-            kill -TERM "$BENCH_PID" 2>/dev/null || true
-            sleep 3
-            pkill -9 -P "$BENCH_PID" 2>/dev/null || true
-            kill -9 "$BENCH_PID" 2>/dev/null || true
-            break
+        while kill -0 "$BENCH_PID" 2>/dev/null; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                log "ERROR: Decode server crashed during benchmark! Aborting..."
+                SERVER_CRASHED=true
+                pkill -TERM -P "$BENCH_PID" 2>/dev/null || true
+                kill -TERM "$BENCH_PID" 2>/dev/null || true
+                sleep 3
+                pkill -9 -P "$BENCH_PID" 2>/dev/null || true
+                kill -9 "$BENCH_PID" 2>/dev/null || true
+                break
+            fi
+            sleep 10
+        done
+
+        BENCH_RC=0
+        wait "$BENCH_PID" 2>/dev/null || BENCH_RC=$?
+        CASE_END=$(date +%s)
+        CASE_ELAPSED=$(( CASE_END - CASE_START ))
+
+        if $SERVER_CRASHED; then
+            log "ERROR: Benchmark aborted — decode server crashed (${CASE_ELAPSED}s)."
+            echo "${CASE_TAG}: SERVER_CRASH (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        elif (( BENCH_RC == 0 )); then
+            log "Benchmark completed in ${CASE_ELAPSED}s."
+            echo "${CASE_TAG}: PASSED (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        elif (( BENCH_RC == 124 )); then
+            log "WARNING: Benchmark timed out after ${BENCHMARK_TIMEOUT}s (ran ${CASE_ELAPSED}s)."
+            echo "${CASE_TAG}: TIMEOUT (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        else
+            log "WARNING: Benchmark exited with code ${BENCH_RC} (${CASE_ELAPSED}s)."
+            echo "${CASE_TAG}: ERROR rc=${BENCH_RC} (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
         fi
-        sleep 10
-    done
 
-    BENCH_RC=0
-    wait "$BENCH_PID" 2>/dev/null || BENCH_RC=$?
-    CASE_END=$(date +%s)
-    CASE_ELAPSED=$(( CASE_END - CASE_START ))
+        # Cleanup
+        kill_router
+        kill_server
 
-    if $SERVER_CRASHED; then
-        log "ERROR: Benchmark aborted — decode server crashed (${CASE_ELAPSED}s)."
-        echo "${CASE_TAG}: SERVER_CRASH (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
-    elif (( BENCH_RC == 0 )); then
-        log "Benchmark completed in ${CASE_ELAPSED}s."
-        echo "${CASE_TAG}: PASSED (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
-    elif (( BENCH_RC == 124 )); then
-        log "WARNING: Benchmark timed out after ${BENCHMARK_TIMEOUT}s (ran ${CASE_ELAPSED}s)."
-        echo "${CASE_TAG}: TIMEOUT (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
+        if bool_is_true "$ENABLE_UMBP"; then
+            log "Cleaning UMBP SSD dir after benchmark."
+            clean_ssd_dir
+        fi
     else
-        log "WARNING: Benchmark exited with code ${BENCH_RC} (${CASE_ELAPSED}s)."
-        echo "${CASE_TAG}: ERROR rc=${BENCH_RC} (${CASE_ELAPSED}s)" >> "$SUMMARY_FILE"
-    fi
-
-    # Cleanup
-    kill_router
-    kill_server
-
-    if bool_is_true "$ENABLE_UMBP"; then
-        log "Cleaning UMBP SSD dir after benchmark."
-        clean_ssd_dir
+        log "RUN_BENCHMARK=false — decode server and router running. Waiting (send SIGTERM to stop)."
+        log "Router: ${ROUTER_HOST}:${BENCH_PORT}  Decode server: localhost:${DECODE_PORT}"
+        log "Results dir: ${CASE_DIR}"
+        wait "$SERVER_PID" || true
     fi
 
     {

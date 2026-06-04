@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -48,8 +49,20 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def drain_pending_storage_acks(tree_cache, deadline_seconds: float = 5.0) -> bool:
+    """Pump HiCache bookkeeping until storage-side queues become idle."""
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        tree_cache.writing_check()
+        tree_cache._drain_storage_control_queues_local()
+        if tree_cache.is_storage_idle():
+            return True
+        time.sleep(0.05)
+    return tree_cache.is_storage_idle()
+
+
 class LayerLoadingEvent:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, enable_critical_path: bool = False):
         self._num_layers = num_layers
         self.load_events = [
             device_module.Event(enable_timing=(i == num_layers - 1))
@@ -57,32 +70,82 @@ class LayerLoadingEvent:
         ]
         self.start_event = device_module.Event(enable_timing=True)
 
+        self._enable_critical_path = enable_critical_path
+        if enable_critical_path:
+            self._waited = [False] * num_layers
+            self._pre_wait_events = [
+                device_module.Event(enable_timing=True) for _ in range(num_layers)
+            ]
+            self._post_wait_events = [
+                device_module.Event(enable_timing=True) for _ in range(num_layers)
+            ]
+            self._all_waits_recorded = device_module.Event()
+            self._has_waits = False
+        else:
+            self._waited = None
+
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        device_module.current_stream().wait_event(self.load_events[layer_index])
+        if self._waited is not None and not self._waited[layer_index]:
+            self._waited[layer_index] = True
+            self._has_waits = True
+            self._pre_wait_events[layer_index].record()
+            device_module.current_stream().wait_event(self.load_events[layer_index])
+            self._post_wait_events[layer_index].record()
+            self._all_waits_recorded.record()
+        else:
+            device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
         return self.load_events[-1]
 
+    def critical_path_ready(self) -> bool:
+        if not self._enable_critical_path or not self._has_waits:
+            return False
+        return self._all_waits_recorded.query()
+
+    def get_critical_path_ms(self) -> float:
+        if not self._enable_critical_path:
+            return 0.0
+        total_ms = 0.0
+        for i in range(self._num_layers):
+            if self._waited[i]:
+                elapsed = self._pre_wait_events[i].elapsed_time(
+                    self._post_wait_events[i]
+                )
+                if elapsed > 0:
+                    total_ms += elapsed
+        return total_ms
+
+    def reset_critical_path(self):
+        if self._enable_critical_path:
+            for i in range(self._num_layers):
+                self._waited[i] = False
+            self._has_waits = False
+
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, enable_critical_path: bool = False):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        self.events = [
+            LayerLoadingEvent(num_layers, enable_critical_path)
+            for _ in range(self.num_counters)
+        ]
         self.producer_index = -1
         self.consumer_index = -1
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        ev = self.events[self.producer_index].finish_event
-        if not ev.query():
-            ev.synchronize()
+        ev = self.events[self.producer_index]
+        if not ev.finish_event.query():
+            ev.finish_event.synchronize()
+        ev.reset_critical_path()
         return self.producer_index
 
     def set_consumer(self, index: int):
@@ -228,6 +291,27 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        # Per-stage timestamps for breaking down where prefetch time goes.
+        # Each is set by the worker that begins/ends that stage; None means
+        # the op never reached that stage (e.g. revoked, or scheduler
+        # terminated before IO started under timeout policy).
+        # Stage timeline:
+        #   start_time → hit_query_start → hit_query_done →
+        #   io_start → complete_time
+        self.hit_query_start_time: Optional[float] = None
+        self.hit_query_done_time: Optional[float] = None
+        self.io_start_time: Optional[float] = None
+        # Set by the IO aux thread once _page_transfer finishes (success or
+        # early break). Used together with start_time to report the total
+        # async L3 prefetch duration. None means the transfer hasn't completed
+        # yet — terminate_time is used as a fallback in that case.
+        self.complete_time: Optional[float] = None
+        # Set by the scheduler the first time check_prefetch_progress sees
+        # this op as not-yet-terminable. The delta between this and the
+        # terminate timestamp is the scheduler-observed critical-path wait
+        # (i.e. the part of the prefetch that wasn't overlapped with other
+        # work). Stays None when the very first poll already terminates.
+        self.first_poll_time: Optional[float] = None
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -263,6 +347,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_critical_path: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -281,6 +366,7 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self._enable_critical_path = enable_critical_path
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -294,7 +380,9 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.layer_done_counter = LayerDoneCounter(
+            self.layer_num, enable_critical_path=enable_critical_path
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -308,6 +396,7 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
+        self.ack_load_critical_path: List[Optional[LayerLoadingEvent]] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.stop_event = threading.Event()
@@ -632,6 +721,7 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+        self.ack_load_critical_path.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -775,6 +865,9 @@ class HiCacheController:
                 num_tokens=len(device_indices),
             )
         )
+        self.ack_load_critical_path.append(
+            producer_event if self._enable_critical_path else None
+        )
         return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
@@ -887,7 +980,9 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                operation.io_start_time = time.monotonic()
                 self._page_transfer(operation)
+                operation.complete_time = time.monotonic()
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -900,8 +995,8 @@ class HiCacheController:
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         # cancel prefetch if too much memory is occupied
-        if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
-            return True
+        # if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+        #     return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
@@ -951,6 +1046,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                operation.hit_query_start_time = time.monotonic()
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -963,6 +1059,7 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
+                operation.hit_query_done_time = time.monotonic()
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)

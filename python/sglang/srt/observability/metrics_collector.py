@@ -434,6 +434,18 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
         )
+        self.kv_mori_rdma_latency_ms = Histogram(
+            name="sglang:kv_mori_rdma_latency_ms",
+            documentation="Histogram of mori-io RDMA transfer latency in ms (last chunk issue to all statuses complete), labeled per decode endpoint for P-D pair visibility.",
+            labelnames=list(labels.keys()) + ["decode_endpoint"],
+            buckets=(0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
+        )
+        self.kv_mori_rdma_speed_gb_s = Histogram(
+            name="sglang:kv_mori_rdma_speed_gb_s",
+            documentation="Histogram of mori-io RDMA transfer speed in GB/s (last chunk bytes / tail latency), labeled per decode endpoint for P-D pair visibility.",
+            labelnames=list(labels.keys()) + ["decode_endpoint"],
+            buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
+        )
 
         # Utilization
         self.utilization = Gauge(
@@ -871,6 +883,16 @@ class SchedulerMetricsCollector:
     ) -> None:
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
+
+    def observe_kv_mori_rdma_metrics(
+        self,
+        rdma_latency_ms: float,
+        rdma_speed_gb_s: float,
+        decode_endpoint: str,
+    ) -> None:
+        labels = {**self.labels, "decode_endpoint": decode_endpoint}
+        self.kv_mori_rdma_latency_ms.labels(**labels).observe(rdma_latency_ms)
+        self.kv_mori_rdma_speed_gb_s.labels(**labels).observe(rdma_speed_gb_s)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -1513,6 +1535,120 @@ class StorageMetricsCollector:
             buckets=bucket_bandwidth,
         )
 
+        bucket_prefetch_duration = [
+            0.0005,
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+        ]
+
+        self.prefetch_duration_seconds = Histogram(
+            name="sglang:prefetch_duration_seconds",
+            documentation=(
+                "Total async L3 prefetch duration in seconds: time from "
+                "PrefetchOperation enqueue (cache_controller.prefetch) to the "
+                "IO aux thread finishing _page_transfer. Recorded only for "
+                "wait_complete and timeout policies, where the scheduler "
+                "polls until completion is observed. Not emitted under "
+                "best_effort (the scheduler terminates on the first poll "
+                "while the transfer is still in flight, so we have no "
+                "scheduler-side signal for true completion)."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_duration,
+        )
+
+        self.prefetch_critical_path_seconds = Histogram(
+            name="sglang:prefetch_critical_path_seconds",
+            documentation=(
+                "Unoverlapped L3 prefetch tail in seconds: the part of the "
+                "async prefetch that ran after the scheduler first observed "
+                "the op as not-yet-terminable. Anchored on the same end "
+                "(complete_time) as prefetch_duration_seconds, so it is "
+                "always <= total duration. Always 0 under best_effort (the "
+                "scheduler terminates immediately, so first_poll_time is "
+                "never set); meaningful under wait_complete and timeout."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_duration,
+        )
+
+        cp_stage_doc_suffix = (
+            " Portion of the unoverlapped critical path (first_poll → "
+            "complete_time) spent in this stage. The four prefetch_cp_*_seconds "
+            "series sum to prefetch_critical_path_seconds, so stacking them as "
+            "rates gives the per-stage share of the critical path. Always 0 "
+            "under best_effort."
+        )
+
+        self.prefetch_cp_queue_wait_seconds = Histogram(
+            name="sglang:prefetch_cp_queue_wait_seconds",
+            documentation=(
+                "Time the PrefetchOperation sat in cache_controller.prefetch_queue "
+                "waiting for prefetch_thread_func to dequeue it."
+                + cp_stage_doc_suffix
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_duration,
+        )
+
+        self.prefetch_cp_hit_query_seconds = Histogram(
+            name="sglang:prefetch_cp_hit_query_seconds",
+            documentation=(
+                "Time spent in _storage_hit_query (hash compute + "
+                "storage_backend.batch_exists + TP all_reduce on hit count)."
+                + cp_stage_doc_suffix
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_duration,
+        )
+
+        self.prefetch_cp_io_queue_wait_seconds = Histogram(
+            name="sglang:prefetch_cp_io_queue_wait_seconds",
+            documentation=(
+                "Time the op sat in cache_controller.prefetch_buffer between "
+                "the lookup thread and prefetch_io_aux_thread."
+                + cp_stage_doc_suffix
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_duration,
+        )
+
+        self.prefetch_cp_io_transfer_seconds = Histogram(
+            name="sglang:prefetch_cp_io_transfer_seconds",
+            documentation=(
+                "Time spent in _page_transfer (batched storage_backend.batch_get "
+                "calls + any host-side memcpy in the generic path)."
+                + cp_stage_doc_suffix
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_duration,
+        )
+
+        self.prefetch_critical_path_bandwidth = Histogram(
+            name="sglang:prefetch_critical_path_bandwidth",
+            documentation=(
+                "Prefetched bytes divided by the unoverlapped critical-path "
+                "duration, in GB/s. Upper-bound on effective L3 throughput "
+                "seen by the scheduler: critical_path starts at first_poll "
+                "(possibly after I/O began) and ends at complete_time, so "
+                "this can exceed true backend bandwidth. Only emitted when "
+                "critical_path > 0 (i.e. scheduler actually blocked on the "
+                "prefetch); always skipped under best_effort."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth,
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1528,6 +1664,47 @@ class StorageMetricsCollector:
     def log_backuped_bytes(self, backuped_bytes: int):
         if backuped_bytes > 0:
             self.backuped_bytes_total.labels(**self.labels).inc(backuped_bytes)
+
+    def log_prefetch_duration(self, duration_seconds: float):
+        if duration_seconds >= 0:
+            self.prefetch_duration_seconds.labels(**self.labels).observe(
+                duration_seconds
+            )
+
+    def log_prefetch_critical_path(self, duration_seconds: float):
+        if duration_seconds >= 0:
+            self.prefetch_critical_path_seconds.labels(**self.labels).observe(
+                duration_seconds
+            )
+
+    def log_prefetch_critical_path_bandwidth(self, bandwidth_gb_s: float):
+        if bandwidth_gb_s > 0:
+            self.prefetch_critical_path_bandwidth.labels(**self.labels).observe(
+                bandwidth_gb_s
+            )
+
+    def log_prefetch_cp_stage_breakdown(
+        self,
+        queue_wait_seconds: float,
+        hit_query_seconds: float,
+        io_queue_wait_seconds: float,
+        io_transfer_seconds: float,
+    ):
+        # Always observe (even zeros) so the four stage histograms have the
+        # same _count as prefetch_critical_path_seconds and stack cleanly as
+        # rate(sum) ratios in Grafana.
+        self.prefetch_cp_queue_wait_seconds.labels(**self.labels).observe(
+            max(0.0, queue_wait_seconds)
+        )
+        self.prefetch_cp_hit_query_seconds.labels(**self.labels).observe(
+            max(0.0, hit_query_seconds)
+        )
+        self.prefetch_cp_io_queue_wait_seconds.labels(**self.labels).observe(
+            max(0.0, io_queue_wait_seconds)
+        )
+        self.prefetch_cp_io_transfer_seconds.labels(**self.labels).observe(
+            max(0.0, io_transfer_seconds)
+        )
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -1735,6 +1912,16 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth_gb_s,
         )
+        self.load_back_critical_path_seconds = Histogram(
+            name="sglang:load_back_critical_path_seconds",
+            documentation=(
+                "L2→L1 load-back critical-path latency in seconds: "
+                "the sum of per-layer forward-stream stalls waiting for "
+                "host→GPU transfer (not overlapped with compute)."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
@@ -1765,3 +1952,8 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
         self.load_back_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
+
+    def observe_load_back_critical_path(self, duration_seconds: float) -> None:
+        self.load_back_critical_path_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )

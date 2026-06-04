@@ -1556,8 +1556,11 @@ class HiMambaRadixCache(MambaRadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            if operation.first_poll_time is None:
+                operation.first_poll_time = time.monotonic()
             return False
 
+        terminate_time = time.monotonic()
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
@@ -1598,6 +1601,19 @@ class HiMambaRadixCache(MambaRadixCache):
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+            end_time = operation.complete_time or terminate_time
+            # See HiRadixCache.check_prefetch_progress for the policy gating
+            # rationale — total duration is only meaningful when the scheduler
+            # actually waits for completion.
+            if self.prefetch_stop_policy != "best_effort":
+                self.storage_metrics_collector.log_prefetch_duration(
+                    max(0.0, end_time - operation.start_time)
+                )
+            if operation.first_poll_time is not None:
+                critical_path = max(0.0, end_time - operation.first_poll_time)
+            else:
+                critical_path = 0.0
+            self.storage_metrics_collector.log_prefetch_critical_path(critical_path)
 
         return True
 

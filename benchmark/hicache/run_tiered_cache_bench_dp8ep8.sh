@@ -36,9 +36,16 @@ UMBP_SSD_DIR="${UMBP_SSD_DIR:-/tmp/umbp_ssd}"
 UMBP_SSD_DURABILITY_MODE="${UMBP_SSD_DURABILITY_MODE:-relaxed}"
 UMBP_COPY_TO_SSD_ASYNC="${UMBP_COPY_TO_SSD_ASYNC:-true}"
 UMBP_SSD_WRITER_THREADS="${UMBP_SSD_WRITER_THREADS:-4}"
+UMBP_SSD_IO_BACKEND="${UMBP_SSD_IO_BACKEND:-io_uring}"  # SSD file I/O: posix|io_uring
+case "$UMBP_SSD_IO_BACKEND" in
+    posix|io_uring) ;;
+    *)
+        echo "ERROR: UMBP_SSD_IO_BACKEND must be one of posix|io_uring, got '$UMBP_SSD_IO_BACKEND'"
+        exit 1 ;;
+esac
 
 # SPDK backend (set UMBP_SSD_BACKEND=spdk_proxy to enable)
-UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"          # posix | spdk_proxy
+UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-file}"           # file | spdk_proxy
 UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-}"           # e.g. 0000:89:00.0
 UMBP_SPDK_PROXY_AUTO_START="${UMBP_SPDK_PROXY_AUTO_START:-true}"
 UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS="${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS:-60000}"
@@ -60,6 +67,11 @@ MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 DUMMY_FORWARD="${DUMMY_FORWARD:-}"
 
+# Extra args forwarded verbatim to sglang.launch_server for all cases.  Split
+# on whitespace so flag+value pairs stay together (e.g.
+# EXTRA_SERVER_ARGS="--max-total-tokens 20000").
+read -r -a EXTRA_SERVER_ARGS_ARR <<< "${EXTRA_SERVER_ARGS:-}"
+
 # ---- Derived paths ------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -70,8 +82,28 @@ export PYTHONPATH
 export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=6G
 
+# ---- Ephemeral port range guard -----------------------------
+# UMBP IOEngine and PeerService bind to fixed ports (default 18080-18087
+# and 19080-19087).  If the kernel's ip_local_port_range overlaps these
+# ports, an outbound TCP connection (Gloo, NCCL, gRPC) may grab one of
+# them as an ephemeral source port before IOEngine/PeerService binds,
+# causing EADDRINUSE and crashing the child process.
+#
+# Push the ephemeral range above 32768 to avoid collisions.
+_ensure_ephemeral_port_range() {
+    local lo hi
+    read -r lo hi < /proc/sys/net/ipv4/ip_local_port_range
+    if (( lo < 32768 )); then
+        log "WARNING: ip_local_port_range starts at $lo (< 32768), raising to 32768-$hi to avoid UMBP port collisions"
+        if ! echo "32768 $hi" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
+            log "WARNING: cannot write to /proc/sys/net/ipv4/ip_local_port_range (not root?). Fixed-port UMBP services may hit EADDRINUSE."
+        fi
+    fi
+}
 # ---- Helpers ------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+_ensure_ephemeral_port_range
 
 bool_is_true() {
     local v="${1:-}"
@@ -269,21 +301,44 @@ wait_for_port_free() {
     local max_wait=60
     local elapsed=0
     local pids
+
+    # Collect all ports that must be free: HTTP port + UMBP IO engine
+    # and peer service ports (one per DP rank, auto-incremented from base).
+    local -a ports_to_check=("$PORT")
+    if [[ -n "${UMBP_IO_ENGINE_PORT:-}" ]]; then
+        for i in $(seq 0 $((DP_SIZE - 1))); do
+            ports_to_check+=($((UMBP_IO_ENGINE_PORT + i)))
+        done
+    fi
+    if [[ -n "${UMBP_PEER_SERVICE_PORT:-}" ]]; then
+        for i in $(seq 0 $((DP_SIZE - 1))); do
+            ports_to_check+=($((UMBP_PEER_SERVICE_PORT + i)))
+        done
+    fi
+
     while (( elapsed < max_wait )); do
-        pids=$(lsof -ti :"$PORT" 2>/dev/null || true)
+        pids=""
+        for p in "${ports_to_check[@]}"; do
+            pids+=" $(lsof -ti :"$p" 2>/dev/null || true)"
+        done
+        pids="$(echo "$pids" | xargs)"
         if [[ -z "$pids" ]]; then
             return 0
         fi
         if (( elapsed == 0 )); then
-            log "Waiting for port $PORT to be released (PIDs: $pids)..."
+            log "Waiting for ports to be released (ports: ${ports_to_check[*]}, PIDs: $pids)..."
         fi
         echo "$pids" | xargs kill -9 2>/dev/null || true
         sleep 2
         elapsed=$(( elapsed + 2 ))
     done
-    pids=$(lsof -ti :"$PORT" 2>/dev/null || true)
+    pids=""
+    for p in "${ports_to_check[@]}"; do
+        pids+=" $(lsof -ti :"$p" 2>/dev/null || true)"
+    done
+    pids="$(echo "$pids" | xargs)"
     if [[ -n "$pids" ]]; then
-        log "ERROR: Port $PORT still occupied after ${max_wait}s (PIDs: $pids)"
+        log "ERROR: Ports still occupied after ${max_wait}s (ports: ${ports_to_check[*]}, PIDs: $pids)"
         return 1
     fi
 }
@@ -360,7 +415,7 @@ launch_server_case1() {
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
         --model-path "$MODEL_PATH" \
-        --host 0.0.0.0 \
+        --host 0.0.0.0 --port "$PORT" \
         --tp-size "$TP_SIZE" --page-size "$PAGE_SIZE" \
         "${DP_EP_ARGS[@]}" \
         "$@"
@@ -370,7 +425,7 @@ launch_server_case2() {
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
         --model-path "$MODEL_PATH" \
-        --host 0.0.0.0 \
+        --host 0.0.0.0 --port "$PORT" \
         --tp-size "$TP_SIZE" --page-size "$PAGE_SIZE" \
         "${DP_EP_ARGS[@]}" \
         --enable-hierarchical-cache \
@@ -382,7 +437,7 @@ launch_server_case2() {
 
 launch_server_case3() {
     local spdk_fields=""
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         spdk_fields=", \"ssd_backend\": \"${UMBP_SSD_BACKEND}\""
         [[ -n "$UMBP_SPDK_NVME_PCI" ]] && \
             spdk_fields+=", \"spdk_nvme_pci_addr\": \"${UMBP_SPDK_NVME_PCI}\""
@@ -402,13 +457,38 @@ launch_server_case3() {
         [[ -n "$UMBP_PEER_SERVICE_PORT" ]] && \
             dist_fields+=", \"peer_service_port\": \"${UMBP_PEER_SERVICE_PORT}\""
         dist_fields+=", \"cache_remote_fetches\": ${UMBP_CACHE_REMOTE_FETCHES}"
+        # Optional override for master's PageBitmapAllocator page_size.
+        # When set, takes precedence over UMBPStore's auto-probe (Path A).
+        [[ -n "${UMBP_DRAM_PAGE_SIZE:-}" ]] && \
+            dist_fields+=", \"dram_page_size\": ${UMBP_DRAM_PAGE_SIZE}"
     fi
-    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": true, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    # Auto-disable SSD when capacity is zero so UMBPConfig::Validate() does
+    # not reject the config (ssd_enabled=true requires ssd_capacity_bytes>0).
+    local ssd_enabled_json="true"
+    if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
+        ssd_enabled_json="false"
+    fi
+    # Optional override of the general distributed staging buffer size (bytes).
+    # This buffer is allocated unconditionally for generic remote put/get.
+    local staging_fields=""
+    if [[ -n "${UMBP_STAGING_BYTES:-}" ]]; then
+        staging_fields=", \"staging_buffer_size\": ${UMBP_STAGING_BYTES}"
+    fi
+    # Dedicated SSD read staging (bytes); per-slot = size / ssd_staging_buffer_slots
+    # must be >= one key's page KV (~4.5MB for full DeepSeek-R1). Default 256MiB.
+    if [[ -n "${UMBP_SSD_STAGING_BYTES:-}" ]]; then
+        staging_fields="${staging_fields}, \"ssd_staging_buffer_size\": ${UMBP_SSD_STAGING_BYTES}"
+    fi
+    # SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
+    if [[ -n "${UMBP_SSD_STAGING_SLOTS:-}" ]]; then
+        staging_fields="${staging_fields}, \"ssd_staging_buffer_slots\": ${UMBP_SSD_STAGING_SLOTS}"
+    fi
+    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_io_backend\": \"${UMBP_SSD_IO_BACKEND}\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${staging_fields}}"
 
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
         --model-path "$MODEL_PATH" \
-        --host 0.0.0.0 \
+        --host 0.0.0.0 --port "$PORT" \
         --tp-size "$TP_SIZE" --page-size "$PAGE_SIZE" \
         "${DP_EP_ARGS[@]}" \
         --enable-hierarchical-cache \
@@ -447,8 +527,8 @@ fi
 log "  L2 size:     ${HICACHE_SIZE} GB/rank"
 log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
 log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
-log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
-if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}, io_backend=${UMBP_SSD_IO_BACKEND}"
+if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
 log "  SPDK:        pci=${UMBP_SPDK_NVME_PCI:-auto}, auto_start=${UMBP_SPDK_PROXY_AUTO_START}"
 fi
 if [[ -n "$UMBP_MASTER_ADDRESS" ]]; then
@@ -472,7 +552,7 @@ mkdir -p "$RESULTS_DIR"
     echo "Output length: $OUTPUT_LENGTH  Request rate: $REQUEST_RATE"
     echo "Write policy: $WRITE_POLICY"
     echo "L2: ${HICACHE_SIZE} GB/rank  L3 DRAM: $((UMBP_DRAM_BYTES / 1073741824)) GB/rank  L3 SSD: $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
-    echo "L3 SSD: durability=${UMBP_SSD_DURABILITY_MODE}  async_copy=${UMBP_COPY_TO_SSD_ASYNC}  writer_threads=${UMBP_SSD_WRITER_THREADS}  backend=${UMBP_SSD_BACKEND}"
+    echo "L3 SSD: durability=${UMBP_SSD_DURABILITY_MODE}  async_copy=${UMBP_COPY_TO_SSD_ASYNC}  writer_threads=${UMBP_SSD_WRITER_THREADS}  backend=${UMBP_SSD_BACKEND}  io_backend=${UMBP_SSD_IO_BACKEND}"
     echo ""
 } > "$SUMMARY_FILE"
 
@@ -502,7 +582,7 @@ for entry in "${CASES[@]}"; do
     # 2. Launch server in background
     SERVER_LOG="${CASE_DIR}/server.log"
     log "Launching server for ${CASE_NAME}..."
-    "launch_server_${CASE_ID}" > "$SERVER_LOG" 2>&1 &
+    "launch_server_${CASE_ID}" ${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"} > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     log "Server PID: $SERVER_PID"
 

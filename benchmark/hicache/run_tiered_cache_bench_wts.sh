@@ -40,7 +40,7 @@ UMBP_SSD_WRITER_THREADS="${UMBP_SSD_WRITER_THREADS:-4}"
 # L3_total = 64 + 96 = 160 GB/rank (> L2 128 GB)
 
 # SPDK backend (set UMBP_SSD_BACKEND=spdk_proxy to enable)
-UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"          # posix | spdk_proxy
+UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-file}"           # file | spdk_proxy
 UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-}"           # e.g. 0000:89:00.0
 UMBP_SPDK_PROXY_AUTO_START="${UMBP_SPDK_PROXY_AUTO_START:-true}"
 UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS="${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS:-60000}"
@@ -376,7 +376,7 @@ launch_server_case2() {
 launch_server_case3() {
     # HBM + DRAM + SSD (L1 + L2 + L3 UMBP)
     local spdk_fields=""
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         spdk_fields=", \"ssd_backend\": \"${UMBP_SSD_BACKEND}\""
         [[ -n "$UMBP_SPDK_NVME_PCI" ]] && \
             spdk_fields+=", \"spdk_nvme_pci_addr\": \"${UMBP_SPDK_NVME_PCI}\""
@@ -436,7 +436,7 @@ log "  L2 size:     ${HICACHE_SIZE} GB/rank"
 log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
 log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
 log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
-if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
 log "  SPDK:        pci=${UMBP_SPDK_NVME_PCI:-auto}, auto_start=${UMBP_SPDK_PROXY_AUTO_START}"
 fi
 if [[ -n "$UMBP_MASTER_ADDRESS" ]]; then
