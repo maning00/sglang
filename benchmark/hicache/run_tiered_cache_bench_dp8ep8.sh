@@ -36,9 +36,16 @@ UMBP_SSD_DIR="${UMBP_SSD_DIR:-/tmp/umbp_ssd}"
 UMBP_SSD_DURABILITY_MODE="${UMBP_SSD_DURABILITY_MODE:-relaxed}"
 UMBP_COPY_TO_SSD_ASYNC="${UMBP_COPY_TO_SSD_ASYNC:-true}"
 UMBP_SSD_WRITER_THREADS="${UMBP_SSD_WRITER_THREADS:-4}"
+UMBP_SSD_IO_BACKEND="${UMBP_SSD_IO_BACKEND:-io_uring}"  # SSD file I/O: posix|io_uring
+case "$UMBP_SSD_IO_BACKEND" in
+    posix|io_uring) ;;
+    *)
+        echo "ERROR: UMBP_SSD_IO_BACKEND must be one of posix|io_uring, got '$UMBP_SSD_IO_BACKEND'"
+        exit 1 ;;
+esac
 
 # SPDK backend (set UMBP_SSD_BACKEND=spdk_proxy to enable)
-UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"          # posix | spdk_proxy
+UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-file}"           # file | spdk_proxy
 UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-}"           # e.g. 0000:89:00.0
 UMBP_SPDK_PROXY_AUTO_START="${UMBP_SPDK_PROXY_AUTO_START:-true}"
 UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS="${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS:-60000}"
@@ -430,7 +437,7 @@ launch_server_case2() {
 
 launch_server_case3() {
     local spdk_fields=""
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         spdk_fields=", \"ssd_backend\": \"${UMBP_SSD_BACKEND}\""
         [[ -n "$UMBP_SPDK_NVME_PCI" ]] && \
             spdk_fields+=", \"spdk_nvme_pci_addr\": \"${UMBP_SPDK_NVME_PCI}\""
@@ -476,7 +483,7 @@ launch_server_case3() {
     if [[ -n "${UMBP_SSD_STAGING_SLOTS:-}" ]]; then
         staging_fields="${staging_fields}, \"ssd_staging_buffer_slots\": ${UMBP_SSD_STAGING_SLOTS}"
     fi
-    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${staging_fields}}"
+    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_io_backend\": \"${UMBP_SSD_IO_BACKEND}\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${staging_fields}}"
 
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
@@ -520,8 +527,8 @@ fi
 log "  L2 size:     ${HICACHE_SIZE} GB/rank"
 log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
 log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
-log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
-if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}, io_backend=${UMBP_SSD_IO_BACKEND}"
+if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
 log "  SPDK:        pci=${UMBP_SPDK_NVME_PCI:-auto}, auto_start=${UMBP_SPDK_PROXY_AUTO_START}"
 fi
 if [[ -n "$UMBP_MASTER_ADDRESS" ]]; then
@@ -545,7 +552,7 @@ mkdir -p "$RESULTS_DIR"
     echo "Output length: $OUTPUT_LENGTH  Request rate: $REQUEST_RATE"
     echo "Write policy: $WRITE_POLICY"
     echo "L2: ${HICACHE_SIZE} GB/rank  L3 DRAM: $((UMBP_DRAM_BYTES / 1073741824)) GB/rank  L3 SSD: $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
-    echo "L3 SSD: durability=${UMBP_SSD_DURABILITY_MODE}  async_copy=${UMBP_COPY_TO_SSD_ASYNC}  writer_threads=${UMBP_SSD_WRITER_THREADS}  backend=${UMBP_SSD_BACKEND}"
+    echo "L3 SSD: durability=${UMBP_SSD_DURABILITY_MODE}  async_copy=${UMBP_COPY_TO_SSD_ASYNC}  writer_threads=${UMBP_SSD_WRITER_THREADS}  backend=${UMBP_SSD_BACKEND}  io_backend=${UMBP_SSD_IO_BACKEND}"
     echo ""
 } > "$SUMMARY_FILE"
 

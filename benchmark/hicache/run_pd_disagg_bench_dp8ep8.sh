@@ -225,7 +225,7 @@ UMBP_COPY_TO_SSD_ASYNC="${UMBP_COPY_TO_SSD_ASYNC:-true}"
 UMBP_SSD_WRITER_THREADS="${UMBP_SSD_WRITER_THREADS:-4}"
 
 # SPDK backend
-UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"
+UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-file}"
 UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-}"
 UMBP_SPDK_PROXY_AUTO_START="${UMBP_SPDK_PROXY_AUTO_START:-true}"
 UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS="${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS:-60000}"
@@ -712,7 +712,7 @@ run_benchmark() {
 # ---- Build UMBP extra config JSON ---------------------------
 build_umbp_extra_config() {
     local spdk_fields=""
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         spdk_fields=", \"ssd_backend\": \"${UMBP_SSD_BACKEND}\""
         [[ -n "$UMBP_SPDK_NVME_PCI" ]] && \
             spdk_fields+=", \"spdk_nvme_pci_addr\": \"${UMBP_SPDK_NVME_PCI}\""
@@ -961,7 +961,7 @@ if bool_is_true "$ENABLE_UMBP"; then
     log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
     log "  L3 SSD:      durability=${UMBP_SSD_DURABILITY_MODE}, async_copy=${UMBP_COPY_TO_SSD_ASYNC}, backend=${UMBP_SSD_BACKEND}"
     log "  L3 prefetch: ${HICACHE_STORAGE_PREFETCH_POLICY}"
-    if [[ "$UMBP_SSD_BACKEND" != "posix" ]]; then
+    if [[ "$UMBP_SSD_BACKEND" != "file" ]]; then
         log "  SPDK:        pci=${UMBP_SPDK_NVME_PCI:-auto}, auto_start=${UMBP_SPDK_PROXY_AUTO_START}"
     fi
     if [[ -n "$UMBP_MASTER_ADDRESS" ]]; then
