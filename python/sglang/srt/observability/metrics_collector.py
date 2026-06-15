@@ -1962,6 +1962,36 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        # Per-token device time of the host->device KV gather (load stream).
+        # Unlike load_back_duration_seconds (whole-op host-side wall clock), this
+        # measures the actual gather kernels via a DeviceTimer and is normalized
+        # per token, so its scale is microseconds..milliseconds.
+        bucket_kv_gather_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_KV_GATHER_DURATION"
+        )
+        if bucket_kv_gather_duration is None:
+            bucket_kv_gather_duration = [
+                1e-6,
+                2e-6,
+                5e-6,
+                1e-5,
+                2e-5,
+                5e-5,
+                1e-4,
+                2e-4,
+                5e-4,
+                1e-3,
+                2e-3,
+                5e-3,
+                1e-2,
+            ]
+        self.kv_gather_duration_seconds = Histogram(
+            name="sglang:kv_gather_duration_seconds",
+            documentation="Per-token device time of host->device KV gather (load stream), seconds/token.",
+            labelnames=labels.keys(),
+            buckets=bucket_kv_gather_duration,
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -1973,6 +2003,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_kv_gather_duration(self, seconds_per_token: float) -> None:
+        self.kv_gather_duration_seconds.labels(**self.labels).observe(seconds_per_token)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:

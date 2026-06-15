@@ -189,6 +189,38 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
+        # metrics_collector is created by the base init above; now safe to wire
+        # the host->device gather device timer.
+        self._install_gather_timer()
+
+    def _install_gather_timer(self) -> None:
+        """Publish per-token host->device gather device time.
+
+        Installs a DeviceTimer on the controller's gather loop (reporting
+        kv_gather_duration_seconds) and hands it to the storage backend so a
+        backend that consumes gather timing (e.g. UMBP) can attach a reporter.
+        No-op unless metrics are enabled and the controller supports gather
+        timing.  Idempotent: the timer is created once and re-handed on re-attach.
+        """
+        if self.metrics_collector is None:
+            return
+        controller = self.cache_controller
+        if not hasattr(controller, "gather_timer"):
+            return
+        if getattr(self, "_gather_timer", None) is None:
+            from sglang.srt.utils.device_timer import DeviceTimer
+
+            collector = self.metrics_collector
+            # DeviceTimer reports elapsed time in seconds; normalize per token.
+            self._gather_timer = DeviceTimer(
+                reporter=lambda t, num_tokens: collector.observe_kv_gather_duration(
+                    t / max(num_tokens, 1)
+                )
+            )
+            controller.gather_timer = self._gather_timer
+        if controller.storage_backend is not None:
+            controller.storage_backend.register_gather_timer(self._gather_timer)
+
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -335,6 +367,11 @@ class HiRadixCache(RadixCache):
                     sorted(existing_collector.labels.keys()),
                     sorted(labels.keys()),
                 )
+
+        # Re-wire the gather timer to the (possibly newly attached) storage
+        # backend.  No-op at init (metrics_collector not yet created); the
+        # post-super().__init__ call performs the first install.
+        self._install_gather_timer()
 
     def attach_storage_backend(
         self,

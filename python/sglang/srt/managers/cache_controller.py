@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import nullcontext
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -33,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.utils.device_timer import DeviceTimer
 
 from sglang.srt.distributed import (
     get_pipeline_model_parallel_rank,
@@ -328,6 +330,10 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+
+        # Optional device timer for the gather loop in start_loading(); the
+        # owner installs one to publish kv_gather_duration_seconds. None = off.
+        self.gather_timer: Optional[DeviceTimer] = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -813,23 +819,32 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
+            # Time the gather kernels when a timer is installed; recorded inside
+            # the stream context so the events bracket the gather on the load
+            # stream.
+            gather_cm = (
+                self.gather_timer.wrap({"num_tokens": host_indices.numel()})
+                if self.gather_timer is not None
+                else nullcontext()
+            )
+            with gather_cm:
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
                         host_indices,
                         device_indices,
                         i,
                         self.io_backend,
                     )
-                producer_event.complete(i)
+                    if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
+                    producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.

@@ -23,6 +23,31 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
+# Per-token host->device KV gather cost reported to the UMBP master so
+# GetTierCoeffs can derive c_gather.  The name must match
+# MORI_UMBP_METRIC_CLIENT_KV_GATHER_DURATION in mori's master_metrics.h, and the
+# bounds must be fixed (the master is first-write-wins on bounds).  These mirror
+# the default SGLANG_BUCKET_KV_GATHER_DURATION layout in RadixCacheMetricsCollector.
+KV_GATHER_DURATION_METRIC = "mori_umbp_client_kv_gather_duration_seconds"
+KV_GATHER_DURATION_HELP = (
+    "Per-token device time of host->device KV gather (load stream), seconds/token"
+)
+KV_GATHER_BUCKETS_SECONDS = [
+    1e-6,
+    2e-6,
+    5e-6,
+    1e-5,
+    2e-5,
+    5e-5,
+    1e-4,
+    2e-4,
+    5e-4,
+    1e-3,
+    2e-3,
+    5e-3,
+    1e-2,
+]
+
 
 def _import_umbp_client():
     """Import UMBPClient from mori.umbp (requires mori built with BUILD_UMBP=ON)."""
@@ -338,9 +363,7 @@ class UMBPStore(HiCacheStorage):
                 )
             if UMBPIoBackend is not None:
                 cfg.ssd.io.backend = (
-                    UMBPIoBackend.Posix
-                    if backend == "posix"
-                    else UMBPIoBackend.IoUring
+                    UMBPIoBackend.Posix if backend == "posix" else UMBPIoBackend.IoUring
                 )
         if "ssd_durability_mode" in extra:
             # Validate even when the enum is unavailable (older mori / mocks).
@@ -857,6 +880,41 @@ class UMBPStore(HiCacheStorage):
                     dp_rank=_dp_rank if _is_dp_mode else None,
                 )
                 self._kv_events_subscriber.start()
+
+    # ------------------------------------------------------------------
+    # Host->device gather cost reporting
+    # ------------------------------------------------------------------
+    def register_gather_timer(self, timer) -> None:
+        """Attach observe_gather as a reporter on the controller's gather timer.
+
+        Idempotent.  Reporting is per-op rather than via the KV-events
+        subscriber: that subscriber only runs on rank 0, but gather happens on
+        every rank's controller, so each rank reports its own gather cost here.
+        """
+        if getattr(self, "_gather_timer_registered", False):
+            return
+        timer.add_reporter(self.observe_gather)
+        self._gather_timer_registered = True
+
+    def observe_gather(self, t, num_tokens) -> None:
+        """DeviceTimer reporter: forward one per-token gather observation.
+
+        ``t`` is the gather device time in seconds (DeviceTimer already divides
+        by 1000); normalize per token and forward via observe_metric (a no-op in
+        standalone mode).
+        """
+        try:
+            per_token = t / max(int(num_tokens), 1)
+            self.client.observe_metric(
+                KV_GATHER_DURATION_METRIC,
+                KV_GATHER_DURATION_HELP,
+                [],
+                KV_GATHER_BUCKETS_SECONDS,
+                float(per_token),
+            )
+        except Exception:
+            # Best-effort telemetry must never break the load path.
+            logger.debug("observe_gather failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Host memory pool registration

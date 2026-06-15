@@ -147,6 +147,14 @@ class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
+    def register_gather_timer(self, timer) -> None:
+        """Hand the backend the controller's gather timer (no-op by default).
+
+        Backends that consume host->device gather timing override this to attach
+        a reporter; called by HiRadixCache after the timer is installed.
+        """
+        pass
+
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
