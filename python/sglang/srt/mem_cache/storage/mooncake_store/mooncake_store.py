@@ -611,6 +611,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 
+    def _register_buffer_raw(self, ptr: int, size: int):
+        """Register a raw (ptr, size) pair with the underlying mooncake store."""
+        if self.store is None:
+            raise RuntimeError("Mooncake store is not initialized.")
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error(f"Failed to register buffer, error code: {ret_code}")
+            raise RuntimeError(
+                f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+            )
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
@@ -618,8 +629,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tensors are registered through register_mem_host_pool_v2().
             return
         try:
-            for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
-                super().register_buffer(buffer)
+            allocator = getattr(self.mem_pool_host, "allocator", None)
+            try:
+                from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                    UMBPHostTensorAllocator,
+                )
+            except ImportError:
+                UMBPHostTensorAllocator = None
+            if UMBPHostTensorAllocator is not None and isinstance(
+                allocator, UMBPHostTensorAllocator
+            ):
+                kv_buf = self.mem_pool_host.kv_buffer
+                base_ptr = kv_buf.data_ptr()
+                reg_size = allocator.mapped_size_for(base_ptr)
+                if reg_size == 0:
+                    reg_size = kv_buf.numel() * kv_buf.element_size()
+                logger.info(
+                    "UMBP hugepage allocator detected: registering entire "
+                    "kv_buffer as single MR (ptr=0x%x, size=%d)",
+                    base_ptr,
+                    reg_size,
+                )
+                self._register_buffer_raw(base_ptr, reg_size)
+            else:
+                for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
+                    super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err

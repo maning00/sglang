@@ -161,6 +161,18 @@ class HiSparseHostPoolMixin:
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
         try:
+            from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                UMBPHostTensorAllocator,
+            )
+
+            return UMBPHostTensorAllocator()
+        except (ImportError, RuntimeError, AttributeError) as exc:
+            logger.warning(
+                "UMBPHostTensorAllocator unavailable for mooncake backend (%s). "
+                "Falling back to MooncakeHostTensorAllocator (no huge pages).",
+                exc,
+            )
+        try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeHostTensorAllocator,
             )
