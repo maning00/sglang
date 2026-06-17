@@ -152,6 +152,7 @@ CORE_METRIC_FIELDS = (
     "token_usage",
     "gen_throughput",
     "cache_hit_rate",
+    "hicache_load_back_us_per_token",
     "utilization",
 )
 SECTION_FIELDS = (
@@ -227,6 +228,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     token_usage: float = 0.0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
+    hicache_load_back_us_per_token: float = 0.0
     utilization: float = 0.0
 
     has_memory: int = 0
@@ -302,6 +304,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
             "token_usage": self.token_usage,
             "gen_throughput": self.gen_throughput,
             "cache_hit_rate": self.cache_hit_rate,
+            "hicache_load_back_us_per_token": self.hicache_load_back_us_per_token,
             "utilization": self.utilization,
         }
 

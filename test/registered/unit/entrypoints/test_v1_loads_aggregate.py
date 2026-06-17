@@ -99,6 +99,7 @@ class TestGetLoads(CustomTestCase):
                     num_running_reqs=3,
                     num_waiting_reqs=2,
                     token_usage=0.25,
+                    hicache_load_back_us_per_token=12.5,
                 )
             )
 
@@ -122,6 +123,7 @@ class TestGetLoads(CustomTestCase):
             self.assertEqual(decoded["num_running_reqs"], 3)
             self.assertEqual(decoded["num_waiting_reqs"], 2)
             self.assertEqual(decoded["token_usage"], 0.25)
+            self.assertEqual(decoded["hicache_load_back_us_per_token"], 12.5)
         finally:
             writer.close()
             if os.path.exists(path):
@@ -148,6 +150,7 @@ class TestGetLoads(CustomTestCase):
                     token_usage=0.125,
                     gen_throughput=99.5,
                     cache_hit_rate=0.75,
+                    hicache_load_back_us_per_token=12.5,
                     utilization=0.5,
                     max_running_requests=128,
                     has_disaggregation=1,
@@ -170,6 +173,7 @@ class TestGetLoads(CustomTestCase):
             d = loads[0].to_dict({"core"})
             self.assertNotIn("disaggregation", d)
             self.assertNotIn("queues", d)
+            self.assertEqual(d["hicache_load_back_us_per_token"], 12.5)
 
             loads_all = asyncio.run(manager.get_loads(include=["all"], dp_rank=0))
             d_all = loads_all[0].to_dict()

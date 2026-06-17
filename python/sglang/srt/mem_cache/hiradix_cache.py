@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    is_event_timing_supported,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -68,6 +72,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+HICACHE_LOAD_BACK_TIMING_EMA_ALPHA = 0.3
+
 
 class HiRadixCache(RadixCache):
 
@@ -110,6 +116,11 @@ class HiRadixCache(RadixCache):
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.enable_load_back_timing = (
+            params.enable_metrics
+            and not isinstance(self.kv_cache, DSATokenToKVPool)
+            and is_event_timing_supported()
+        )
         self.extra_metric_labels = server_args.extra_metric_labels
 
         (
@@ -154,6 +165,7 @@ class HiRadixCache(RadixCache):
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
+                enable_load_back_timing=self.enable_load_back_timing,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -169,6 +181,8 @@ class HiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        self.load_back_num_tokens: dict[int, int] = {}
+        self.hicache_load_back_us_per_token = 0.0
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
@@ -703,6 +717,8 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        self.load_back_num_tokens.clear()
+        self.hicache_load_back_us_per_token = 0.0
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
@@ -953,8 +969,21 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            start_event, finish_event, ack_list = (
+                self.cache_controller.ack_load_queue.pop(0)
+            )
             finish_event.synchronize()
+            if self.enable_load_back_timing:
+                elapsed_ms = start_event.elapsed_time(finish_event)
+                num_tokens = sum(
+                    self.load_back_num_tokens.pop(ack_id, 0) for ack_id in ack_list
+                )
+                if num_tokens > 0:
+                    us_per_token = elapsed_ms * 1000.0 / num_tokens
+                    alpha = HICACHE_LOAD_BACK_TIMING_EMA_ALPHA
+                    self.hicache_load_back_us_per_token = (
+                        1.0 - alpha
+                    ) * self.hicache_load_back_us_per_token + alpha * us_per_token
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
@@ -1192,6 +1221,8 @@ class HiRadixCache(RadixCache):
             return None
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        if self.enable_load_back_timing:
+            self.load_back_num_tokens[last_hit_node.id] = len(host_indices)
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()

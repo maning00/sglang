@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from functools import lru_cache
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -54,11 +55,37 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _make_event(enable_timing: bool = False):
+    if enable_timing:
+        try:
+            return device_module.Event(enable_timing=True)
+        except TypeError:
+            return device_module.Event()
+    return device_module.Event()
+
+
+@lru_cache(maxsize=1)
+def is_event_timing_supported() -> bool:
+    try:
+        event = device_module.Event(enable_timing=True)
+    except TypeError:
+        return False
+    except Exception as e:
+        logger.debug("Device event timing is unavailable: %s", e)
+        return False
+    return hasattr(event, "elapsed_time")
+
+
 class LayerLoadingEvent:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, enable_timing: bool = False):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events = [
+            _make_event(enable_timing and i == num_layers - 1)
+            for i in range(num_layers)
+        ]
+        self.start_event = _make_event(
+            enable_timing
+        )  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -73,11 +100,14 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, enable_timing: bool = False):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        self.events = [
+            LayerLoadingEvent(num_layers, enable_timing=enable_timing)
+            for _ in range(self.num_counters)
+        ]
         self.producer_index = -1
         self.consumer_index = -1
 
@@ -265,6 +295,7 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        enable_load_back_timing: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -306,7 +337,9 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.layer_done_counter = LayerDoneCounter(
+            self.layer_num, enable_timing=enable_load_back_timing
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [

@@ -224,6 +224,9 @@ class SchedulerLoadInquirer:
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(self.get_stats().gen_throughput, 2),
             cache_hit_rate=round(self.get_stats().cache_hit_rate, 4),
+            hicache_load_back_us_per_token=round(
+                self.get_stats().hicache_load_back_us_per_token, 4
+            ),
             utilization=round(self.get_stats().utilization, 4),
             max_running_requests=self.max_running_requests,
             memory=memory,

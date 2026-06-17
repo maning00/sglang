@@ -610,6 +610,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.hicache_load_back_us_per_token = getattr(
+                self.scheduler.tree_cache, "hicache_load_back_us_per_token", 0.0
+            )
             self.stats.l1_hit_tokens = prefill_stats.log_l1_hit_tokens
             self.stats.l2_hit_tokens = prefill_stats.log_l2_hit_tokens
             self.stats.l3_hit_tokens = prefill_stats.log_l3_hit_tokens

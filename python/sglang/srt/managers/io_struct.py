@@ -2142,6 +2142,14 @@ class GetLoadsReqOutput(BaseReq):
     cache_hit_rate: float = field(
         metadata={"metric": ("gauge", "Prefix cache hit rate")}
     )
+    hicache_load_back_us_per_token: float = field(
+        metadata={
+            "metric": (
+                "gauge",
+                "HiCache load-back elapsed time, microseconds per token",
+            )
+        }
+    )
     utilization: float = field(
         metadata={"metric": ("gauge", "Overall utilization ratio")}
     )

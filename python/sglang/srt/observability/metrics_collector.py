@@ -69,6 +69,7 @@ class SchedulerStats:
     num_grammar_queue_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
+    hicache_load_back_us_per_token: float = 0.0
     decode_sum_seq_lens: int = 0
     # Per-tier cache hit token counts (incremental, reset after each log_stats call)
     l1_hit_tokens: int = 0
