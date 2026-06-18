@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
@@ -46,7 +47,12 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+            or self.is_draft_worker
+        ):
             return
         if (
             forward_batch.mamba_clear_indices is not None
@@ -59,9 +65,20 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
-            self.req_to_token_pool.mamba_pool.copy_from(
-                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
-            )
+            ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+            if ckpt_pool is not None:
+                # int8 checkpoints: dequantize the cached state (src = int8 ckpt slot)
+                # into the request's active bf16 slot (dst).
+                ckpt_pool.load_to_active(
+                    self.req_to_token_pool.mamba_pool,
+                    forward_batch.mamba_cow_src_indices,
+                    forward_batch.mamba_cow_dst_indices,
+                )
+            else:
+                self.req_to_token_pool.mamba_pool.copy_from(
+                    forward_batch.mamba_cow_src_indices,
+                    forward_batch.mamba_cow_dst_indices,
+                )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
@@ -81,6 +98,10 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
+            mamba_cache_indices = mamba_cache_indices.clone()
+            mamba_cache_indices[_real_bs:] = -1
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -902,7 +923,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             state_indices_tensor,
             last_correct_step_indices,
         )
-        fused_mamba_state_scatter_with_mask(
+        # conv intermediate uses the deduplicated sliding-window (overlapping)
+        # layout, so it needs the strided-read scatter variant.
+        fused_conv_window_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
@@ -919,7 +942,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-            fused_mamba_state_scatter_with_mask(
+            fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,
                 mamba_track_indices,
