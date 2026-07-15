@@ -460,6 +460,11 @@ class Envs:
 
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
+    # Data-plane backend used by the MoRI PD-disaggregation connector.
+    SGLANG_MORI_BACKEND = EnvStr("rdma")
+    # Number of streams and events in the MoRI fabric backend pools.
+    SGLANG_MORI_FABRIC_STREAMS = EnvInt(64)
+    SGLANG_MORI_FABRIC_EVENTS = EnvInt(64)
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
     # values can increase parallelism and bandwidth utilization.

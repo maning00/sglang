@@ -65,9 +65,9 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
+from sglang.srt.disaggregation.custom_mem_pool import maybe_init_custom_mem_pool
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
-    maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
