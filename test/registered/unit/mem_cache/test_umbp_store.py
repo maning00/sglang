@@ -375,6 +375,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         store.is_mla_backend = True
         store.mla_suffix = ""
         store.mha_suffix = "0"
+        store.config_prefix = None
         store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4)
         return store
 
@@ -394,6 +395,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
                     spdk_proxy_tenant_quota_bytes=0,
                 )
                 self.distributed = None
+                self.standalone_process = None
 
             @classmethod
             def from_environment(cls):
@@ -412,6 +414,8 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
             FakeUMBPClient,
             FakeUMBPConfig,
             fake_role,
+            None,
+            None,
             None,
             None,
             None,

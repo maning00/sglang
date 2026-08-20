@@ -62,30 +62,6 @@ def _ordered_layers(entry) -> list[int]:
     return [by_buffer[index] for index in range(pool_layer_count)]
 
 
-def _drain_sync_groups(params: CacheInitParams) -> tuple[Any, ...]:
-    """Return the cache-rank groups that must agree on drain state."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return ()
-
-    def wide(group: Any) -> Any | None:
-        if group is None or torch.distributed.get_world_size(group=group) <= 1:
-            return None
-        return group
-
-    attn = tuple(
-        group
-        for group in (
-            wide(params.attn_cp_cache_group),
-            wide(params.attn_tp_cache_group),
-        )
-        if group is not None
-    )
-    if attn:
-        return attn
-    tp = wide(params.tp_cache_group)
-    return (tp,) if tp is not None else ()
-
-
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
@@ -366,10 +342,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[tuple[int, list[_PoolRangePlan]] | None] = Queue()
+        self._load_queue: Queue[tuple[int, list[str], list[_PoolRangePlan]] | None] = (
+            Queue()
+        )
+        self._completed_loads: Queue[list[str]] = Queue()
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
-        self._offload_sync_groups = _drain_sync_groups(params)
         self._stats = {
             "lookup": 0,
             "load": 0,
@@ -549,15 +527,27 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._pending[rid] = expanded
         return True
 
+    def cancel_queued_load(self, rid: str) -> bool:
+        # The tree node is already visible in L1. Dropping its transfer would
+        # leave a device hit pointing at slots that were never populated.
+        return False
+
+    def num_completed_loads(self) -> int:
+        return self._completed_loads.qsize()
+
+    def pop_completed_load(self) -> list[str]:
+        return self._completed_loads.get_nowait()
+
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
             return -1
         self._freeze_gc_once()
         pending = self._pending
-        self._pending = {}
+        rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans))
+        self._load_queue.put((counter_index, rids, plans))
+        self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
 
@@ -713,8 +703,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, plans = task
-                self._run_layer_wise_batch(counter_index, plans)
+                counter_index, rids, plans = task
+                try:
+                    self._run_layer_wise_batch(counter_index, plans)
+                finally:
+                    self._completed_loads.put(rids)
             finally:
                 self._load_queue.task_done()
 
@@ -1040,15 +1033,17 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 expanded, ready_event = task
-                page_hashes = self._extkv_page_hashes(expanded)
+                success = False
                 try:
+                    page_hashes = self._extkv_page_hashes(expanded)
                     success = self._run_offload(expanded, ready_event)
+                    if success:
+                        self._queue_extkv_pages(page_hashes)
                 except BaseException:
                     logger.exception("UMBP offload failed")
                     success = False
-                if success:
-                    self._queue_extkv_pages(page_hashes)
-                self._offload_results.put(success)
+                finally:
+                    self._offload_results.put(success)
             finally:
                 self._offload_queue.task_done()
 
@@ -1127,18 +1122,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return self._offload_results.qsize()
 
     def pop_completed_offload(self) -> bool:
-        local_result = self._offload_results.get_nowait()
-        return bool(self._reduce_min_offload_state([local_result])[0])
-
-    def _reduce_min_offload_state(self, values: list) -> list:
-        if not self._offload_sync_groups:
-            return [int(value) for value in values]
-        synced = torch.tensor([int(value) for value in values], dtype=torch.int)
-        for group in self._offload_sync_groups:
-            torch.distributed.all_reduce(
-                synced, op=torch.distributed.ReduceOp.MIN, group=group
-            )
-        return synced.tolist()
+        return self._offload_results.get_nowait()
 
     def reset(self) -> None:
         self._pending.clear()
@@ -1148,6 +1132,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self._offload_results.get_nowait()
+            except Empty:
+                break
+        while True:
+            try:
+                self._completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()
