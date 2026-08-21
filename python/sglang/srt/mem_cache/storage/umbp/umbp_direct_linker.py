@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -748,29 +749,87 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 plans.append(plan)
         return plans
 
-    def _layer_group_ranges(self, plan: _PoolRangePlan, layers: list[int]):
-        """One group of layers' ranges, accumulated per object.
+    def _range_items(self, plan: _PoolRangePlan, layers: list[int]):
+        """(base_ptr, row_stride, size, offset) per emitted range, in wire order.
 
-        `_all_layer_ranges` for a slice of the layer stack. Returns None when
-        this pool covers none of the group, so the caller can skip the call.
+        Grouped by layer, and within a layer by component. Every object emits
+        this same tuple sequence; the only thing that varies across objects is
+        the pointer, by ``row * row_stride``. That invariant is what the
+        vectorized builder rests on.
         """
-        ptrs: list[list[int]] = [[] for _ in plan.keys]
-        sizes: list[list[int]] = [[] for _ in plan.keys]
-        offsets: list[list[int]] = [[] for _ in plan.keys]
-        covered = 0
+        entry = self.pools[plan.name]
+        items: list[list[tuple[int, int, int, int]]] = []
         for logical_layer in layers:
-            meta = self._layer_ranges(plan, logical_layer)
-            if meta is None:
+            buffer_index = entry.layer_mapping.get(logical_layer)
+            if buffer_index is None:
                 continue
-            covered += 1
-            layer_ptrs, layer_sizes, layer_offsets = meta
-            for index in range(len(plan.keys)):
-                ptrs[index].extend(layer_ptrs[index])
-                sizes[index].extend(layer_sizes[index])
-                offsets[index].extend(layer_offsets[index])
-        if covered == 0:
+            items.append(
+                [
+                    (*component[buffer_index], offsets[buffer_index])
+                    for component, offsets in zip(
+                        entry.buffer_meta, entry._component_offsets
+                    )
+                ]
+            )
+        return items
+
+    def _layer_group_ranges(self, plan: _PoolRangePlan, layers: list[int]):
+        """One group of layers' ranges, one nested list per object.
+
+        Built column-wise rather than object by object. A 256K restore emits
+        ~63k ranges across its pools, and assembling those lists one page at a
+        time cost ~43 ms per load -- serialized ahead of every group's transfer,
+        on the same thread, so it landed directly on TTFT. Two redundancies pay
+        for that: ``sizes`` and ``offsets`` do not depend on the row yet were
+        rebuilt for every page, and ``ptrs`` is affine in the row so the whole
+        column can be computed at once.
+
+        Moving the work to a helper thread was tried and does not pay: the load
+        thread has to re-acquire the GIL between blocking transfers and gives the
+        saving straight back. It has to go away rather than move.
+
+        Returns None when this pool covers none of the group, so the caller can
+        skip the call.
+        """
+        items = self._range_items(plan, layers)
+        if not items:
             return None
-        return ptrs, sizes, offsets
+        rows = np.asarray(plan.locations, dtype=np.int64)
+        if not rows.size:
+            return [], [], []
+        expected = len(rows) * plan.entries_per_page
+        if expected != len(plan.keys):
+            # One object per key, so a mismatch means pointers would be paired
+            # with the wrong objects rather than anything failing loudly.
+            raise ValueError(
+                f"UMBP pool {plan.name} has {len(plan.keys)} keys for "
+                f"{len(rows)} rows at {plan.entries_per_page} per page."
+            )
+
+        if self.pools[plan.name].packed:
+            # One object per page, its ranges running (layer, component).
+            flat = [item for layer_items in items for item in layer_items]
+            base = np.fromiter((item[0] for item in flat), np.int64, len(flat))
+            stride = np.fromiter((item[1] for item in flat), np.int64, len(flat))
+            ptrs = (rows[:, None] * stride[None, :] + base[None, :]).tolist()
+            # One list shared by every object instead of a copy each: the client
+            # only reads these.
+            sizes = [item[2] for item in flat]
+            offsets = [item[3] for item in flat]
+            return ptrs, [sizes] * len(rows), [offsets] * len(rows)
+
+        # One object per (page, component), its ranges running over the layers.
+        components = len(items[0])
+        base = np.array([[i[0] for i in layer] for layer in items], np.int64).T
+        stride = np.array([[i[1] for i in layer] for layer in items], np.int64).T
+        ptrs = (
+            (rows[:, None, None] * stride[None, :, :] + base[None, :, :])
+            .reshape(len(rows) * components, -1)
+            .tolist()
+        )
+        sizes = [[layer[index][2] for layer in items] for index in range(components)]
+        offsets = [[layer[index][3] for layer in items] for index in range(components)]
+        return ptrs, sizes * len(rows), offsets * len(rows)
 
     @staticmethod
     def _entries_per_call(sizes: list[list[int]]) -> int:
