@@ -117,6 +117,15 @@ class _PoolRangePlan:
     entries_per_page: int
 
 
+# One queued offload: the pools it resolved to, and the event guarding its KV.
+_OffloadTask = tuple[list[PoolTransfer], object]
+
+
+def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
+    """Pages this task puts into its widest pool, which is what sizes a plan."""
+    return max((len(transfer.keys or ()) for transfer in expanded), default=0)
+
+
 def _object_sizes_per_page(entry) -> list[int]:
     """Return per-page object sizes independently of emitted ranges.
 
@@ -174,6 +183,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._tp_size = server_args.tp_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
+        # Coalesce queued offload tasks up to this many pages; offload_nodes
+        # queues one task per node, so they arrive a page or two at a time.
+        self._offload_coalesce_pages = max(
+            1, int(os.getenv("UMBP_OFFLOAD_COALESCE_PAGES", "1024"))
+        )
         if _config_bool(os.getenv("UMBP_LOAD_SPLIT") or "0", "UMBP_LOAD_SPLIT"):
             raise ValueError(
                 "UMBP_LOAD_SPLIT is not supported by the dedup-after-insert "
@@ -353,6 +367,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "lookup": 0,
             "load": 0,
             "offload": 0,
+            # offload / offload_batches is the coalescing actually achieved.
+            "offload_batches": 0,
             "extkv_reported": 0,
             "extkv_revoked": 0,
             "extkv_reconcile_failures": 0,
@@ -1071,29 +1087,66 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._offload_queue.put((expanded, ready_event))
         return True
 
+    def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
+        """Block for one task, then take whatever else is already queued.
+
+        Returns the tasks and whether the stop sentinel came with them; each
+        item taken here needs one ``task_done()`` from the caller. Taking only
+        what is already queued keeps a task from waiting on an unsubmitted peer.
+        """
+        first = self._offload_queue.get()
+        if first is None:
+            return [], True
+        tasks = [first]
+        pages = _offload_task_pages(first[0])
+        while pages < self._offload_coalesce_pages:
+            try:
+                task = self._offload_queue.get_nowait()
+            except Empty:
+                break
+            if task is None:
+                return tasks, True
+            tasks.append(task)
+            pages += _offload_task_pages(task[0])
+        return tasks, False
+
     def _offload_thread_func(self) -> None:
         while True:
-            task = self._offload_queue.get()
+            tasks, stopping = self._take_offload_batch()
+            taken = len(tasks) + int(stopping)
             try:
-                if task is None:
-                    return
-                expanded, ready_event = task
-                success = False
-                try:
-                    page_hashes = self._extkv_page_hashes(expanded)
-                    success = self._run_offload(expanded, ready_event)
-                    if success:
-                        self._queue_extkv_pages(page_hashes)
-                except BaseException:
-                    logger.exception("UMBP offload failed")
-                    success = False
-                finally:
-                    self._offload_results.put(success)
+                if tasks:
+                    self._offload_batch(tasks)
             finally:
-                self._offload_queue.task_done()
+                for _ in range(taken):
+                    self._offload_queue.task_done()
+            if stopping:
+                return
 
-    def _run_offload(self, expanded: list[PoolTransfer], ready_event: object) -> bool:
-        ready_event.synchronize()
+    def _offload_batch(self, tasks: list[_OffloadTask]) -> None:
+        success = False
+        try:
+            page_hashes = [
+                page_hash
+                for expanded, _ in tasks
+                for page_hash in self._extkv_page_hashes(expanded)
+            ]
+            success = self._run_offload(tasks)
+            if success:
+                self._queue_extkv_pages(page_hashes)
+        except BaseException:
+            logger.exception("UMBP offload failed")
+            success = False
+        finally:
+            # One result per task in submission order: the tree pairs them
+            # positionally. A batch resolves as a unit because the first failed
+            # pool stops the rest, leaving every task in it incomplete.
+            for _ in tasks:
+                self._offload_results.put(success)
+
+    def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
+        for _, ready_event in tasks:
+            ready_event.synchronize()
         next_slot = 0
 
         def materialize_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -1103,18 +1156,19 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return self._materialize_offload_indices(indices, slot)
 
         plans = self._build_load_plans(
-            [expanded], materialize_indices=materialize_indices
+            [expanded for expanded, _ in tasks],
+            materialize_indices=materialize_indices,
         )
-        plans_by_name = {plan.name: plan for plan in plans}
-        for transfer in expanded:
-            plan = plans_by_name[transfer.name]
-            entry = self.pools[transfer.name]
+        # Over plans, not transfers: a plan already carries every task's keys
+        # for its pool, so walking transfers would put that pool once per task.
+        for plan in plans:
+            entry = self.pools[plan.name]
             # From the pool layout, never from the ranges below: see
             # _object_sizes_per_page.
             per_page = _object_sizes_per_page(entry)
             if len(per_page) != plan.entries_per_page:
                 raise ValueError(
-                    f"UMBP pool {transfer.name} declares {len(per_page)} object "
+                    f"UMBP pool {plan.name} declares {len(per_page)} object "
                     f"sizes per page but yields {plan.entries_per_page} objects."
                 )
             object_sizes = [
@@ -1144,7 +1198,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     logger.warning(
                         "UMBP offload failed: pool=%s object_range=[%d,%d) "
                         "success=%d/%d returned=%d",
-                        transfer.name,
+                        plan.name,
                         start,
                         min(end, len(plan.keys)),
                         sum(bool(value) for value in results),
@@ -1153,7 +1207,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     )
                     return False
 
-        self._stats["offload"] += 1
+        self._stats["offload"] += len(tasks)
+        self._stats["offload_batches"] += 1
         return True
 
     def _freeze_gc_once(self) -> None:
