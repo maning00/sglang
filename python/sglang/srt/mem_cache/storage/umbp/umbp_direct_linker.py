@@ -685,21 +685,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         return _materialize_cpu_indices(indices)
 
-    def _layer_ranges(self, plan: _PoolRangePlan, logical_layer: int):
-        """(ptrs, sizes, offsets) for one layer, one nested list per object."""
-        meta = self.pools[plan.name].get_prepared_layer_range_meta(
-            plan.locations, logical_layer
-        )
-        if meta is None:
-            return None
-        ptrs, sizes, offsets = meta
-        if not len(ptrs) == len(sizes) == len(offsets) == len(plan.keys):
-            raise ValueError(
-                f"UMBP pool {plan.name} layer {logical_layer} produced "
-                f"{len(ptrs)} range entries for {len(plan.keys)} keys."
-            )
-        return ptrs, sizes, offsets
-
     def _load_thread_func(self) -> None:
         while True:
             task = self._load_queue.get()
@@ -719,20 +704,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
         Offload requires one call to carry ranges that tile the object exactly,
         so an object's ranges must never be split across calls.
+
+        The group is the pool's own layer stack, so it always covers the pool
+        and the None return is unreachable; rejecting it keeps a future caller
+        that passes a foreign plan from failing on a tuple unpack instead.
         """
-        ptrs: list[list[int]] = [[] for _ in plan.keys]
-        sizes: list[list[int]] = [[] for _ in plan.keys]
-        offsets: list[list[int]] = [[] for _ in plan.keys]
-        for logical_layer in self.pool_layers[plan.name]:
-            meta = self._layer_ranges(plan, logical_layer)
-            if meta is None:
-                continue
-            layer_ptrs, layer_sizes, layer_offsets = meta
-            for index in range(len(plan.keys)):
-                ptrs[index].extend(layer_ptrs[index])
-                sizes[index].extend(layer_sizes[index])
-                offsets[index].extend(layer_offsets[index])
-        return ptrs, sizes, offsets
+        meta = self._layer_group_ranges(plan, self.pool_layers[plan.name])
+        if meta is None:
+            raise ValueError(
+                f"UMBP pool {plan.name} covers none of its own layers "
+                f"({self.pool_layers[plan.name]})."
+            )
+        return meta
 
     @staticmethod
     def _plans_covering(
