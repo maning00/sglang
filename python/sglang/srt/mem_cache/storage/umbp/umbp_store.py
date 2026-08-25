@@ -249,7 +249,13 @@ class UMBPStore(HiCacheStorage):
         self,
         storage_config: HiCacheStorageConfig = None,
         mem_pool_host: HostKVCache = None,
+        *,
+        per_rank_keyspace: bool = False,
     ):
+        # per_rank_keyspace: the caller suffixes every object key with its rank,
+        # so no two ranks can name the same object. Only the direct linker does
+        # that today. Default False keeps the HiCache L3 path (which reaches
+        # this class through backend_factory) on exactly the behaviour it had.
         (
             UMBPClient,
             UMBPConfig,
@@ -760,7 +766,22 @@ class UMBPStore(HiCacheStorage):
         remote_process_enabled = (
             cfg.distributed is not None or cfg.standalone_process is not None
         )
-        if not remote_process_enabled and self.is_mla_backend and tp_size > 1:
+        # Shared SSD exists to deduplicate MLA KV, which TP replicates: one
+        # rank owns the bytes and the others read them back. A caller that
+        # already keys per rank has nothing to deduplicate -- and would be
+        # broken by the scheme, because a follower would be sent looking for
+        # keys the leader never wrote under the follower's own suffix.
+        #
+        # It is also the reason embedded mode could not run: followers are the
+        # one role whose client reports no ranged multi-buffer I/O, which
+        # page-granular objects require. Standalone never hit this, not by
+        # design but because remote_process_enabled short-circuits it there.
+        if (
+            not remote_process_enabled
+            and not per_rank_keyspace
+            and self.is_mla_backend
+            and tp_size > 1
+        ):
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.

@@ -298,7 +298,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if _storage is None:
             from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
-            self.storage = UMBPStore(storage_config, mem_pool_host=None)
+            # per_rank_keyspace: every object key this class writes carries a
+            # tp{rank} suffix (set just below), so the store must not put the
+            # ranks into the shared-SSD leader/follower scheme meant for
+            # deduplicating replicated MLA KV.
+            self.storage = UMBPStore(
+                storage_config, mem_pool_host=None, per_rank_keyspace=True
+            )
         else:
             self.storage = _storage
 
