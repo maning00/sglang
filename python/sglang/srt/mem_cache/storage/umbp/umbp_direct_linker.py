@@ -306,21 +306,26 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             client = self.storage.client
             mode = client.get_deployment_mode()
             mode_type = type(mode)
-            # Page objects require ranged I/O, currently exposed by StandaloneProcess.
-            if mode != mode_type.StandaloneProcess:
-                raise ValueError(
-                    "Direct UMBP requires the StandaloneProcess deployment mode: "
-                    "page-granular objects need ranged multi-buffer I/O, which "
-                    f"the {mode!r} client does not implement yet."
-                )
+            # What page-granular objects actually need is ranged multi-buffer
+            # I/O. That used to be true only of StandaloneProcess, so the gate
+            # was written as a mode test -- but mori now implements it in the
+            # in-process client too ("Both media behind LocalStorageManager
+            # implement ranged I/O now", standalone_client.h), and a mode test
+            # would keep rejecting a client that can do the job.
+            #
+            # So ask the client what it supports instead of inferring it from
+            # which mode it is. supports_ranged_io() is the capability this
+            # code depends on, it is already consulted below, and a client that
+            # answers truthfully cannot be wrongly admitted by it.
             supports_ranged = getattr(client, "supports_ranged_io", None)
             if not callable(supports_ranged) or not bool(supports_ranged()):
                 raise ValueError(
-                    "Direct UMBP requires a standalone server whose inner backend "
-                    "advertises ranged multi-buffer I/O support. Upgrade mori and "
-                    "verify the server's distributed/local backend configuration. "
-                    "For a Distributed inner backend, set "
-                    "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES to a positive value."
+                    f"Direct UMBP needs ranged multi-buffer I/O, which this "
+                    f"{mode!r} client does not advertise. Upgrade mori; if the "
+                    "server has a Distributed inner backend, set "
+                    "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES to a positive value "
+                    "(both scratch arenas must be non-zero), and note that a "
+                    "read-only SharedSSDFollower is whole-object by design."
                 )
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
@@ -340,9 +345,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
             self._register_buffers()
+            # Report the mode rather than asserting it in the text: the line is
+            # what every acceptance check greps to prove the linker attached at
+            # all, and it used to say "standalone_process" unconditionally, so
+            # it could not have shown an embedded run for what it was.
             logger.info(
-                "UMBPDirectLinker topology=standalone_process+%s ranged_io=yes",
-                getattr(self.backend_mode, "name", self.backend_mode),
+                "UMBPDirectLinker topology=%s+%s ranged_io=yes",
+                mode.name,
+                self.backend_mode.name if self.backend_mode is not None else None,
             )
         except BaseException:
             self.storage.close()
