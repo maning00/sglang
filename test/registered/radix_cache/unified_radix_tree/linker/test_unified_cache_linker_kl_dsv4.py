@@ -5,8 +5,8 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.test_utils import (
     CustomTestCase,
