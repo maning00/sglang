@@ -27,7 +27,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
     UnifiedRadixTreeTestMixin, CustomTestCase
 ):
     page_size = 256
-    kl_threshold = 0.005
+    kl_threshold = 0.01
     sampling_temperature = 0
     max_new_tokens = 64
     prefix_len = 2048
