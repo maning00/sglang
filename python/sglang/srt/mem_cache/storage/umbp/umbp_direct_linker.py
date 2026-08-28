@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.mem_cache.utils import hash_str_to_int64
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
@@ -243,7 +243,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
         extra_config = _parse_storage_extra_config(
-            server_args.hicache_storage_backend_extra_config
+            get_memory().hicache_storage_backend_extra_config
         )
         extra_config = dict(extra_config)
         standalone_requested = bool(

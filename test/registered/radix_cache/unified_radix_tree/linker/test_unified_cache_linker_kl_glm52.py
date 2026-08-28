@@ -23,7 +23,7 @@ register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
     page_size = 64
-    kl_threshold = 0.03
+    kl_threshold = 0.01
     sampling_temperature = 0
     max_new_tokens = 64
     prefix_len = 2048
