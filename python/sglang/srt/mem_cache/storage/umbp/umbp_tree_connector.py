@@ -607,7 +607,12 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
         valid_pages = list(range(1, len(page_keys) + 1))
         for transfer in expanded:
-            page_exists = self._page_exists(page_keys, transfer)
+            # Probe only as far as the surviving boundary: no hit policy reads
+            # past its own end offset, so pages beyond the longest candidate
+            # cannot change the answer. This runs synchronously inside the
+            # scheduler's prefill batch build, and DP-attention ranks are
+            # lockstep, so every extra key is stall charged to all of them.
+            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer)
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
             if not valid_pages:
                 break

@@ -214,6 +214,52 @@ class TestUMBPTreeConnector(unittest.TestCase):
     def wait_for_offloads(connector):
         connector._offload_queue.join()
 
+    def test_lookup_narrows_the_probe_to_the_surviving_boundary(self):
+        """Every pool after the first probes only up to the longest candidate.
+
+        The probe is a synchronous round trip inside the scheduler's prefill
+        batch build, and DP-attention ranks are lockstep, so a pool that
+        re-probes the full key list charges every rank for keys whose answer
+        cannot change the boundary.
+        """
+        connector = self.make_connector()
+        pages = 8
+        kv_present = 3
+
+        probes = []
+
+        def batch_exists(keys):
+            probes.append(list(keys))
+            if keys and keys[0].endswith(str(PoolName.KV)):
+                return [index < kv_present for index in range(len(keys))]
+            return [True] * len(keys)
+
+        self.client.batch_exists.side_effect = batch_exists
+
+        valid_pages = connector.lookup("rid", [self.transfer(pages=pages)])
+
+        self.assertEqual(valid_pages, list(range(1, kv_present + 1)))
+        self.assertEqual(len(probes), 2)
+        self.assertEqual(len(probes[0]), pages)
+        self.assertEqual(len(probes[1]), kv_present)
+
+    def test_lookup_probe_narrowing_does_not_change_the_boundary(self):
+        """Narrowing is an optimisation: the answer matches an unnarrowed probe."""
+        connector = self.make_connector()
+        pages = 8
+
+        for kv_present in range(pages + 1):
+            for indexer_present in range(pages + 1):
+
+                def batch_exists(keys, kv=kv_present, indexer=indexer_present):
+                    limit = kv if keys and keys[0].endswith(str(PoolName.KV)) else indexer
+                    return [index < limit for index in range(len(keys))]
+
+                self.client.batch_exists.side_effect = batch_exists
+                got = connector.lookup("rid", [self.transfer(pages=pages)])
+                expected = list(range(1, min(kv_present, indexer_present) + 1))
+                self.assertEqual(got, expected, f"kv={kv_present} indexer={indexer_present}")
+
     def test_object_key_and_pointer_order_are_page_major(self):
         connector = self.make_connector()
         transfer = connector.pool_group.resolve_transfers([self.transfer(pages=2)])[0]
@@ -724,9 +770,11 @@ class TestUMBPTreeConnector(unittest.TestCase):
         connector = self.make_connector()
         # One object per page now, so a chunk holds far more pages than before
         # and all four fit in one probe per pool: pages 1-3 present, page 4 not.
+        # The second response is three wide, not four: the first pool caps the
+        # candidates at 3 and lookup does not probe past the surviving boundary.
         self.client.batch_exists.side_effect = [
             [True, True, True, False],
-            [True, True, True, False],
+            [True, True, True],
         ]
         with patch(
             "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
