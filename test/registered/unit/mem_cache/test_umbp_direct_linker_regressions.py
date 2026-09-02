@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import unittest
 from enum import Enum
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
+    with_direct_linker_cache_layout_tag,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -236,6 +238,83 @@ class TestUMBPDirectLinkerRegressions(unittest.TestCase):
                 got = connector.lookup("rid", [self.transfer(pages=pages)])
                 expected = list(range(1, min(kv_present, indexer_present) + 1))
                 self.assertEqual(got, expected, f"kv={kv_present} indexer={indexer_present}")
+    def dsv4_pool_group(self):
+        entry = DevicePoolEntry(
+            name=PoolName.DEEPSEEK_V4_C4,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[self.kv_buffers],
+            layer_mapping={layer: layer for layer in range(self.num_layers)},
+            page_size=self.page_size,
+            rows_are_pages=False,
+        )
+        return DevicePoolGroup(
+            [entry], self.num_layers, self.page_size, rank_replicated=True
+        )
+
+    def test_dsv4_layout_tag_is_appended_to_umbp_storage_config(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        kvcache._unified_kv = True
+        kvcache.c4_indexer_kv_pool = SimpleNamespace(use_fp4_indexer=False)
+        self.params.token_to_kv_pool_allocator.get_kvcache.return_value = kvcache
+        self.params.pp_rank = 1
+        self.params.pp_size = 4
+
+        captured = {}
+
+        def make_storage_config(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(
+                umbp_direct_linker,
+                "HiCacheStorageConfig",
+                side_effect=make_storage_config,
+            ),
+        ):
+            os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+            self.make_connector(
+                {"extra_backend_tag": "tenant-a", "custom_option": "kept"},
+                pool_group=self.dsv4_pool_group(),
+            )
+
+        self.assertEqual(captured["extra_config"]["custom_option"], "kept")
+        self.assertEqual(
+            captured["extra_config"]["extra_backend_tag"],
+            "tenant-a__ucdl-dsv4-v1-layout-unified-bf16-indexer-int8-"
+            "pp4-layers-auto",
+        )
+
+    def test_dsv4_layout_tag_is_identical_across_pp_ranks_for_extkv(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        kvcache._unified_kv = True
+        kvcache.c4_indexer_kv_pool = SimpleNamespace(use_fp4_indexer=False)
+        with patch.dict(
+            os.environ, {"SGLANG_PP_LAYER_PARTITION": "30,31"}, clear=False
+        ):
+            tags = [
+                with_direct_linker_cache_layout_tag(
+                    {"extra_backend_tag": "tenant-a"},
+                    kvcache=kvcache,
+                    pool_group=self.dsv4_pool_group(),
+                    pp_rank=rank,
+                    pp_size=2,
+                )["extra_backend_tag"]
+                for rank in range(2)
+            ]
+
+        self.assertEqual(tags[0], tags[1])
+        self.assertTrue(tags[0].endswith("-pp2-layers-30.31"))
 
     @staticmethod
     def wait_for_offloads(connector):
