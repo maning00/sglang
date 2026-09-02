@@ -191,6 +191,52 @@ class TestUMBPDirectLinkerRegressions(unittest.TestCase):
             keys=[f"page-{index}" for index in range(pages)],
         )
 
+    def test_lookup_narrows_the_probe_to_the_surviving_boundary(self):
+        """Every pool after the first probes only up to the longest candidate.
+
+        The probe is a synchronous round trip inside the scheduler's prefill
+        batch build, and DP-attention ranks are lockstep, so a pool that
+        re-probes the full key list charges every rank for keys whose answer
+        cannot change the boundary.
+        """
+        connector = self.make_connector()
+        pages = 8
+        kv_present = 3
+
+        probes = []
+
+        def batch_exists(keys):
+            probes.append(list(keys))
+            if keys and keys[0].endswith(str(PoolName.KV)):
+                return [index < kv_present for index in range(len(keys))]
+            return [True] * len(keys)
+
+        self.client.batch_exists.side_effect = batch_exists
+
+        valid_pages = connector.lookup("rid", [self.transfer(pages=pages)])
+
+        self.assertEqual(valid_pages, list(range(1, kv_present + 1)))
+        self.assertEqual(len(probes), 2)
+        self.assertEqual(len(probes[0]), pages)
+        self.assertEqual(len(probes[1]), kv_present)
+
+    def test_lookup_probe_narrowing_does_not_change_the_boundary(self):
+        """Narrowing is an optimisation: the answer matches an unnarrowed probe."""
+        connector = self.make_connector()
+        pages = 8
+
+        for kv_present in range(pages + 1):
+            for indexer_present in range(pages + 1):
+
+                def batch_exists(keys, kv=kv_present, indexer=indexer_present):
+                    limit = kv if keys and keys[0].endswith(str(PoolName.KV)) else indexer
+                    return [index < limit for index in range(len(keys))]
+
+                self.client.batch_exists.side_effect = batch_exists
+                got = connector.lookup("rid", [self.transfer(pages=pages)])
+                expected = list(range(1, min(kv_present, indexer_present) + 1))
+                self.assertEqual(got, expected, f"kv={kv_present} indexer={indexer_present}")
+
     @staticmethod
     def wait_for_offloads(connector):
         connector._offload_queue.join()
