@@ -97,31 +97,66 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    _flush_retry_seconds: float = field(default=0.0, init=False)
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
 
     @contextmanager
-    def _observe_weight_load(self, source: str) -> Iterator[None]:
+    def _weight_update(self, source: str, *, flush_cache: bool = True) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
-        # update_weights_from_* call. Engine is paused during the update so
-        # the periodic log_stats path can't carry this.
+        # update_weights_from_* call. The update owns the scheduler thread,
+        # so the periodic log_stats path cannot carry this.
         # `source` distinguishes disk vs distributed vs tensor vs ipc.
         t0 = time.perf_counter()
         try:
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+            cache = self.scheduler.tree_cache if self.scheduler is not None else None
+            if (
+                flush_cache
+                and isinstance(cache, UnifiedRadixCache)
+                and cache.peer_l1 is not None
+            ):
+                peer = cache.peer_l1
+                assert (
+                    not peer.has_unstarted_reservations
+                ), "Weight update reached an unsubmitted peer L1 reservation"
+                # Run before loading weights: even a rank whose load fails
+                # must participate. Flush is only called on successful ranks.
+                # Retry only while all workers are paused and idle.
+                quiescent = torch.tensor(
+                    int(
+                        self.scheduler._engine_paused
+                        and self.is_fully_idle(ignore_waiting=True)
+                    ),
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                torch.distributed.all_reduce(
+                    quiescent, op=torch.distributed.ReduceOp.MIN, group=peer.cpu_group
+                )
+                if quiescent.item():
+                    self._flush_retry_seconds = peer.wait_seconds
+
             yield
         finally:
+            self._flush_retry_seconds = 0.0
             if self.metrics_collector is not None:
-                self.metrics_collector.observe_weight_load(
-                    time.perf_counter() - t0, source
-                )
+                self.metrics_collector.observe_weight_load(time.perf_counter() - t0, source)
 
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:
-            flush_cache_success = self.flush_cache(
-                empty_cache=recv_req.torch_empty_cache
-            )
+            deadline = time.monotonic() + self._flush_retry_seconds
+            while True:
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
+                remaining = deadline - time.monotonic()
+                if flush_cache_success or remaining <= 0:
+                    break
+                time.sleep(min(0.001, remaining))
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
@@ -129,7 +164,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
-        with self._observe_weight_load("disk"):
+        with self._weight_update("disk", flush_cache=recv_req.flush_cache):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -185,7 +220,7 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_distributed must run between "
                 "begin_weight_update() and end_weight_update()",
             )
-        with self._observe_weight_load("distributed"):
+        with self._weight_update("distributed", flush_cache=recv_req.flush_cache):
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -225,7 +260,7 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_tensor must run between "
                 "begin_weight_update() and end_weight_update()",
             )
-        with self._observe_weight_load("tensor"):
+        with self._weight_update("tensor", flush_cache=recv_req.flush_cache):
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
@@ -250,7 +285,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
-        with self._observe_weight_load("ipc"):
+        with self._weight_update("ipc", flush_cache=recv_req.flush_cache):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():

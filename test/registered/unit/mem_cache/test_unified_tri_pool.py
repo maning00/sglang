@@ -372,6 +372,7 @@ class TestUnifiedTriPool(unittest.TestCase):
                 self.assertEqual(mamba_slots.schedulable_available_size(), 0)
 
                 cache = object.__new__(UnifiedRadixCache)
+                cache.peer_l1 = None
                 cache.disable = False
                 cache.tree_components = (
                     ComponentType.FULL,

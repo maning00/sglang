@@ -157,6 +157,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
             scheduler=SimpleNamespace(
+                tree_cache=None,
                 record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version
                 )
@@ -170,6 +171,92 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             # update_weights_from_* require an open session
             manager._session = _WeightUpdateSession(selector="all")
         return manager
+
+
+class TestPeerL1WeightUpdateFlush(_WeightUpdaterManagerTestBase):
+    def _peer_manager(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        manager = self._manager(_runner())
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.peer_l1 = SimpleNamespace(
+            cpu_group=object(), wait_seconds=0.2, has_unstarted_reservations=False
+        )
+        manager.scheduler.tree_cache = cache
+        manager.scheduler._engine_paused = True
+        return manager
+
+    def test_paused_engine_retries_transient_flush_failure(self):
+        manager = self._peer_manager()
+        manager.flush_cache = Mock(side_effect=[False, True])
+        with (
+            patch("torch.distributed.all_reduce") as consensus,
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.time.sleep"
+            ) as sleep,
+        ):
+            with manager._weight_update("test"):
+                manager.flush_cache_after_weight_update(_request())
+        self.assertEqual(manager.flush_cache.call_count, 2)
+        consensus.assert_called_once()
+        self.assertEqual(consensus.call_args.args[0].item(), 1)
+        sleep.assert_called_once()
+
+    def test_one_unpaused_peer_disables_retries(self):
+        manager = self._peer_manager()
+        manager.flush_cache = Mock(return_value=False)
+        with (
+            patch(
+                "torch.distributed.all_reduce",
+                side_effect=lambda flag, **kwargs: flag.zero_(),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.time.sleep"
+            ) as sleep,
+            self.assertRaisesRegex(AssertionError, "Cache flush failed"),
+        ):
+            with manager._weight_update("test"):
+                manager.flush_cache_after_weight_update(_request())
+        manager.flush_cache.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_timeout_still_rejects_stale_cache(self):
+        manager = self._peer_manager()
+        manager.flush_cache = Mock(return_value=False)
+        with (
+            patch("torch.distributed.all_reduce"),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.time.monotonic",
+                side_effect=[0.0, 1.0],
+            ),
+            self.assertRaisesRegex(AssertionError, "Cache flush failed"),
+        ):
+            with manager._weight_update("test"):
+                manager.flush_cache_after_weight_update(_request())
+        manager.flush_cache.assert_called_once()
+
+    def test_no_flush_update_adds_no_collective(self):
+        manager = self._peer_manager()
+        manager.flush_cache = Mock()
+        with patch("torch.distributed.all_reduce") as consensus:
+            result = manager.update_weights_from_disk(_request(flush_cache=False))
+        self.assertTrue(result.success)
+        consensus.assert_not_called()
+        manager.flush_cache.assert_not_called()
+
+    def test_failed_weight_load_still_participates_in_preflight(self):
+        manager = self._peer_manager()
+        manager.tp_worker.model_runner.weight_updater.update_weights_from_disk.return_value = (
+            False,
+            "load failed",
+        )
+        manager.flush_cache = Mock()
+        with patch("torch.distributed.all_reduce") as consensus:
+            result = manager.update_weights_from_disk(_request())
+        self.assertFalse(result.success)
+        consensus.assert_called_once()
+        manager.flush_cache.assert_not_called()
+        self.assertEqual(manager._flush_retry_seconds, 0.0)
 
 
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):

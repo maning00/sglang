@@ -86,17 +86,33 @@ def main():
             )
         )
     assert all(result["cached"].get("host", 0) >= 2048 for result in results)
-    deadline = time.monotonic() + 30
-    while True:
-        response = requests.post(args.url + "/flush_cache", timeout=10)
-        if response.ok and "not flushed" not in response.text.lower():
-            break
-        assert time.monotonic() < deadline, response.text
-        time.sleep(0.1)
+
+    def flush():
+        deadline = time.monotonic() + 30
+        while True:
+            response = requests.post(args.url + "/flush_cache", timeout=10)
+            if response.ok and "not flushed" not in response.text.lower():
+                break
+            assert time.monotonic() < deadline, response.text
+            time.sleep(0.1)
+
+    flush()
     after = generate("after_flush", 1, text)
     assert sum(after["cached"].values()) == 0, "flush left a peer directory readable"
+    response = requests.post(
+        args.url + "/pause_generation", json={"mode": "retract"}, timeout=30
+    )
+    response.raise_for_status()
+    try:
+        flush()
+    finally:
+        response = requests.post(args.url + "/continue_generation", json={}, timeout=30)
+        response.raise_for_status()
+    after = generate("after_paused_flush", 1, text)
+    assert sum(after["cached"].values()) == 0, "paused flush left stale peer pages"
     print(
-        "PASS: peer/local/cold attribution, concurrent restores, and flush", flush=True
+        "PASS: peer/local/cold attribution, concurrent restores, ordinary and paused flush",
+        flush=True,
     )
 
 

@@ -191,6 +191,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
     def _new_unpublished_swa_state(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.is_mamba_enabled = False
         cache.tree_core = SimpleNamespace(is_eagle=False)
         cache.req_to_token_pool = SimpleNamespace(
@@ -221,6 +222,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.cache_controller = SimpleNamespace(write_policy=write_policy)
         queue.scheduler = SimpleNamespace(
             attn_cp_cpu_group=None,
@@ -340,6 +342,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
     def test_write_through_pending_chunk_does_not_publish(self):
         scheduler = SimpleNamespace()
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.cache_controller = SimpleNamespace(write_policy="write_through")
         cache.advance_unpublished_req = MagicMock()
         cache.req_to_token_pool = SimpleNamespace(

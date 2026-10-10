@@ -18,6 +18,7 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
     def test_no_insert_without_lock_skips_lock_release(self):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.cache_controller = None
         cache.session = MagicMock()
         cache.session.try_cache_finished_req.return_value = False

@@ -3,10 +3,31 @@
 import multiprocessing as mp
 
 import pytest
+import torch
+import torch.distributed as dist
+from sglang.srt.mem_cache.unified_cache.peer_l1.debug import CollectiveGuard
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("name", ["all_reduce", "all_gather_into_tensor"])
+def test_collective_guard_catches_preimported_alias(name):
+    collective = getattr(dist, name)  # Capture the alias before enabling checks.
+    tensor = torch.zeros(1)
+    guard = CollectiveGuard()
+    guard.enable()
+    try:
+        dist.is_initialized()  # Metadata queries must remain usable.
+        with pytest.raises(AssertionError, match="unsubmitted reservation"):
+            if name == "all_reduce":
+                collective(tensor)
+            else:
+                collective(tensor, tensor)
+        assert not guard.enabled
+    finally:
+        guard.disable()
 
 
 def _key(value):

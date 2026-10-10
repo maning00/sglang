@@ -48,6 +48,7 @@ class TestPPSyncDrain(unittest.TestCase):
 class TestUnifiedPPSyncBatching(unittest.TestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.tree_core = SimpleNamespace(
             enable_storage=False,
             write_back_duplicate_reclaim_digest=0,

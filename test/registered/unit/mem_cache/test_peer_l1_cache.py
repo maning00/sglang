@@ -3,7 +3,7 @@
 import ctypes
 import threading
 from array import array
-from collections import Counter
+from collections import Counter, deque
 from types import SimpleNamespace
 
 import pytest
@@ -15,11 +15,82 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
+from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker, Reservation
 from sglang.srt.mem_cache.unified_cache.peer_l1.owner import L1Owner
 from sglang.test.ci.ci_register import register_cuda_ci
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_flush_drains_completed_load_and_releases_tree_lock(tmp_path, backend, caplog):
+    cache, allocator, _ = build_fixture(
+        CacheConfig(page_size=4, kv_size=64, num_layers=2), tree_core_backend=backend
+    )
+    if backend == "rust":
+        assert type(cache.tree_core).__name__.startswith("Rust")
+    peer = PeerL1Linker.__new__(PeerL1Linker)
+    peer.directory = L1Directory(str(tmp_path / "flush"), 17, 4, create=True)
+    peer.device = allocator.device
+    peer.check_hooks = True
+    peer.stats = Counter()
+    peer.loading_keys = Counter()
+    peer._reservations, peer._queued, peer._lookups = {}, {}, {}
+    peer._inflight, peer._batches = set(), deque()
+    peer._flush_frozen = False
+    cache.init_cache_linker(peer)
+    try:
+        value = allocator.alloc(8)
+        inserted = cache.insert(
+            InsertParams(key=RadixKey(array("q", range(8))), value=value)
+        )
+        # The load-back attach was suppressed while its bytes were in flight.
+        [(keys, _)] = cache.tree_core.take_l1_events()
+        node = inserted.last_device_node
+        cache.linker.pending_loads["load"] = (
+            node,
+            cache.inc_lock_ref(node).to_dec_params(),
+        )
+        peer.loading_keys.update(keys)
+        peer._reservations["load"] = Reservation(0, keys, None, None)
+        peer._inflight.add("load")
+        complete = threading.Event()
+        peer._batches.append(
+            SimpleNamespace(
+                finish=SimpleNamespace(query=complete.is_set),
+                error_cpu=None,
+                keys=keys,
+                rows_cpu=value.reshape(-1, 4)[:, 0].cpu() // 4,
+                rids=["load"],
+            )
+        )
+        assert not peer.begin_flush()
+        assert "local loads" in caplog.text
+        assert cache.linker.pending_loads and cache.full_protected_size() == 8
+        # No scheduler poll occurs here, as with a paused engine. Flush itself
+        # must drain the completed batch and release the wrapper's tree lock.
+        complete.set()
+        assert peer.begin_flush()
+        assert not peer.has_loads and not cache.linker.pending_loads
+        assert cache.full_protected_size() == 0
+        rows, gens = peer.directory.probe(hash_words(keys))
+        assert not peer.directory.pin(rows, gens)  # Still frozen through reset.
+        peer.end_flush()
+        assert peer.directory.pin(rows, gens)
+        try:
+            assert not peer.begin_flush()
+            assert "remote refs=2" in caplog.text
+        finally:
+            peer.directory.unpin(rows)
+        assert peer.begin_flush()
+        peer.owner.reset()
+        peer.end_flush()
+        assert not len(peer.directory.probe(hash_words(keys))[0])
+    finally:
+        peer.end_flush()
+        peer.owner.stream.synchronize()
+        peer.directory.close()
 
 
 def test_hip_event_waits_for_host_callback():

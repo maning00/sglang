@@ -178,7 +178,7 @@ class FullComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            if getattr(self.tree_core, "enable_l1_events", False):
+            if self.tree_core.enable_l1_events:
                 self.tree_core.record_l1_event(node, attach=False)
             device_frees[self.component_type].append(cd.value)
             # Progress toward an eviction request and the ledger move are

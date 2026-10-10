@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCache
 from sglang.srt.runtime_context import get_memory, get_parallel
 
 from .copier import L1Copier, PeerMemoryMap
+from .debug import CollectiveGuard
 from .directory import L1Directory, hash_words
 from .owner import L1Owner
 
@@ -51,9 +52,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         if not torch.version.hip or params.page_size != 256:
             raise ValueError("peer_l1 requires ROCm and page_size=256")
         memory = get_memory()
-        if memory.enable_unified_memory or getattr(
-            server_args, "enable_memory_saver", False
-        ):
+        if memory.enable_unified_memory or server_args.enable_memory_saver:
             raise ValueError(
                 "peer_l1 requires fixed KV allocations without memory saver"
             )
@@ -92,6 +91,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.wait_seconds = float(config.get("wait_timeout_ms", 200)) / 1000
         self.min_pages = int(config.get("min_hit_pages", 1))
         self.check_hooks = bool(config.get("check_hooks", False))
+        self._collective_guard = CollectiveGuard() if self.check_hooks else None
         layer_group, blocks = int(config.get("layer_group", 8)), int(
             config.get("blocks", 32)
         )
@@ -209,12 +209,23 @@ class PeerL1Linker(UnifiedCacheLinker):
             found.rows[:num_pages],
             found.gens[:num_pages],
         )
-        if not self.peers[found.peer].pin(found.rows, found.gens):
-            self.stats["reserve_failures"] += 1
-            return False
-        self._reservations[rid] = found
-        self.loading_keys.update(found.keys)
-        return True
+        # Install before pinning so a conflicting debugger/profiler cannot
+        # leave an untracked reservation behind.
+        if self._collective_guard is not None:
+            self._collective_guard.enable()
+        try:
+            if not self.peers[found.peer].pin(found.rows, found.gens):
+                self.stats["reserve_failures"] += 1
+                return False
+            self._reservations[rid] = found
+            self.loading_keys.update(found.keys)
+            return True
+        finally:
+            self._stop_collective_guard_if_submitted()
+
+    def _stop_collective_guard_if_submitted(self):
+        if self._collective_guard is not None and not self.has_unstarted_reservations:
+            self._collective_guard.disable()
 
     def _forget_reservation(self, rid):
         reservation = self._reservations.pop(rid)
@@ -234,6 +245,7 @@ class PeerL1Linker(UnifiedCacheLinker):
             return
         reservation = self._forget_reservation(rid)
         self.peers[reservation.peer].unpin(reservation.rows)
+        self._stop_collective_guard_if_submitted()
 
     def load(self, rid, transfers):
         transfer = next(t for t in transfers if t.name == PoolName.KV)
@@ -272,6 +284,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         self._batches.append(batch)
         self._inflight.update(batch.rids)
         self._queued.clear()
+        self._stop_collective_guard_if_submitted()
         self.stats["loaded_pages"] += len(batch.keys)
         return batch.index
 
@@ -313,6 +326,9 @@ class PeerL1Linker(UnifiedCacheLinker):
         raise RuntimeError("peer_l1 does not offload")
 
     def begin_flush(self):
+        # A paused scheduler skips its usual HiCache poll. Drain through the
+        # wrapper so completed loads release both reservations and tree locks.
+        self.owner.cache.linker.drain_loads(self.num_completed_loads())
         self._flush_frozen = self.owner.begin_flush()
         return self._flush_frozen
 

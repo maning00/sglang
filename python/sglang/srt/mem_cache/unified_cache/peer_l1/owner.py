@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -194,9 +197,23 @@ class L1Owner:
     def begin_flush(self):
         self.consume_events()
         self.reclaim()
-        if self._hold or self._zombies or self.linker.has_loads:
+        if self.linker.has_loads:
+            logger.warning("peer_l1 flush busy: local loads have not completed")
             return False
-        return self.directory.freeze()
+        if self._hold or self._zombies:
+            logger.warning(
+                "peer_l1 flush busy: %d retired pages awaiting free, %d deferred pages",
+                len(self._hold),
+                len(self._zombies),
+            )
+            return False
+        if not self.directory.freeze():
+            logger.warning(
+                "peer_l1 flush busy: directory is pinned or frozen (remote refs=%d)",
+                self.directory.pinned_refs,
+            )
+            return False
+        return True
 
     def reset(self):
         # Called only after begin_flush, or after the whole worker quiesces.

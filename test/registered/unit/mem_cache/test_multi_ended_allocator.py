@@ -3330,6 +3330,7 @@ class TestDcpWidening(unittest.TestCase):
 
     def _build_donor_cache(self, allocator, mamba_slot_allocator, full_leaves):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         cache.is_swa_enabled = False

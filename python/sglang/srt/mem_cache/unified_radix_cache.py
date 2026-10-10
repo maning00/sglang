@@ -755,7 +755,7 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         request_by_type = self._evict_request_by_type(params)
-        peer = getattr(self, "peer_l1", None)
+        peer = self.peer_l1
         peer_owner = peer.owner if peer is not None else None
         if peer_owner is not None:
             def full_available():
@@ -1315,17 +1315,19 @@ class UnifiedRadixCache(BasePrefixCache):
             actions.reverse()
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
-        peer = getattr(self, "peer_l1", None)
-        if peer is not None:
-            owner = peer.owner
-            owner.consume_events()
-            if isinstance(action, (FreeDeviceKV, FreeDeviceKVFullOnly)) or (
+        peer = self.peer_l1
+        if peer is not None and (
+            isinstance(action, (FreeDeviceKV, FreeDeviceKVFullOnly))
+            or (
                 isinstance(action, FreeComponentDeviceSlot)
                 and action.component_type == ComponentType.FULL
-            ):
-                action.indices[:] = [
-                    owner.filter_free(indices) for indices in action.indices
-                ]
+            )
+        ):
+            owner = peer.owner
+            owner.consume_events()
+            action.indices[:] = [
+                owner.filter_free(indices) for indices in action.indices
+            ]
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
@@ -3508,7 +3510,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        peer = getattr(self, "peer_l1", None)
+        peer = self.peer_l1
         if peer is not None:
             peer.poll()
         if self.linker is not None:

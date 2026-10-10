@@ -167,6 +167,7 @@ def _swa_allocator(swa_req_ring):
 
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.peer_l1 = None
     cache.tree_core = SimpleNamespace(
         enable_external_cache_linker=False,
         write_through_threshold=256,
@@ -956,6 +957,7 @@ def test_failed_offload_rolls_back_split_fragments():
 def test_split_action_retargets_pending_external_offload():
     calls = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.peer_l1 = None
     cache.linker = SimpleNamespace(
         replace_pending_offload_node=lambda *args: calls.append(("linker", *args))
     )
@@ -1034,6 +1036,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.peer_l1 = None
     cache.linker = SimpleNamespace(
         num_completed_loads=lambda: 1,
         drain_loads=lambda count: committed.append(("load", count)),
@@ -1129,6 +1132,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.peer_l1 = None
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
     cache.cache_controller = object() if enable_hicache else None
@@ -1152,6 +1156,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
 
 def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.peer_l1 = None
     cache.components = {}
     assert cache.swa_reprefill_tail_tokens() == 0
 

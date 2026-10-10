@@ -9739,6 +9739,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
 
     def test_retraction_uses_engine_transfer_index_domains(self):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.is_swa_enabled = True
         cache._sliding_window_size = 3
         cache.tree_core = mock.Mock(page_size=2)
@@ -11340,6 +11341,7 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
 
     def test_positive_hit_with_lost_anchor_reports_anchor_lost(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.storage_prefetch_retries = StoragePrefetchRetries()
         cache.ongoing_prefetch = {
             self._REQ: SimpleNamespace(

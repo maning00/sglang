@@ -28,11 +28,14 @@ The extra-config object accepts:
 | `min_hit_pages` | 1 | Minimum prefix worth restoring |
 | `wait_timeout_ms` | 200 | Bounded capacity wait; 0 disables waiting |
 | `verify_bytes` | false | Compare every copied row before releasing its source pin |
-| `check_hooks` | false | Check that allocator frees contain no published rows |
+| `check_hooks` | false | Check allocator frees and reject collectives between pin and copy submission |
 
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;
 a reservation race returns a cache miss through the existing load-back flow.
+The collective check uses the current thread's Python profile hook only while
+reservations are unsubmitted, including calls through previously imported
+aliases. It cannot run alongside another Python profiler on that thread.
 
 ## Ownership and completion
 
@@ -45,8 +48,13 @@ passes. Genuine shortages retain the caller's existing retract/ABORT behavior.
 Tree publications wait for both the scheduler's index writes and the forward's
 KV writes. The consumer queues layer events for forward and a separate batch
 event after verification and the native unpin callback. Batch cleanup and event
-slot reuse use the latter. Flush checks local activity, atomically freezes new
-remote reservations, then withdraws the directory before clearing the pool.
+slot reuse use the latter. Flush first drains completed loads and their tree
+locks, including when the scheduler is paused. It then checks local activity,
+atomically freezes new remote reservations, and withdraws the directory before
+clearing the pool. Busy flushes report their reason and return immediately.
+Weight updates can retry for `wait_timeout_ms` only after every worker confirms
+it is paused and idle; this confirmation precedes loading weights so failed
+loads do not skip a collective. Expiry still rejects the stale cache.
 
 IPC mappings live for the engine's lifetime. Close is collective across the
 worker group so producers outlive consumers. Recovery from individual worker

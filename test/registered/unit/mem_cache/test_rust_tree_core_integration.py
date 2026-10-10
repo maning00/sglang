@@ -4235,6 +4235,7 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
     # Real components, tree, backup planner/commit and controller eviction. Only
     # allocation and DMA completion are simulated so this also runs on CPU.
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.peer_l1 = None
     cache.enable_session_radix_cache = False
     cache.token_to_kv_pool_allocator = None
     params = CacheInitParams(

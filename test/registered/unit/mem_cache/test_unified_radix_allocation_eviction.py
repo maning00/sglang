@@ -25,6 +25,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
     @staticmethod
     def _build_cache(*, collateral_capacity_gain: int):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         cache.is_swa_enabled = False
@@ -64,6 +65,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         *, free_ids: int, byte_slots: int, tri_pool: bool = False
     ):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.disable = False
         cache.tree_components = (
             (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
@@ -136,6 +138,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_mamba_allocation_counts_collateral_full_capacity(self):
         cache = object.__new__(UnifiedRadixCache)
+        cache.peer_l1 = None
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         cache.is_swa_enabled = False
