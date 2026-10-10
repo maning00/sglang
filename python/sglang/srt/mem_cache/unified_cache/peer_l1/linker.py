@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -24,6 +25,9 @@ from .directory import L1Directory, hash_words
 from .owner import L1Owner
 
 logger = logging.getLogger(__name__)
+
+# Arbitrary; often enough to difference counters at benchmark phase boundaries.
+_STATS_LOG_SECONDS = 60.0
 
 
 @dataclass
@@ -104,6 +108,7 @@ class PeerL1Linker(UnifiedCacheLinker):
                 "peer_l1 sizes must be positive and wait_timeout_ms nonnegative"
             )
         self.stats = Counter()
+        self._next_stats_log = time.monotonic() + _STATS_LOG_SECONDS
         self._lookups = {}
         self._reservations = {}
         self._queued = {}
@@ -195,6 +200,10 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.stats["lookups"] += 1
         if best is None or len(best.rows) < self.min_pages:
             return []
+        self.stats["lookup_hits"] += 1
+        self.stats["lookup_hit_pages"] += len(best.rows)
+        if len(best.rows) == self.pin_cap < len(keys):
+            self.stats["lookup_capped"] += 1
         self._lookups[rid] = best
         return list(range(1, len(best.rows) + 1))
 
@@ -215,7 +224,9 @@ class PeerL1Linker(UnifiedCacheLinker):
         try:
             if not self.peers[found.peer].pin(found.rows, found.gens):
                 self.stats["reserve_failures"] += 1
+                self.stats["reserve_failed_pages"] += num_pages
                 return False
+            self.stats["reserved_pages"] += num_pages
             self._reservations[rid] = found
             return True
         finally:
@@ -278,6 +289,19 @@ class PeerL1Linker(UnifiedCacheLinker):
 
     def poll(self):
         self.owner.poll(self.forward_stream)
+        now = time.monotonic()
+        if now >= self._next_stats_log:
+            self._next_stats_log = now + _STATS_LOG_SECONDS
+            self._log_stats()
+
+    def _log_stats(self):
+        logger.info(
+            "peer_l1 rank=%d stats: %s deferred_tokens=%d own_pinned_refs=%d",
+            self.rank,
+            dict(sorted(self.stats.items())),
+            self.owner.deferred_tokens if self.owner is not None else 0,
+            self.directory.pinned_refs,
+        )
 
     def finish_layer_wise_loading(self, counter_index):
         batch = self._batches.get(counter_index)
@@ -335,6 +359,7 @@ class PeerL1Linker(UnifiedCacheLinker):
     def close(self):
         if self._closed:
             return
+        self._log_stats()
         self.copier.stream.synchronize()
         for batch in self._batches.values():
             for rid in batch.rids:
