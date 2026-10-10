@@ -173,6 +173,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    peer_l1 = None
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -756,11 +758,41 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         request_by_type = self._evict_request_by_type(params)
+        peer = getattr(self, "peer_l1", None)
+        peer_owner = peer.owner if peer is not None else None
+        if peer_owner is not None:
+            def full_available():
+                return self._component_available_size(ComponentType.FULL)
+
+            full_target = full_available() + request_by_type[ComponentType.FULL]
+            withheld_before = peer_owner.withheld_total
         self._evict_components(
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
         )
+
+        if peer_owner is not None:
+            peer_owner.reclaim()
+            if peer_owner.withheld_total != withheld_before:
+                while full_available() < full_target and self.full_evictable_size() > 0:
+                    delta = {ct: 0 for ct in self.tree_components}
+                    shortfall = {
+                        ct: (
+                            full_target - full_available()
+                            if ct == ComponentType.FULL
+                            else 0
+                        )
+                        for ct in self.tree_components
+                    }
+                    self._evict_components(shortfall, delta)
+                    self._accumulate_tracker(tracker, delta)
+                    peer_owner.reclaim()
+                    self.peer_l1.stats["compensation_rounds"] += 1
+                    if not delta[ComponentType.FULL]:
+                        break
+            if request_by_type[ComponentType.FULL] and full_available() < full_target:
+                peer_owner.wait_for_capacity(full_target, full_available)
 
         if (
             self.cache_controller is not None
@@ -1304,6 +1336,17 @@ class UnifiedRadixCache(BasePrefixCache):
             actions.reverse()
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
+        peer = getattr(self, "peer_l1", None)
+        if peer is not None:
+            owner = peer.owner
+            owner.consume_events()
+            if isinstance(action, (FreeDeviceKV, FreeDeviceKVFullOnly)) or (
+                isinstance(action, FreeComponentDeviceSlot)
+                and action.component_type == ComponentType.FULL
+            ):
+                action.indices[:] = [
+                    owner.filter_free(indices) for indices in action.indices
+                ]
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
@@ -3508,6 +3551,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        peer = getattr(self, "peer_l1", None)
+        if peer is not None:
+            peer.poll()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],

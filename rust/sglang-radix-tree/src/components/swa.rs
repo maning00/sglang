@@ -472,6 +472,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 return 0;
             }
             result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
+            tree_core.record_l1_event_(node_id, false);
+            let node = tree_core.arena.node_mut(node_id);
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy());
             cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
@@ -479,6 +481,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 node_id: node.id,
                 source_value: value_slice,
             });
+            tree_core.record_l1_event_(node_id, true);
             0
         } else if swa_evicted_seqlen < total_prefix_len + prefix_len {
             // Branch 2: value_slice[start_idx:] is within SWA window — partial recover
@@ -504,6 +507,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 return start_idx;
             }
             result.record_adopted_range(FULL, swa_evicted_seqlen, total_prefix_len + prefix_len);
+            tree_core.record_l1_event_(node_id, false);
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy());
@@ -512,6 +516,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 node_id: node_ext_id,
                 source_value: new_full,
             });
+            tree_core.record_l1_event_(node_id, true);
             start_idx
         } else {
             // Branch 3: entire value_slice is outside SWA window — not consumed

@@ -1,0 +1,167 @@
+"""The shared-memory protocol, including a real cross-process reader."""
+
+import multiprocessing as mp
+
+import pytest
+from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _key(value):
+    # Deliberately collide in the table's low hash word.
+    return "0" * 16 + f"{value:016x}" + "0" * 32
+
+
+def _reader(path, acquired, release):
+    directory = L1Directory(path, 16, 4, create=False)
+    rows, gens = directory.probe(hash_words([_key(1)]))
+    assert rows.tolist() == [3]
+    assert directory.pin(rows, gens)
+    acquired.set()
+    assert release.wait(10)
+    directory.unpin(rows)
+    directory.close()
+
+
+def test_pin_rollback_and_generation(tmp_path):
+    directory = L1Directory(str(tmp_path / "directory"), 16, 4, create=True)
+    try:
+        directory.publish([_key(1), _key(2)], [3, 4])
+        rows, gens = directory.probe(hash_words([_key(1), _key(2)]))
+        directory.retire([_key(2)])
+        assert not directory.pin(rows, gens)
+        assert directory.pinned_refs == 0
+        assert directory.states([3, 4])[0].tolist() == [0, 0]
+        directory.publish([_key(3)], [4])
+        assert not directory.pin(rows, gens)
+        assert directory.pinned_refs == 0
+        assert directory.freeze()
+        assert not directory.pin(rows[:1], gens[:1])
+        directory.thaw()
+        assert directory.pin(rows[:1], gens[:1])
+        directory.unpin(rows[:1])
+    finally:
+        directory.close()
+
+
+def test_reader_survives_retirement(tmp_path):
+    path = str(tmp_path / "directory")
+    directory = L1Directory(path, 16, 4, create=True)
+    ctx = mp.get_context("spawn")
+    acquired, release = ctx.Event(), ctx.Event()
+    reader = ctx.Process(target=_reader, args=(path, acquired, release))
+    try:
+        directory.publish([_key(1)], [3])
+        reader.start()
+        assert acquired.wait(10)
+        assert directory.retire([_key(1)]).tolist() == [3]
+        assert directory.states([3])[0].tolist() == [1]
+        assert not directory.freeze()
+        with pytest.raises(RuntimeError, match="pinned"):
+            directory.publish([_key(2)], [3])
+        release.set()
+        reader.join(10)
+        assert reader.exitcode == 0
+        assert directory.pinned_refs == 0
+        directory.publish([_key(2)], [3])
+        assert directory.probe(hash_words([_key(2)]))[0].tolist() == [3]
+    finally:
+        release.set()
+        if reader.is_alive():
+            reader.terminate()
+            reader.join()
+        directory.close()
+
+
+def test_collisions_churn_and_cap(tmp_path):
+    directory = L1Directory(str(tmp_path / "directory"), 16, 2, create=True)
+    try:
+        for generation in range(100):
+            keys = [_key(generation * 3 + i) for i in range(3)]
+            directory.publish(keys, [1, 2, 3])
+            # Lookup clips the promise before reserve, rather than discarding
+            # the entire long prefix when the hard cap would reject it.
+            rows, gens = directory.probe(hash_words(keys))
+            assert rows.tolist() == [1, 2]
+            assert directory.pin(rows, gens)
+            assert not directory.pin(rows[:1], gens[:1])
+            assert directory.retire(keys).tolist() == [1, 2, 3]
+            directory.unpin(rows)
+            assert directory.pinned_refs == 0
+    finally:
+        directory.close()
+
+
+@pytest.fixture
+def peer_linker(tmp_path):
+    from collections import Counter
+
+    from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker
+
+    directory = L1Directory(str(tmp_path / "source"), 16, 4, create=True)
+    directory.publish([_key(1), _key(2)], [3, 4])
+    peer = PeerL1Linker.__new__(PeerL1Linker)
+    peer.peers = {1: directory}
+    peer.stats = Counter()
+    peer.min_pages = 1
+    peer._lookups, peer._reservations, peer._queued, peer._batches = {}, {}, {}, {}
+    peer._inflight = set()
+    try:
+        yield peer, directory
+    finally:
+        directory.close()
+
+
+def _queue_peer(peer):
+    import torch
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+    transfer = PoolTransfer(
+        name=PoolName.KV, keys=[_key(1), _key(2)], device_indices=torch.arange(8)
+    )
+    assert peer.lookup("r", [transfer]) == [1, 2]
+    assert peer.reserve("r", 2)
+    assert peer.load("r", [transfer])
+
+
+def test_peer_cancel_unpins_only_a_queued_load(peer_linker):
+    peer, directory = peer_linker
+    _queue_peer(peer)
+    # Releasing a request's hint must not unpin a still-queued transfer.
+    peer.release_reservation("r")
+    assert directory.pinned_refs == 2
+    assert peer.cancel_queued_load("r")
+    assert not peer.cancel_queued_load("r")
+    assert directory.pinned_refs == 0
+    assert not peer.has_loads and not peer._lookups
+
+
+@pytest.mark.parametrize("error", [0, 1])
+def test_peer_finish_waits_before_retiring_even_on_failure(peer_linker, error):
+    from types import SimpleNamespace
+
+    import torch
+
+    peer, directory = peer_linker
+    _queue_peer(peer)
+    plan = peer._queued.pop("r")
+    peer._inflight.add("r")
+    peer._batches[0] = SimpleNamespace(rids=["r"], error_cpu=torch.tensor(error))
+
+    def finish(index):
+        assert index == 0 and peer.has_loads
+        assert directory.pinned_refs == 2
+        directory.unpin(plan.rows)  # Completion event follows the native callback.
+        return True
+
+    peer.layer_done_counter = SimpleNamespace(finish=finish)
+    assert not peer.cancel_queued_load("r")
+    peer.release_reservation("r")
+    assert directory.pinned_refs == 2
+    assert peer.finish_layer_wise_loading(0) == (error == 0)
+    assert not peer.has_loads and not peer._inflight
+    assert directory.pinned_refs == 0
+    assert peer.stats["failed_load_batches"] == bool(error)

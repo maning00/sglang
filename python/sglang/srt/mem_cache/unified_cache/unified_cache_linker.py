@@ -132,6 +132,16 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    persists = True
+
+    def bind_cache(self, cache) -> None:
+        """Attach optional tree-side lifecycle handling after construction."""
+
+    def reserve(self, rid: str, num_pages: int) -> bool:
+        return True
+
+    def release_reservation(self, rid: str) -> None:
+        """Release a reservation that did not become an in-flight load."""
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -247,7 +257,8 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
 
         cache.tree_core.enable_external_cache_linker = True
-        cache.write_through_threshold = 1
+        cache.write_through_threshold = 1 if cache_linker.persists else (1 << 63) - 1
+        cache_linker.bind_cache(cache)
 
     @property
     def layer_done_counter(self) -> object:
@@ -363,11 +374,22 @@ class UnifiedCacheLinkerWrapper:
         computed KV after its forward, once :meth:`finish_loads` has confirmed
         the load.
         """
-        cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
 
+        if not self.cache_linker.reserve(req.rid, len(hit.tail_hashes)):
+            return 0, req.last_node
+        try:
+            return self._load_reserved(req, hit)
+        finally:
+            if req.rid not in self.private_load_indices:
+                self.cache_linker.release_reservation(req.rid)
+
+    def _load_reserved(
+        self, req: Req, hit: ExternalCacheHitMarker
+    ) -> tuple[int, NodeId]:
+        cache = self.cache
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
@@ -582,6 +604,7 @@ class UnifiedCacheLinkerWrapper:
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
+        self.cache_linker.release_reservation(rid)
 
     def close(self) -> None:
         self.cache_linker.close()

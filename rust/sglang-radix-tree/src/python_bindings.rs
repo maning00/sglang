@@ -2163,6 +2163,23 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.detach(|| self.core().enable_external_cache_linker)
     }
 
+    fn set_enable_l1_events(&self, py: Python<'_>, value: bool) {
+        py.detach(|| self.core().enable_l1_events = value);
+    }
+
+    fn enable_l1_events(&self, py: Python<'_>) -> bool {
+        py.detach(|| self.core().enable_l1_events)
+    }
+
+    fn take_l1_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let events = py.detach(|| std::mem::take(&mut self.core().l1_events));
+        let list = PyList::empty(py);
+        for (keys, value) in events {
+            list.append((keys, value.map(PyTensor)))?;
+        }
+        Ok(list.unbind())
+    }
+
     /// Queue the all-cleared placement event.
     fn record_all_cleared_event(&self, py: Python<'_>) {
         py.detach(|| self.core().record_all_cleared_event());
@@ -3493,6 +3510,18 @@ macro_rules! tree_core_binding {
             /// Whether the direct external-cache linker is wired.
             fn enable_external_cache_linker(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.enable_external_cache_linker(py)))
+            }
+
+            fn set_enable_l1_events(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+                catch_native_panic(|| { self.inner.set_enable_l1_events(py, value); Ok(()) })
+            }
+
+            fn enable_l1_events(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.enable_l1_events(py)))
+            }
+
+            fn take_l1_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+                catch_native_panic(|| self.inner.take_l1_events(py))
             }
 
             /// Queue the all-cleared placement event.
