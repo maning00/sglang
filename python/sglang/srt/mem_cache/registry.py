@@ -207,14 +207,19 @@ def create_unified_radix_cache(
             )
 
             linker_cls = UMBPDirectLinker
+        elif backend == "peer_l1":
+            from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker
+
+            linker_cls = PeerL1Linker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"
             )
 
-        cache.init_cache_linker(
-            linker_cls(server_args, params, components=set(cache.components))
-        )
+        linker = linker_cls(server_args, params, components=set(cache.components))
+        if backend == "peer_l1":
+            linker.forward_stream = ctx.tp_worker.model_runner.forward_stream
+        cache.init_cache_linker(linker)
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)

@@ -5025,6 +5025,8 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
+        peer = getattr(self.tree_cache, "peer_l1", None)
+        deferred_pending |= peer is not None and peer.owner.deferred_tokens > 0
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
             if not self.enable_hisparse and not deferred_pending:
                 has_leak, messages = self.invariant_checker._check_all_pools(
@@ -5251,25 +5253,32 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
-            self.cur_batch_for_debug = None
-            self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
-            self.req_to_token_pool.reset_aux_cache_allocator()
-            self.grammar_manager.clear()
-            self.metrics_reporter.reset_metrics()
+            peer = getattr(self.tree_cache, "peer_l1", None)
+            if peer is not None and not peer.begin_flush():
+                return False
+            try:
+                self.cur_batch_for_debug = None
+                self.last_batch = None
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+                self.req_to_token_pool.reset_aux_cache_allocator()
+                self.grammar_manager.clear()
+                self.metrics_reporter.reset_metrics()
 
-            if self.draft_worker:
-                self.draft_worker.clear_cache_pool()
+                if self.draft_worker:
+                    self.draft_worker.clear_cache_pool()
 
-            if empty_cache:
-                current_platform.empty_cache()
-            # Per-DP-group leader logs once: ranks within a DP group are
-            # state-synchronous, but DP groups may diverge.
-            if self.metrics_reporter.is_stats_logging_rank:
-                logger.info("Cache flushed successfully!")
-            success = True
+                if empty_cache:
+                    current_platform.empty_cache()
+                # Per-DP-group leader logs once: ranks within a DP group are
+                # state-synchronous, but DP groups may diverge.
+                if self.metrics_reporter.is_stats_logging_rank:
+                    logger.info("Cache flushed successfully!")
+                success = True
+            finally:
+                if peer is not None:
+                    peer.end_flush()
         else:
             logging.warning(
                 f"Cache not flushed because there are pending requests. "

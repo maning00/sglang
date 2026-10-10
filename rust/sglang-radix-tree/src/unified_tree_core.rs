@@ -633,6 +633,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_storage: bool,
     /// Whether a direct device-to-external-cache linker is wired.
     pub(crate) enable_external_cache_linker: bool,
+    pub(crate) enable_l1_events: bool,
+    pub(crate) l1_events: Vec<(Vec<String>, Option<Tensor>)>,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -828,6 +830,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             is_host_memory_buffer_only: false,
             enable_storage: false,
             enable_external_cache_linker: false,
+            enable_l1_events: false,
+            l1_events: Vec::new(),
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
@@ -852,6 +856,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
     /// match result.
     pub fn reset(&mut self) {
+        self.l1_events.clear();
         self.arena.reset();
         self.component_states = Default::default();
         self.evictable_device_leaves = NodeSet::new();
@@ -2211,6 +2216,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(new_node_id).hash_value = Some(hash_values);
         }
 
+        self.record_l1_event_(new_node_id, true);
+
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(parent_id);
         self.record_store_event_(new_node_id, StorageMedium::Gpu, session_id);
@@ -2227,6 +2234,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
+        self.record_l1_event_(node_id, true);
         let tokens = fresh_value.size()[0] as usize;
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
@@ -2241,6 +2249,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.update_evictable_leaf_sets_(parent_id);
         }
         self.record_store_event_(node_id, StorageMedium::Gpu, session_id);
+    }
+
+    /// Record exact Full-slot ownership independently of public KV events.
+    pub(crate) fn record_l1_event_(&mut self, node_id: NodeIdx_, attach: bool) {
+        if !self.enable_l1_events {
+            return;
+        }
+        let node = self.arena.node(node_id);
+        let hashes = node
+            .hash_value
+            .as_ref()
+            .expect("L1 pages require storage hashes")
+            .clone();
+        let value = attach.then(|| node.device_value(FULL).shallow_clone());
+        self.l1_events.push((hashes, value));
     }
 
     /// Update both device and host leaf sets for a node.

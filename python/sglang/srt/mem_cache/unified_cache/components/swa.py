@@ -443,7 +443,11 @@ class SWAComponent(TreeComponent):
             )
             return
         result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
+        if getattr(self.tree_core, "enable_l1_events", False):
+            self.tree_core.record_l1_event(node, attach=False)
         full_cd.value = incoming_full.clone()
+        if getattr(self.tree_core, "enable_l1_events", False):
+            self.tree_core.record_l1_event(node, attach=True)
         cache_actions.append(FreeDeviceKVFullOnly([old_full]))
         self._publish_window(node=node, cache_actions=cache_actions)
 

@@ -845,6 +845,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def enable_external_cache_linker(self, value: bool) -> None:
         self._binding.set_enable_external_cache_linker(value)
 
+    @property
+    def enable_l1_events(self) -> bool:
+        return self._binding.enable_l1_events()
+
+    @enable_l1_events.setter
+    def enable_l1_events(self, value: bool) -> None:
+        self._binding.set_enable_l1_events(value)
+
+    def take_l1_events(self):
+        return self._binding.take_l1_events()
+
     def insert_host(
         self,
         node_id: NodeId,

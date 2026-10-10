@@ -135,6 +135,8 @@ class SchedulerInvariantChecker:
             # Preserve the existing DCP-only accounting adjustment. DCP widens
             # allocator pages; its scheduler counters still use per-rank units.
             full_evictable_size = ceil_align(full_evictable_size, allocator.page_size)
+        peer = getattr(self.tree_cache, "peer_l1", None)
+        deferred = peer.owner.deferred_tokens if peer is not None else 0
         leak, msg = self._check_pool_invariant(
             "full",
             full_available,
@@ -142,8 +144,10 @@ class SchedulerInvariantChecker:
             protected,
             session_held,
             total,
-            uncached,
+            uncached + deferred,
         )
+        if deferred:
+            msg += f", peer_l1_deferred={deferred}"
         msg += class_watermark_msg
         if kv_shard_size > 1:
             # Partial active pages are already rounded in

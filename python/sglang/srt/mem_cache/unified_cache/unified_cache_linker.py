@@ -62,6 +62,16 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    persists = True
+
+    def bind_cache(self, cache) -> None:
+        """Attach optional tree-side lifecycle handling after construction."""
+
+    def reserve(self, rid: str, num_pages: int) -> bool:
+        return True
+
+    def release_reservation(self, rid: str) -> None:
+        """Release a reservation that did not become an in-flight load."""
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -178,7 +188,8 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
 
         cache.tree_core.enable_external_cache_linker = True
-        cache.write_through_threshold = 1
+        cache.write_through_threshold = 1 if cache_linker.persists else (1 << 63) - 1
+        cache_linker.bind_cache(cache)
 
     @property
     def layer_done_counter(self) -> object:
@@ -288,10 +299,22 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[int, NodeId]:
-        cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
+
+        if not self.cache_linker.reserve(req.rid, len(hit.tail_hashes)):
+            return 0, req.last_node
+        try:
+            return self._load_reserved(req, hit)
+        finally:
+            if req.rid not in self.pending_loads:
+                self.cache_linker.release_reservation(req.rid)
+
+    def _load_reserved(
+        self, req: Req, hit: ExternalCacheHitMarker
+    ) -> tuple[int, NodeId]:
+        cache = self.cache
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
@@ -387,9 +410,10 @@ class UnifiedCacheLinkerWrapper:
 
         self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
-        cache.tree_core.mark_external_cache_stored_path(
-            insert_result.last_device_node, req.last_node
-        )
+        if self.cache_linker.persists:
+            cache.tree_core.mark_external_cache_stored_path(
+                insert_result.last_device_node, req.last_node
+            )
         return len(canonical_tail), insert_result.last_device_node
 
     def _queue_load(
@@ -594,6 +618,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.cache_linker.release_reservation(rid)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.
         if self.cache_linker.cancel_queued_load(rid):

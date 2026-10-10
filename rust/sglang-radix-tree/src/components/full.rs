@@ -106,6 +106,11 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         target: EvictLayer,
     ) -> (usize, usize) {
+        if target.contains(EvictLayer::Device)
+            && tree_core.arena.node(node_id).has_device_value(FULL)
+        {
+            tree_core.record_l1_event_(node_id, false);
+        }
         let node = tree_core.arena.node_mut(node_id);
         let mut freed = 0;
         let mut host_freed = 0;

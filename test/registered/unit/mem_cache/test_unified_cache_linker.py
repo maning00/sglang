@@ -185,6 +185,35 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
+def test_failed_peer_reservation_does_not_prepare_a_load():
+    linker = _FakeLinker()
+    linker.persists = False
+    linker.reserve = lambda rid, pages: False
+    component = SimpleNamespace(build_external_linker_transfer=MagicMock())
+    cache = _cache_for_wrapper(page_size=4, _components_tuple=(component,))
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper.hit_markers["r"] = ExternalCacheHitMarker(
+        RadixKey(array("q", range(4))), ["page"], 0
+    )
+    assert wrapper.load_back(SimpleNamespace(rid="r", last_node=0)) == (0, 0)
+    component.build_external_linker_transfer.assert_not_called()
+    assert cache.write_through_threshold == (1 << 63) - 1
+
+
+def test_allocation_failure_releases_peer_reservation_once():
+    linker = _FakeLinker()
+    linker.reserve = lambda rid, pages: True
+    linker.release_reservation = MagicMock()
+    component = SimpleNamespace(build_external_linker_transfer=lambda *args: None)
+    cache = _cache_for_wrapper(page_size=4, _components_tuple=(component,))
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper.hit_markers["r"] = ExternalCacheHitMarker(
+        RadixKey(array("q", range(4))), ["page"], 0
+    )
+    assert wrapper.load_back(SimpleNamespace(rid="r", last_node=0)) == (0, 0)
+    linker.release_reservation.assert_called_once_with("r")
+
+
 @pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))

@@ -94,7 +94,11 @@ class PrefillBudget:
             if self.tree_cache.supports_mamba()
             else self.tree_cache.evictable_size()
         )
-        return self.allocator.available_size() + evictable
+        return self.allocator.available_size() + evictable - self._peer_pinned_tokens()
+
+    def _peer_pinned_tokens(self):
+        peer = getattr(self.tree_cache, "peer_l1", None)
+        return peer.owner.pinned_live_tokens if peer is not None else 0
 
     @property
     def remaining_total(self):
@@ -182,7 +186,9 @@ class SWAPrefillBudget(PrefillBudget):
                 + self.tree_cache.swa_evictable_size()
             )
         return (
-            self.allocator.full_available_size() + self.tree_cache.full_evictable_size()
+            self.allocator.full_available_size()
+            + self.tree_cache.full_evictable_size()
+            - self._peer_pinned_tokens()
         )
 
     @property

@@ -475,6 +475,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        self._l1_events = []
         # End suspended walks while their session-cursor sentinels still
         # belong to the old LRUs, clearing any pending internal victim.
         for component in self.components:
@@ -1502,6 +1503,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
+        self.record_l1_event(new_node, attach=True)
+
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
         self.kv_events.record_store(new_node, session_id=session_id)
@@ -1519,6 +1522,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[ct]
         assert cd.value is None
         cd.value = fresh_value.clone()
+        self.record_l1_event(node, attach=True)
         n = self.components_by_type[ct].reclaimable_tokens(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
@@ -1534,6 +1538,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             medium=StorageMedium.GPU,
             session_id=session_id,
         )
+
+    # Peer L1 records storage hashes and exact device values independently of
+    # optional public KV events. Splits preserve the hash-to-slot relation.
+    enable_l1_events = False
+
+    def record_l1_event(self, node, *, attach: bool) -> None:
+        if self.enable_l1_events:
+            self._l1_events.append(
+                (
+                    list(node.hash_value),
+                    node.component_data[BASE_COMPONENT_TYPE].value if attach else None,
+                )
+            )
+
+    def take_l1_events(self):
+        events, self._l1_events = self._l1_events, []
+        return events
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
