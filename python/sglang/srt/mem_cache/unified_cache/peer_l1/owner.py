@@ -56,6 +56,7 @@ class L1Owner:
                     self._pending.pop(key, None)
                     self._published.discard(key)
                 rows = self.directory.retire(keys)
+                self.linker.stats["retired_pages"] += len(rows)
                 if len(rows):
                     pins, _ = self.directory.states(rows)
                     self._hold.update(int(row) for row in rows[pins > 0])
@@ -190,6 +191,7 @@ class L1Owner:
 
     def publish_loaded(self, keys, rows):
         self.directory.publish(keys, rows)
+        self.linker.stats["published_pages"] += len(keys)
         self._published.update(keys)
         for key in keys:
             self._pending.pop(key, None)
