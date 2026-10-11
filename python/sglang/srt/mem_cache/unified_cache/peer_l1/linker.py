@@ -95,6 +95,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.wait_seconds = float(config.get("wait_timeout_ms", 200)) / 1000
         self.min_pages = int(config.get("min_hit_pages", 1))
         self.check_hooks = bool(config.get("check_hooks", False))
+        self.stitch_stats = bool(config.get("stitch_stats", False))
         self._collective_guard = CollectiveGuard() if self.check_hooks else None
         layer_group, blocks = int(config.get("layer_group", 8)), int(
             config.get("blocks", 32)
@@ -200,6 +201,9 @@ class PeerL1Linker(UnifiedCacheLinker):
             if len(rows) and (best is None or len(rows) > len(best.rows)):
                 best = Reservation(peer, list(keys[: len(rows)]), rows, gens)
         self.stats["lookups"] += 1
+        self.stats["lookup_tail_pages"] += len(keys)
+        if self.stitch_stats and best is not None:
+            self._count_stitchable(hashes, start=len(best.rows))
         if best is None or len(best.rows) < self.min_pages:
             return []
         self.stats["lookup_hits"] += 1
@@ -208,6 +212,20 @@ class PeerL1Linker(UnifiedCacheLinker):
             self.stats["lookup_capped"] += 1
         self._lookups[rid] = best
         return list(range(1, len(best.rows) + 1))
+
+    def _count_stitchable(self, hashes, *, start):
+        """Diagnostic: the prefix restorable if consecutive runs could come
+        from different peers, against the single-peer prefix ending at start."""
+        position = start
+        while position < len(hashes):
+            run = max(
+                len(peer.probe(hashes[position:])[0]) for peer in self.peers.values()
+            )
+            if run == 0:
+                break
+            position += run
+        self.stats["lookup_single_peer_pages"] += start
+        self.stats["lookup_stitched_pages"] += position
 
     def reserve(self, rid, num_pages):
         found = self._lookups.pop(rid, None)
