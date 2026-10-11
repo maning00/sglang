@@ -151,6 +151,7 @@ class PeerL1Linker(UnifiedCacheLinker):
                 layer_group=layer_group,
                 blocks=blocks,
                 verify=bool(config.get("verify_bytes", False)),
+                priority=int(config.get("stream_priority", 0)),
             )
             self.layer_done_counter = self.copier.counter
         except BaseException:

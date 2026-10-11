@@ -171,10 +171,13 @@ class L1Copier:
         layer_group: int,
         blocks: int,
         verify: bool,
+        priority: int = 0,
     ):
         self.memory = memory
         self.module = copy_module()
-        self.stream = torch.cuda.Stream(device=memory.device)
+        # A non-default priority draws from a separate stream pool, which can map
+        # to its own hardware queue instead of one shared with forward or EP.
+        self.stream = torch.cuda.Stream(device=memory.device, priority=priority)
         self.counter = LayerCounter(layers)
         self.layer_group, self.blocks, self.verify = layer_group, blocks, verify
 

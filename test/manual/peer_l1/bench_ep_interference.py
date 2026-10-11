@@ -164,6 +164,11 @@ def worker(rank, args, port):
     results = []
     for blocks in args.blocks:
         copier = L1Copier(memory, layers=61, layer_group=8, blocks=blocks, verify=False)
+        if args.copy_priority:
+            # Experiment: a high-priority stream may get its own hardware queue.
+            copier.stream = torch.cuda.Stream(
+                device=device, priority=args.copy_priority
+            )
         forward = torch.cuda.current_stream()
 
         def copy_once(tag):
@@ -294,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--ep-iters", type=int, default=20)
     parser.add_argument("--copy-iters", type=int, default=10)
     parser.add_argument("--gemm-iters", type=int, default=50)
+    parser.add_argument("--copy-priority", type=int, default=0)
     args = parser.parse_args()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
