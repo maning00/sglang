@@ -127,6 +127,8 @@ def peer_linker(tmp_path):
     peer.peers = {1: directory}
     peer.stats = Counter()
     peer.min_pages = 1
+    peer.pin_cap = 4
+    peer.stitch_stats = False
     peer._collective_guard = None
     peer._lookups, peer._reservations, peer._queued, peer._batches = {}, {}, {}, {}
     peer._inflight = set()

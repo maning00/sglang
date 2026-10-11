@@ -30,6 +30,7 @@ The extra-config object accepts:
 | `wait_timeout_ms` | 200 | Bounded capacity wait; 0 disables waiting |
 | `verify_bytes` | false | Compare every copied row before releasing its source pin |
 | `check_hooks` | false | Check allocator frees and reject collectives between pin and copy submission |
+| `stitch_stats` | false | Count the prefix pages restorable if runs could come from different peers (`lookup_stitched_pages` against `lookup_single_peer_pages`) |
 
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;
