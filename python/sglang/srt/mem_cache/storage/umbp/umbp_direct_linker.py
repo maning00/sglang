@@ -7,20 +7,16 @@ from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
-)
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-    resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import (
@@ -29,6 +25,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -194,7 +193,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         *,
         components,
         _storage=None,
+        extra_config=None,
     ):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            resolve_hybrid_device_pool_group,
+        )
+
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
@@ -247,9 +251,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = _parse_storage_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        if extra_config is None:
+            extra_config = _parse_storage_extra_config(
+                get_memory().hicache_storage_backend_extra_config
+            )
         extra_config = dict(extra_config)
         standalone_requested = bool(
             extra_config.get("standalone_address")
@@ -401,7 +406,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._load_queue: Queue[
             tuple[int, list[str], list[_PoolRangePlan], object] | None
         ] = Queue()
-        self._completed_loads: Queue[list[str]] = Queue()
+        self._completed_loads: Queue[tuple[list[str], BaseException | None]] = Queue()
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
@@ -558,7 +563,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return self._completed_loads.qsize()
 
     def pop_completed_load(self) -> list[str]:
-        return self._completed_loads.get_nowait()
+        rids, error = self._completed_loads.get_nowait()
+        if error is not None:
+            raise RuntimeError("UMBP layer-wise KV load failed.") from error
+        return rids
 
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
@@ -713,10 +721,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 counter_index, rids, plans, ready_event = task
-                try:
-                    self._run_layer_wise_batch(counter_index, plans, ready_event)
-                finally:
-                    self._completed_loads.put(rids)
+                error = self._run_layer_wise_batch(counter_index, plans, ready_event)
+                self._completed_loads.put((rids, error))
             finally:
                 self._load_queue.task_done()
 
@@ -849,7 +855,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
-    ) -> None:
+    ) -> BaseException | None:
         try:
             ready_event.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
@@ -894,6 +900,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
+            return error
+        return None
 
     def _layer_groups(self) -> list[list[int]]:
         return [

@@ -20,6 +20,9 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:39087")
     parser.add_argument("--records", type=int, default=400)
     parser.add_argument("--timeout", type=float, default=900)
+    parser.add_argument(
+        "--combined", action="store_true", help="Expect L2 hits after flush"
+    )
     args = parser.parse_args()
     session = uuid.uuid4().hex
     output_lock = Lock()
@@ -98,7 +101,17 @@ def main():
 
     flush()
     after = generate("after_flush", 1, text)
-    assert sum(after["cached"].values()) == 0, "flush left a peer directory readable"
+    if args.combined:
+        # Every peer directory was cleared. A host hit now must come from L2.
+        assert after["cached"].get("host", 0) >= 2048
+        assert after["cached"].get("device", 0) == 0
+        time.sleep(0.2)
+        promoted = generate("l2_promoted_to_peer", 6, text)
+        assert promoted["cached"].get("host", 0) >= 2048
+    else:
+        assert (
+            sum(after["cached"].values()) == 0
+        ), "flush left a peer directory readable"
     response = requests.post(
         args.url + "/pause_generation", json={"mode": "retract"}, timeout=30
     )
@@ -109,7 +122,11 @@ def main():
         response = requests.post(args.url + "/continue_generation", json={}, timeout=30)
         response.raise_for_status()
     after = generate("after_paused_flush", 1, text)
-    assert sum(after["cached"].values()) == 0, "paused flush left stale peer pages"
+    if args.combined:
+        assert after["cached"].get("host", 0) >= 2048
+        assert after["cached"].get("device", 0) == 0
+    else:
+        assert sum(after["cached"].values()) == 0, "paused flush left stale peer pages"
     print(
         "PASS: peer/local/cold attribution, concurrent restores, ordinary and paused flush",
         flush=True,

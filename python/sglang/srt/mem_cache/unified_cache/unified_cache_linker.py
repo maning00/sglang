@@ -25,27 +25,20 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
-    InsertParams,
-    MatchResult,
-)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components import (
-    ComponentType,
-    ExternalLinkerLoadPhase,
-    LinkerTransferPhase,
-    TreeComponent,
-)
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, MatchResult
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.components import (
+        ExternalLinkerLoadPhase,
+        TreeComponent,
+    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -72,6 +65,10 @@ class UnifiedCacheLinker(ABC):
 
     def release_reservation(self, rid: str) -> None:
         """Release a reservation that did not become an in-flight load."""
+
+    def marks_loaded_as_stored(self, rid: str) -> bool:
+        """Whether the selected hit confirms an external store copy."""
+        return self.persists
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -159,6 +156,8 @@ class UnifiedCacheLinkerWrapper:
         cache: UnifiedRadixCache,
         cache_linker: UnifiedCacheLinker,
     ):
+        from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+
         unsupported = set(cache.tree_components) - _EXTERNAL_LINKER_SUPPORTED_COMPONENTS
         if unsupported:
             names = ", ".join(
@@ -201,6 +200,8 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        from sglang.srt.mem_cache.unified_cache.components import LinkerTransferPhase
+
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -278,6 +279,8 @@ class UnifiedCacheLinkerWrapper:
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
     ) -> list[str]:
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
         """Per-page storage hashes for the device-uncached tail of the prefix."""
         last_hash = None
         if device_hit_len > 0:
@@ -314,6 +317,12 @@ class UnifiedCacheLinkerWrapper:
     def _load_reserved(
         self, req: Req, hit: ExternalCacheHitMarker
     ) -> tuple[int, NodeId]:
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.unified_cache.components import (
+            ExternalLinkerLoadPhase,
+            LinkerTransferPhase,
+        )
+
         cache = self.cache
 
         device_hit_len = hit.device_hit_len
@@ -410,7 +419,7 @@ class UnifiedCacheLinkerWrapper:
 
         self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
-        if self.cache_linker.persists:
+        if self.cache_linker.marks_loaded_as_stored(req.rid):
             cache.tree_core.mark_external_cache_stored_path(
                 insert_result.last_device_node, req.last_node
             )
@@ -443,6 +452,8 @@ class UnifiedCacheLinkerWrapper:
         insert_result=None,
         canonical_full: torch.Tensor | None = None,
     ) -> list[PoolTransfer]:
+        from sglang.srt.mem_cache.unified_cache.components import ExternalLinkerLoadPhase
+
         if not component_transfers:
             return []
         full = component_transfers[0][1]

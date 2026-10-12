@@ -199,8 +199,12 @@ class L1Owner:
     def begin_flush(self):
         self.consume_events()
         self.reclaim()
-        if self.linker.has_loads:
+        wrapper = self.cache.linker
+        if self.linker.has_loads or wrapper.pending_loads:
             logger.warning("peer_l1 flush busy: local loads have not completed")
+            return False
+        if wrapper.pending_offloads:
+            logger.warning("peer_l1 flush busy: UMBP offloads have not completed")
             return False
         if self._hold or self._zombies:
             logger.warning(
