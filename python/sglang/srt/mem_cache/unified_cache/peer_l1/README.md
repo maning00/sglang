@@ -64,6 +64,28 @@ IPC mappings live for the engine's lifetime. Close is collective across the
 worker group so producers outlive consumers. Recovery from individual worker
 crashes is outside this PoC's scope.
 
+## Peer L1 plus UMBP
+
+`--unified-cache-external-linker-backend mori_peer_l1` combines peer HBM reads
+with the existing UMBP write-through store. UMBP configuration stays at the top
+level and peer options go in `peer_l1`, for example:
+
+```json
+{"ssd_enabled":false,"peer_l1":{"blocks":32,"layer_group":8,"pin_cap":16384}}
+```
+
+This requires the same UMBP standalone setup as the `mori` backend. Each request
+uses one source: peer HBM when it covers the selected prefix and can reserve it,
+otherwise UMBP when it covers the whole prefix. A failed peer reservation with
+only a shorter UMBP prefix falls back to recomputation. Writes always go to UMBP.
+Restores stay private until their whole load succeeds and checkpoint inserts them.
+An L1 or L2 failure aborts every restoring request in that batch.
+Flush checks both loaders and UMBP offloads; it clears device directories while
+preserving the UMBP tier. The periodic peer stats distinguish `l1_loaded_pages`
+and `l2_loaded_pages` for successful batches, and `failed_composite_load_batches`.
+Restored tails follow upstream write-through behavior when checkpoint inserts them,
+including a repeated write for a tail loaded from UMBP.
+
 ## Verification
 
 The focused tests are `test_peer_l1_directory.py` and `test_peer_l1_cache.py` in
@@ -82,3 +104,6 @@ With a real-weight DEP8 server and both verification options enabled, run
 concurrent readers, and cold attribution after flush. Unified KV output text
 can differ across cache paths; the byte checks and cache-source attribution
 establish which data path was exercised.
+Pass `--combined` for `mori_peer_l1`: after flush it requires an L2 hit, followed
+by another peer read of that restored prefix. Check both loaded-page counters
+in the server log to confirm the selected sources.

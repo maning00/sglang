@@ -567,6 +567,46 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         cache.reset()
         cache.sanity_check()
 
+    def test_peer_l1_duplicate_private_tail_has_no_attach_event(self):
+        self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        linker = _FakeLinker()
+        linker.restorable = [1, 2]
+        cache.init_cache_linker(linker)
+        cache.write_through_threshold = sys.maxsize
+        cache.tree_core.enable_l1_events = True
+        tokens = list(range(1, 5))
+        req = self._make_req(req_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        loaded = cache.linker.private_load_indices[req.rid]
+        self.assertEqual(cache.tree_core.take_l1_events(), [])
+
+        # Another request inserts the same prefix before this load checkpoints.
+        self._insert(cache, allocator, req_pool, tokens)
+        events = cache.tree_core.take_l1_events()
+        self.assertTrue(events)
+        for _, indices in events:
+            self.assertFalse(torch.isin(indices, loaded).any().item())
+        cache.ready_to_load_host_cache()
+        self._bind_loaded_request(cache, req_pool, req, tokens, loaded)
+        self.assertEqual(cache.finish_external_linker_loads([req]), [])
+        before = allocator.available_size()
+        cache.checkpoint(req, up_to=req.extend_end)
+        self.assertEqual(allocator.available_size(), before + len(loaded))
+        self.assertEqual(cache.tree_core.take_l1_events(), [])
+        cache.unlock(req.lock)
+        req.lock = None
+
     def test_swa_hit_loads_private_tail_and_dedups_on_insert(self):
         self._run_swa_hit(load_landed=True)
 

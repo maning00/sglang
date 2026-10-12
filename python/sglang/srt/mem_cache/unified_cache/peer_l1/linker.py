@@ -52,7 +52,7 @@ class LoadPlan:
 class PeerL1Linker(UnifiedCacheLinker):
     persists = False
 
-    def __init__(self, server_args, params, *, components):
+    def __init__(self, server_args, params, *, components, extra_config=None):
         if not torch.version.hip or params.page_size != 256:
             raise ValueError("peer_l1 requires ROCm and page_size=256")
         memory = get_memory()
@@ -89,7 +89,11 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.device = torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.device_count() < world:
             raise ValueError("Every peer_l1 worker must see every participating GPU")
-        config = memory.hicache_storage_backend_extra_config
+        config = (
+            memory.hicache_storage_backend_extra_config
+            if extra_config is None
+            else extra_config
+        )
         config = json.loads(config) if isinstance(config, str) else dict(config or {})
         # Measured on DEP8 AgentX: 2048 caused reserve failures and truncated long
         # prefixes up to c128; 8192 cleared both at c64, 16384 adds headroom.

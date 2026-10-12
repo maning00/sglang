@@ -189,3 +189,212 @@ def test_peer_finish_waits_before_retiring_even_on_failure(peer_linker, error):
     assert not peer.has_loads and not peer._inflight
     assert directory.pinned_refs == 0
     assert peer.stats["failed_load_batches"] == bool(error)
+
+
+class _Source:
+    """Queue contract with real CPU layer futures; no device or storage IO."""
+
+    def __init__(self):
+        from collections import Counter
+
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            LayerWiseLoadCounter,
+        )
+
+        self.page_size = 4
+        self.hits, self.pin, self.accept_load = 2, True, True
+        self.stats = Counter()
+        self.layer_done_counter = LayerWiseLoadCounter(2)
+        self.pending, self.batches = {}, {}
+        self.reserved, self.active, self.hints = set(), set(), set()
+        self.finishes = []
+
+    def bind_cache(self, cache):
+        pass
+
+    def lookup(self, rid, transfers):
+        self.hints.add(rid)
+        return list(range(1, self.hits + 1))
+
+    def reserve(self, rid, pages):
+        self.hints.discard(rid)
+        if self.pin:
+            self.reserved.add(rid)
+        return self.pin
+
+    def release_reservation(self, rid):
+        self.hints.discard(rid)
+        if rid not in self.active:
+            self.reserved.discard(rid)
+
+    def load(self, rid, transfers):
+        if not self.accept_load:
+            return False
+        self.pending[rid] = transfers
+        self.active.add(rid)
+        return True
+
+    def start_layer_wise_loading(self):
+        if not self.pending:
+            return -1
+        index = self.layer_done_counter.update_producer()
+        self.batches[index] = list(self.pending)
+        self.pending.clear()
+        return index
+
+    def finish_layer_wise_loading(self, index):
+        self.finishes.append(index)
+        landed = self.layer_done_counter.finish(index)
+        for rid in self.batches.pop(index, ()):
+            self.active.remove(rid)
+            self.reserved.discard(rid)
+        return landed
+
+    def cancel_queued_load(self, rid):
+        if self.pending.pop(rid, None) is None:
+            return False
+        self.active.remove(rid)
+        self.release_reservation(rid)
+        return True
+
+    def reset(self):
+        self.pending.clear()
+        self.batches.clear()
+        self.active.clear()
+        self.reserved.clear()
+        self.hints.clear()
+        self.layer_done_counter.reset()
+
+    close = reset
+
+
+@pytest.fixture
+def composite():
+    from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
+
+    return PeerL1PlusL2Linker(_Source(), _Source())
+
+
+def _transfers(pages=2):
+    import torch
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+    return [
+        PoolTransfer(
+            name=PoolName.KV,
+            keys=[_key(i) for i in range(pages)],
+            device_indices=torch.arange(pages * 4),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "a,b,pin,source",
+    [
+        (4, 2, True, "l1"),
+        (2, 2, True, "l1"),
+        (2, 4, True, "l2"),
+        (4, 4, False, "l2"),
+        (4, 2, False, None),
+    ],
+)
+def test_composite_selects_one_source_and_releases_unused_reservation(
+    composite, a, b, pin, source
+):
+    composite.l1.hits, composite.l2.hits, composite.l1.pin = a, b, pin
+    pages = max(a, b)
+    assert composite.lookup("r", _transfers(pages)) == list(range(1, pages + 1))
+    assert composite.reserve("r", pages) == (source is not None)
+    if source is not None:
+        assert composite._requests["r"].source == source
+    composite.release_reservation("r")  # Allocation failed before load().
+    assert not composite._requests and not composite._lookups
+    assert not composite.l1.reserved and not composite.l1.hints
+
+
+@pytest.mark.parametrize("source", ["l1", "l2"])
+@pytest.mark.parametrize("cancel", [False, True], ids=["rejected", "cancelled"])
+def test_composite_cleans_a_load_that_never_started(composite, source, cancel):
+    composite.l1.hits = 2 if source == "l1" else 0
+    backend = getattr(composite, source)
+    backend.accept_load = cancel
+    transfers = _transfers()
+    composite.lookup("r", transfers)
+    assert composite.reserve("r", 2)
+    assert composite.load("r", transfers) == cancel
+    if cancel:
+        assert "r" in backend.pending  # L2 must be queued during load(), too.
+        assert composite.cancel_queued_load("r")
+    composite.release_reservation("r")
+    assert composite.start_layer_wise_loading() == -1
+    assert not composite._requests and not composite._queued
+    assert not backend.active and not composite.l1.reserved
+
+
+@pytest.mark.parametrize("failed_source", [None, "l1", "l2"])
+def test_composite_finishes_both_sources_before_batch_verdict(composite, failed_source):
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+        UnifiedCacheLinkerWrapper,
+    )
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from test_unified_cache_linker import _cache_for_wrapper
+
+    transfers = _transfers()
+    for rid, hits in (("a", 2), ("b", 0)):
+        composite.l1.hits = hits
+        composite.lookup(rid, transfers)
+        assert composite.reserve(rid, 2)
+        assert composite.load(rid, transfers)
+    index = composite.start_layer_wise_loading()
+    assert not composite.cancel_queued_load("a")
+    for name in ("l1", "l2"):
+        source = getattr(composite, name)
+        counter = source.layer_done_counter
+        if name == failed_source:
+            counter.fail(counter.producer_index, RuntimeError("load failed"))
+        else:
+            for layer in range(2):
+                counter.complete(counter.producer_index, layer)
+    composite.layer_done_counter.set_consumer(index)
+    composite.layer_done_counter.wait_until(1)  # No exception or early retirement.
+    assert index in composite.layer_done_counter._indices
+
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=lambda *args: None)
+    wrapper = UnifiedCacheLinkerWrapper(cache, composite)
+    cache.linker = wrapper
+    wrapper.inflight_load_rids = ["a", "b"]
+    wrapper.inflight_load_index = index
+    wrapper.private_load_indices = {
+        rid: transfers[0].device_indices for rid in ("a", "b")
+    }
+    reqs = [
+        SimpleNamespace(rid=rid, skip_radix_cache_insert=False) for rid in ("a", "b")
+    ]
+    failed = UnifiedRadixCache.finish_external_linker_loads(cache, reqs)
+    assert failed == (reqs if failed_source else [])
+    if failed_source:
+        assert all(
+            req.skip_radix_cache_insert and req.discard_output_reason.status_code == 503
+            for req in reqs
+        )
+    assert not wrapper.private_load_indices and not wrapper.inflight_load_rids
+    assert not composite._requests and not composite._batches
+    assert not composite.layer_done_counter._indices
+    assert composite.l1.finishes == [0] and composite.l2.finishes == [0]
+    assert not composite.l1.reserved and not composite.l2.active
+    composite.layer_done_counter.set_consumer(index)  # A later decode keeps this index.
+    composite.layer_done_counter.wait_until(0)
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_composite_reset_clears_unused_requests(composite, operation):
+    composite.lookup("r", _transfers())
+    composite.reserve("r", 2)
+    getattr(composite, operation)()
+    assert not composite._lookups and not composite._requests
+    assert not composite._queued and not composite._batches
+    assert not composite.layer_done_counter._indices
+    assert not composite.l1.reserved
