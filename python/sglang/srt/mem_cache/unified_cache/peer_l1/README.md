@@ -25,7 +25,7 @@ The extra-config object accepts:
 | `blocks` | 32 | Maximum blocks in a fused copy launch |
 | `layer_group` | 8 | Logical layers copied before recording their ready events |
 | `stream_priority` | 0 | Copy stream priority; -1 asks for a high-priority stream (own hardware queue) |
-| `pin_cap` | 2048 | Maximum remote page references held on one owner |
+| `pin_cap` | 16384 | Maximum remote page references held on one owner |
 | `min_hit_pages` | 1 | Minimum prefix worth restoring |
 | `wait_timeout_ms` | 200 | Bounded capacity wait; 0 disables waiting |
 | `verify_bytes` | false | Compare every copied row before releasing its source pin |

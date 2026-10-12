@@ -91,7 +91,9 @@ class PeerL1Linker(UnifiedCacheLinker):
             raise ValueError("Every peer_l1 worker must see every participating GPU")
         config = memory.hicache_storage_backend_extra_config
         config = json.loads(config) if isinstance(config, str) else dict(config or {})
-        self.pin_cap = int(config.get("pin_cap", 2048))
+        # Measured on DEP8 AgentX: 2048 caused reserve failures and truncated long
+        # prefixes up to c128; 8192 cleared both at c64, 16384 adds headroom.
+        self.pin_cap = int(config.get("pin_cap", 16384))
         self.wait_seconds = float(config.get("wait_timeout_ms", 200)) / 1000
         self.min_pages = int(config.get("min_hit_pages", 1))
         self.check_hooks = bool(config.get("check_hooks", False))
