@@ -279,9 +279,9 @@ class UnifiedCacheLinkerWrapper:
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
     ) -> list[str]:
+        """Per-page storage hashes for the device-uncached tail of the prefix."""
         from sglang.srt.mem_cache.utils import get_storage_hash_str
 
-        """Per-page storage hashes for the device-uncached tail of the prefix."""
         last_hash = None
         if device_hit_len > 0:
             last_hash = self.cache.get_last_hash_value(result.last_device_node)
@@ -452,7 +452,9 @@ class UnifiedCacheLinkerWrapper:
         insert_result=None,
         canonical_full: torch.Tensor | None = None,
     ) -> list[PoolTransfer]:
-        from sglang.srt.mem_cache.unified_cache.components import ExternalLinkerLoadPhase
+        from sglang.srt.mem_cache.unified_cache.components import (
+            ExternalLinkerLoadPhase,
+        )
 
         if not component_transfers:
             return []
