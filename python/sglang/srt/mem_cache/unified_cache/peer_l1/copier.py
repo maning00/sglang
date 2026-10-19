@@ -202,8 +202,7 @@ class L1Copier:
         events, finish = self.counter.events[index]
         self.stream.wait_stream(schedule_stream)
         self.stream.wait_stream(forward_stream)
-        # Each plan has one peer, selected source rows, destination indices,
-        # and the full reservation (which can include deduplicated pages).
+        # Each plan has one peer, source rows and request-private destinations.
         keys = [key for plan in plans for key in plan.keys]
         sources = torch.empty(
             (len(keys), 2), dtype=torch.int64, device="cpu", pin_memory=True

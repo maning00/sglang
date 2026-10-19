@@ -761,6 +761,7 @@ class UnifiedRadixCache(BasePrefixCache):
         peer = self.peer_l1
         peer_owner = peer.owner if peer is not None else None
         if peer_owner is not None:
+
             def full_available():
                 return self._component_available_size(ComponentType.FULL)
 

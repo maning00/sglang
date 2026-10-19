@@ -130,8 +130,9 @@ def build_ep(rank, world, tokens):
 
 
 def timed(stream, fn, iterations):
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
     )
     with torch.cuda.stream(stream):
         start.record(stream)
@@ -247,8 +248,9 @@ def worker(rank, args, port):
     dst.copy_(src)
     torch.cuda.synchronize()
     dist.barrier()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
     )
     start.record()
     for _ in range(5):
