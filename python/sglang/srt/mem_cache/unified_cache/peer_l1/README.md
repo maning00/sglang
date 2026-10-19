@@ -28,11 +28,14 @@ The extra-config object accepts:
 | `min_hit_pages` | 1 | Minimum prefix worth restoring |
 | `wait_timeout_ms` | 200 | Bounded capacity wait; 0 disables waiting |
 | `verify_bytes` | false | Compare every copied row before releasing its source pin |
-| `check_hooks` | false | Check that allocator frees contain no published rows |
+| `check_hooks` | false | Check allocator frees and reject collectives between pin and copy submission |
 
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;
 a reservation race returns a cache miss through the existing load-back flow.
+The collective check uses the current thread's Python profile hook only while
+reservations are unsubmitted, including calls through previously imported
+aliases. It cannot run alongside another Python profiler on that thread.
 
 ## Ownership and completion
 
@@ -51,7 +54,9 @@ A failed batch is aborted by the scheduler without publishing its pages. Queued
 loads can be cancelled before the request frees its private slots.
 
 Flush checks local activity, atomically freezes new remote reservations, then
-withdraws the directory before clearing the pool.
+withdraws the directory before clearing the pool. Completed offloads are reaped
+when flushing a paused engine; pending loads, offloads or remote pins return busy.
+Weight updates use the upstream failure response when a flush is refused.
 
 IPC mappings live for the engine's lifetime. Close is collective across the
 worker group so producers outlive consumers. Recovery from individual worker

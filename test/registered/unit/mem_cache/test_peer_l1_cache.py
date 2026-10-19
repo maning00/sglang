@@ -22,6 +22,38 @@ from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
+def test_flush_refuses_private_loads_offloads_and_remote_pins(tmp_path, caplog):
+    directory = L1Directory(str(tmp_path / "flush"), 17, 4, create=True)
+    wrapper = SimpleNamespace(inflight_load_rids=["r"], pending_offloads=[])
+    owner = L1Owner.__new__(L1Owner)
+    owner.cache = SimpleNamespace(linker=wrapper)
+    owner.linker = SimpleNamespace(has_loads=False)
+    owner.directory = directory
+    owner.consume_events = lambda: None
+    owner._hold, owner._zombies = set(), set()
+    keys = ["0" * 64]
+    try:
+        directory.publish(keys, [1])
+        assert not owner.begin_flush()
+        assert "local loads" in caplog.text
+        wrapper.inflight_load_rids.clear()
+        wrapper.pending_offloads.append(object())
+        assert not owner.begin_flush()
+        assert "offloads" in caplog.text
+        wrapper.pending_offloads.clear()
+        rows, gens = directory.probe(hash_words(keys))
+        assert directory.pin(rows, gens)
+        assert not owner.begin_flush()
+        directory.unpin(rows)
+        assert owner.begin_flush()
+        assert not directory.pin(rows, gens)
+        directory.thaw()
+        assert directory.pin(rows, gens)
+        directory.unpin(rows)
+    finally:
+        directory.close()
+
+
 def test_hip_event_waits_for_host_callback():
     if not torch.version.hip or not torch.cuda.is_available():
         pytest.skip("HIP callback contract")
