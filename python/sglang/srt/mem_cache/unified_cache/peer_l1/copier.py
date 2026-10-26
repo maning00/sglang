@@ -57,18 +57,21 @@ def sdma_module():
 class SdmaEngine:
     """mori anvil SDMA queues, one per peer, that pull peer rows into this GPU."""
 
-    def __init__(self, memory, peer_devices):
+    def __init__(self, memory, peer_devices, channels):
         self.module = sdma_module()
         device = memory.device
-        # Queue order is the peer rank order; the copier sorts jobs the same way.
-        self.queue_of = {peer: q for q, peer in enumerate(sorted(peer_devices))}
-        handles = torch.empty(len(self.queue_of), dtype=torch.int64)
+        # Queues are peer-major in peer rank order, `channels` per peer; the copier
+        # sorts jobs by peer and splits each peer's jobs across its channels.
+        self.peers = sorted(peer_devices)
+        self.channels = channels
+        handles = torch.empty(len(self.peers) * channels, dtype=torch.int64)
         self.module.connect(
             device.index,
-            torch.tensor([peer_devices[p] for p in sorted(peer_devices)], dtype=torch.int64),
+            torch.tensor([peer_devices[p] for p in self.peers], dtype=torch.int64),
+            channels,
             handles,
         )
-        signals = torch.empty(len(self.queue_of), dtype=torch.int64)
+        signals = torch.empty(len(handles), dtype=torch.int64)
         self.module.alloc_signals(signals)
         self.signal_ptrs = signals.tolist()
         self.handles = handles.to(device)
@@ -232,12 +235,15 @@ class L1Copier:
         priority: int = -1,
         engine: str = "kernel",
         peer_devices: dict | None = None,
+        sdma_channels: int = 2,
     ):
         self.memory = memory
         self.module = copy_module()
         # The kernel engine copies on CUs; sdma moves rows on the DMA engines and
         # keeps the kernel only for byte verification.
-        self.sdma = SdmaEngine(memory, peer_devices) if engine == "sdma" else None
+        self.sdma = (
+            SdmaEngine(memory, peer_devices, sdma_channels) if engine == "sdma" else None
+        )
         # Normal-priority streams share a few hardware queues (GPU_MAX_HW_QUEUES), so
         # this stream's wait on the forward stream can stall the scheduler's syncs.
         self.stream = torch.cuda.Stream(device=memory.device, priority=priority)
@@ -346,9 +352,15 @@ class L1Copier:
         """Queue the batch on the SDMA engines; the copy stream then waits on every
         queue's signal per layer group before recording that group's layer events."""
         sdma, stream = self.sdma, self.stream.cuda_stream
-        counts = np.zeros(len(sdma.queue_of), dtype=np.int64)
+        per_peer = dict.fromkeys(sdma.peers, 0)
         for plan in plans:
-            counts[sdma.queue_of[plan.peer]] += len(plan.keys)
+            per_peer[plan.peer] += len(plan.keys)
+        # A peer's jobs are contiguous; split them evenly across its channels.
+        counts = [
+            n // sdma.channels + (c < n % sdma.channels)
+            for n in per_peer.values()
+            for c in range(sdma.channels)
+        ]
         job_begin = torch.empty(len(counts) + 1, dtype=torch.int64, pin_memory=True)
         job_begin[0] = 0
         job_begin[1:] = torch.from_numpy(np.cumsum(counts))

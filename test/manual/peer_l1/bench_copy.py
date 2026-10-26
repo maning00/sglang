@@ -89,6 +89,7 @@ def worker(rank, args, port):
         verify=True,
         engine=args.engine,
         peer_devices={p: p for p in range(args.ranks) if p != rank},
+        sdma_channels=args.sdma_channels,
     )
     forward = torch.cuda.current_stream()
     remote_keys = keys(peer, count)
@@ -182,6 +183,7 @@ def worker(rank, args, port):
                 blocks=args.blocks,
                 layer_group=args.layer_group,
                 engine=args.engine,
+                sdma_channels=args.sdma_channels,
                 ms=ms,
                 GBps=amount / ms / 1e6,
             )
@@ -204,6 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--skip-copy", action="store_true")
     parser.add_argument("--engine", default="kernel", choices=["kernel", "sdma"])
+    parser.add_argument("--sdma-channels", type=int, default=2)
     args = parser.parse_args()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

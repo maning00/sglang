@@ -163,6 +163,7 @@ class PeerL1Linker(UnifiedCacheLinker):
                 verify=bool(config.get("verify_bytes", False)),
                 priority=int(config.get("stream_priority", -1)),
                 engine=copy_engine,
+                sdma_channels=int(config.get("sdma_channels", 2)),
                 peer_devices={
                     peer: info[3]
                     for peer, info in enumerate(self.memory.directory_infos)

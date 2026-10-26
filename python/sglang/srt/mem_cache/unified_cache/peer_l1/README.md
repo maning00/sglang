@@ -25,6 +25,7 @@ The extra-config object accepts:
 | `blocks` | 32 | Maximum blocks in a fused copy launch |
 | `layer_group` | 8 | Logical layers copied before recording their ready events |
 | `copy_engine` | `kernel` | `sdma` moves restored rows with mori anvil SDMA queues (one per peer, DMA engines instead of CUs; needs `hipStreamWaitValue64`); `kernel` uses the copy kernel. Byte verification always uses the kernel |
+| `sdma_channels` | 2 | SDMA queues per peer; a peer's jobs in a batch are split evenly across them |
 | `stream_priority` | -1 | Copy stream priority. The default high priority keeps the copy stream off the hardware queues that normal-priority streams share; at 0 its wait on the forward stream can stall the scheduler stream's syncs until that forward ends (measured on MI355 with `GPU_MAX_HW_QUEUES=5`) |
 | `pin_cap` | 16384 | Maximum remote page references held on one owner |
 | `min_hit_pages` | 1 | Minimum prefix worth restoring |
