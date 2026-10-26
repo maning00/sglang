@@ -103,6 +103,9 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.check_hooks = bool(config.get("check_hooks", False))
         self.stitch_stats = bool(config.get("stitch_stats", False))
         self._collective_guard = CollectiveGuard() if self.check_hooks else None
+        copy_engine = str(config.get("copy_engine", "kernel"))
+        if copy_engine not in ("kernel", "sdma"):
+            raise ValueError(f"Unknown peer_l1 copy_engine: {copy_engine!r}")
         layer_group, blocks = (
             int(config.get("layer_group", 8)),
             int(config.get("blocks", 32)),
@@ -159,6 +162,12 @@ class PeerL1Linker(UnifiedCacheLinker):
                 blocks=blocks,
                 verify=bool(config.get("verify_bytes", False)),
                 priority=int(config.get("stream_priority", -1)),
+                engine=copy_engine,
+                peer_devices={
+                    peer: info[3]
+                    for peer, info in enumerate(self.memory.directory_infos)
+                    if peer != self.rank
+                },
             )
             self.layer_done_counter = self.copier.counter
         except BaseException:

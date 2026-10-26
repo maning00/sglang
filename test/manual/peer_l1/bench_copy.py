@@ -2,6 +2,7 @@
 
 PYTHONPATH=python python test/manual/peer_l1/bench_copy.py --ranks 2 --pages 256
 --skip-copy is the negative control: it must fail byte verification.
+--engine sdma copies through mori anvil SDMA queues instead of the copy kernel.
 """
 
 import argparse
@@ -81,7 +82,13 @@ def worker(rank, args, port):
     peer = (rank + 1) % args.ranks
     remote = L1Directory(*memory.directory_infos[peer], create=False)
     copier = L1Copier(
-        memory, layers=61, layer_group=args.layer_group, blocks=args.blocks, verify=True
+        memory,
+        layers=61,
+        layer_group=args.layer_group,
+        blocks=args.blocks,
+        verify=True,
+        engine=args.engine,
+        peer_devices={p: p for p in range(args.ranks) if p != rank},
     )
     forward = torch.cuda.current_stream()
     remote_keys = keys(peer, count)
@@ -174,6 +181,7 @@ def worker(rank, args, port):
                 pages=count,
                 blocks=args.blocks,
                 layer_group=args.layer_group,
+                engine=args.engine,
                 ms=ms,
                 GBps=amount / ms / 1e6,
             )
@@ -195,6 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer-group", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--skip-copy", action="store_true")
+    parser.add_argument("--engine", default="kernel", choices=["kernel", "sdma"])
     args = parser.parse_args()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

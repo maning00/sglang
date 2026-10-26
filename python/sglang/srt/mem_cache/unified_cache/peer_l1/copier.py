@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import glob
+import os
 import socket
 from dataclasses import dataclass, field
+from pathlib import Path
 
+import numpy as np
 import torch
 from sglang.kernels.jit.utils import cache_once, load_jit
 
@@ -21,6 +25,56 @@ def copy_module():
             ("unpin", "peer_l1::enqueue_unpin"),
         ],
     )
+
+
+@cache_once
+def sdma_module():
+    import mori
+
+    # The image's mori checkout: headers under include/, libraries under build/src/.
+    root = Path(mori.__file__).resolve().parents[2]
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    return load_jit(
+        "peer_l1_sdma",
+        cuda_files=["peer_l1/sdma.cuh"],
+        cuda_wrappers=[
+            ("connect", "peer_l1::sdma_connect"),
+            ("alloc_signals", "peer_l1::sdma_alloc_signals"),
+            ("submit", "peer_l1::sdma_submit"),
+            ("wait", "peer_l1::sdma_wait"),
+        ],
+        extra_include_paths=[str(root / "include")],
+        extra_ldflags=[
+            f"-L{root}/build/src/application",
+            "-lmori_application",
+            f"-L{rocm}/lib",
+            "-lhsa-runtime64",
+            *(f"-Wl,-rpath,{d}" for d in sorted(glob.glob(f"{root}/build/src/*/"))),
+        ],
+    )
+
+
+class SdmaEngine:
+    """mori anvil SDMA queues, one per peer, that pull peer rows into this GPU."""
+
+    def __init__(self, memory, peer_devices):
+        self.module = sdma_module()
+        device = memory.device
+        # Queue order is the peer rank order; the copier sorts jobs the same way.
+        self.queue_of = {peer: q for q, peer in enumerate(sorted(peer_devices))}
+        handles = torch.empty(len(self.queue_of), dtype=torch.int64)
+        self.module.connect(
+            device.index,
+            torch.tensor([peer_devices[p] for p in sorted(peer_devices)], dtype=torch.int64),
+            handles,
+        )
+        signals = torch.empty(len(self.queue_of), dtype=torch.int64)
+        self.module.alloc_signals(signals)
+        self.signal_ptrs = signals.tolist()
+        self.handles = handles.to(device)
+        self.signals = signals.to(device)
+        # Every queue's signal rises by one per layer group of every batch.
+        self.base = 0
 
 
 class LayerCounter:
@@ -176,14 +230,25 @@ class L1Copier:
         blocks: int,
         verify: bool,
         priority: int = -1,
+        engine: str = "kernel",
+        peer_devices: dict | None = None,
     ):
         self.memory = memory
         self.module = copy_module()
+        # The kernel engine copies on CUs; sdma moves rows on the DMA engines and
+        # keeps the kernel only for byte verification.
+        self.sdma = SdmaEngine(memory, peer_devices) if engine == "sdma" else None
         # Normal-priority streams share a few hardware queues (GPU_MAX_HW_QUEUES), so
         # this stream's wait on the forward stream can stall the scheduler's syncs.
         self.stream = torch.cuda.Stream(device=memory.device, priority=priority)
         self.counter = LayerCounter(layers)
         self.layer_group, self.blocks, self.verify = layer_group, blocks, verify
+        groups = list(range(0, layers, layer_group)) + [layers]
+        self.group_first = torch.tensor(
+            [memory.layer_offsets[g] for g in groups],
+            dtype=torch.int64,
+            device=memory.device,
+        )
 
     def submit(self, plans, forward_stream):
         schedule_stream = torch.cuda.current_stream()
@@ -202,6 +267,9 @@ class L1Copier:
         events, finish = self.counter.events[index]
         self.stream.wait_stream(schedule_stream)
         self.stream.wait_stream(forward_stream)
+        if self.sdma is not None:
+            # Each SDMA queue reads one peer: group the jobs by peer, in queue order.
+            plans = sorted(plans, key=lambda plan: plan.peer)
         # Each plan has one peer, source rows and request-private destinations.
         keys = [key for plan in plans for key in plan.keys]
         sources = torch.empty(
@@ -229,20 +297,24 @@ class L1Copier:
                 1, dtype=torch.int64, device=self.memory.device
             )
             offsets = self.memory.layer_offsets
-            for first in range(0, self.counter.num_layers, self.layer_group):
-                last = min(first + self.layer_group, self.counter.num_layers)
-                self.module.copy(
-                    self.memory.descriptors,
-                    jobs,
-                    offsets[first],
-                    offsets[last],
-                    self.blocks,
-                    error,
-                    False,
-                    self.stream.cuda_stream,
-                )
-                for layer in range(first, last):
-                    events[layer].record(self.stream)
+            if self.sdma is not None:
+                job_begin = self._submit_sdma(plans, jobs, events)
+            else:
+                job_begin = None
+                for first in range(0, self.counter.num_layers, self.layer_group):
+                    last = min(first + self.layer_group, self.counter.num_layers)
+                    self.module.copy(
+                        self.memory.descriptors,
+                        jobs,
+                        offsets[first],
+                        offsets[last],
+                        self.blocks,
+                        error,
+                        False,
+                        self.stream.cuda_stream,
+                    )
+                    for layer in range(first, last):
+                        events[layer].record(self.stream)
             error_cpu = None
             if self.verify:
                 self.module.copy(
@@ -267,5 +339,35 @@ class L1Copier:
             finish,
             keys,
             error_cpu,
-            [plans, sources, unpins, destinations, source_gpu, jobs, error],
+            [plans, sources, unpins, destinations, source_gpu, jobs, error, job_begin],
         )
+
+    def _submit_sdma(self, plans, jobs, events):
+        """Queue the batch on the SDMA engines; the copy stream then waits on every
+        queue's signal per layer group before recording that group's layer events."""
+        sdma, stream = self.sdma, self.stream.cuda_stream
+        counts = np.zeros(len(sdma.queue_of), dtype=np.int64)
+        for plan in plans:
+            counts[sdma.queue_of[plan.peer]] += len(plan.keys)
+        job_begin = torch.empty(len(counts) + 1, dtype=torch.int64, pin_memory=True)
+        job_begin[0] = 0
+        job_begin[1:] = torch.from_numpy(np.cumsum(counts))
+        job_begin_gpu = job_begin.to(self.memory.device, non_blocking=True)
+        groups = len(self.group_first) - 1
+        sdma.module.submit(
+            sdma.handles,
+            job_begin_gpu,
+            self.memory.descriptors,
+            jobs,
+            self.group_first,
+            groups,
+            sdma.signals,
+            stream,
+        )
+        for g, first in enumerate(range(0, self.counter.num_layers, self.layer_group)):
+            for signal in sdma.signal_ptrs:
+                sdma.module.wait(stream, signal, sdma.base + g + 1)
+            for layer in range(first, min(first + self.layer_group, self.counter.num_layers)):
+                events[layer].record(self.stream)
+        sdma.base += groups
+        return [job_begin, job_begin_gpu]
