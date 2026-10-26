@@ -230,6 +230,7 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
         wait_seconds=0,
     )
     owner = L1Owner(cache, linker)
+    linker.owner = owner
     writes = []
     owner.last_replica_writer = lambda keys, rows: writes.append((keys, rows)) or True
     cache.peer_l1 = linker
