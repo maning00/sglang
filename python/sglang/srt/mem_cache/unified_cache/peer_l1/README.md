@@ -24,7 +24,7 @@ The extra-config object accepts:
 |---|---:|---|
 | `blocks` | 32 | Maximum blocks in a fused copy launch |
 | `layer_group` | 8 | Logical layers copied before recording their ready events |
-| `stream_priority` | 0 | Copy stream priority; -1 asks for a high-priority stream (own hardware queue) |
+| `stream_priority` | -1 | Copy stream priority. The default high priority keeps the copy stream off the hardware queues that normal-priority streams share; at 0 its wait on the forward stream can stall the scheduler stream's syncs until that forward ends (measured on MI355 with `GPU_MAX_HW_QUEUES=5`) |
 | `pin_cap` | 16384 | Maximum remote page references held on one owner |
 | `min_hit_pages` | 1 | Minimum prefix worth restoring |
 | `wait_timeout_ms` | 200 | Bounded capacity wait; 0 disables waiting |

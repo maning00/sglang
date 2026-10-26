@@ -175,12 +175,12 @@ class L1Copier:
         layer_group: int,
         blocks: int,
         verify: bool,
-        priority: int = 0,
+        priority: int = -1,
     ):
         self.memory = memory
         self.module = copy_module()
-        # A non-default priority draws from a separate stream pool, which can map
-        # to its own hardware queue instead of one shared with forward or EP.
+        # Normal-priority streams share a few hardware queues (GPU_MAX_HW_QUEUES), so
+        # this stream's wait on the forward stream can stall the scheduler's syncs.
         self.stream = torch.cuda.Stream(device=memory.device, priority=priority)
         self.counter = LayerCounter(layers)
         self.layer_group, self.blocks, self.verify = layer_group, blocks, verify

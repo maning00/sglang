@@ -26,7 +26,9 @@ class L1Owner:
     def __init__(self, cache, linker):
         self.cache, self.linker = cache, linker
         self.directory = linker.directory
-        self.stream = torch.cuda.Stream(device=linker.device)
+        # High priority for the same reason as the copier's stream: it waits on
+        # the forward stream and must not share a hardware queue with the scheduler.
+        self.stream = torch.cuda.Stream(device=linker.device, priority=-1)
         self._version = 0
         self._pending = {}
         self._attaches = []
