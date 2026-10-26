@@ -57,6 +57,15 @@ int64_t l1_probe(void* p, const Hash* hashes, int64_t* rows, int64_t* gens, size
     return i;
   });
 }
+int64_t l1_contains(void* p, const Hash* hashes, int64_t* found, size_t n) {
+  return checked([&] {
+    Directory d(p);
+    int64_t row, gen;
+    for (size_t i = 0; i < n; ++i)
+      found[i] = d.probe(hashes[i], row, gen);
+    return 0;
+  });
+}
 int64_t l1_pin(void* p, const int64_t* rows, const int64_t* gens, size_t n) {
   return checked([&] { return Directory(p).pin(rows, gens, n); });
 }

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+import numpy as np
+import torch
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 
 
@@ -59,9 +62,15 @@ class _Restore:
 
 
 class PeerL1PlusL2Linker(UnifiedCacheLinker):
-    def __init__(self, l1, l2):
+    def __init__(self, l1, l2, *, l2_write="write_through"):
+        if l2_write not in ("write_through", "last_replica"):
+            raise ValueError(f"Unknown peer_l1 l2_write policy: {l2_write!r}")
         self.l1, self.l2 = l1, l2
         self.page_size = l2.page_size
+        # last_replica: L2 receives a page only when its last HBM copy on the node
+        # is evicted (the wrapper writes through only for a persisting linker).
+        self.persists = l2_write == "write_through"
+        self._writes = deque()
         self.layer_done_counter = CompositeLayerCounter(l1, l2)
         self._lookups = {}
         self._requests = {}
@@ -88,11 +97,23 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         l2 = UMBPDirectLinker(
             server_args, params, components=components, extra_config=config
         )
-        return cls(l1, l2)
+        return cls(l1, l2, l2_write=l1_config.get("l2_write", "write_through"))
 
     def bind_cache(self, cache):
         self.l1.bind_cache(cache)
         self.l2.bind_cache(cache)
+        if not self.persists:
+            self.l1.owner.last_replica_writer = self._write_last_replicas
+
+    def _write_last_replicas(self, keys, rows):
+        page = self.page_size
+        # CPU indices: the L2 offload snapshots them without a device sync.
+        indices = torch.from_numpy((rows[:, None] * page + np.arange(page)).reshape(-1))
+        transfer = PoolTransfer(name=PoolName.KV, device_indices=indices, keys=list(keys))
+        if not self.l2.offload([transfer]):
+            return False
+        self._writes.append(rows)
+        return True
 
     def lookup(self, rid, transfers):
         self._lookups.pop(rid, None)
@@ -185,7 +206,15 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         return self.l2.offload(transfers)
 
     def num_completed_offloads(self):
-        return self.l2.num_completed_offloads()
+        if self.persists:
+            return self.l2.num_completed_offloads()
+        # The wrapper offloads nothing; every completion is a last-replica write.
+        for _ in range(self.l2.num_completed_offloads()):
+            landed = self.l2.pop_completed_offload()
+            self.l1.owner.release_written(self._writes.popleft())
+            if not landed:
+                self.l1.stats["last_replica_failed_batches"] += 1
+        return 0
 
     def pop_completed_offload(self):
         return self.l2.pop_completed_offload()

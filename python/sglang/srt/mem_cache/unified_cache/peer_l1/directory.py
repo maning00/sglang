@@ -59,6 +59,7 @@ def _native():
         "publish": [ptr, ptr, ptr, size],
         "retire": [ptr, ptr, ptr, size],
         "probe": [ptr, ptr, ptr, ptr, size],
+        "contains": [ptr, ptr, ptr, size],
         "pin": [ptr, ptr, ptr, size],
         "unpin": [ptr, ptr, size],
         "states": [ptr, ptr, ptr, ptr, size],
@@ -116,6 +117,15 @@ class L1Directory:
         )
         return rows[:count], gens[:count]
 
+    def contains(self, hashes: np.ndarray) -> np.ndarray:
+        """Whether each hash is published, unlike probe without stopping at a miss."""
+        found = np.empty(len(hashes), dtype=np.int64)
+        if len(hashes):
+            self._native.l1_contains(
+                self.address, hashes.ctypes.data, found.ctypes.data, len(hashes)
+            )
+        return found.astype(bool)
+
     def pin(self, rows: np.ndarray, gens: np.ndarray) -> bool:
         return bool(
             self._native.l1_pin(
@@ -134,7 +144,8 @@ class L1Directory:
             self.address, hashes.ctypes.data, rows.ctypes.data, len(rows)
         )
 
-    def retire(self, keys) -> np.ndarray:
+    def retire(self, keys, *, aligned=False) -> np.ndarray:
+        """Rows of the retired keys; with aligned, one entry per key, -1 if absent."""
         hashes = hash_words(keys)
         rows = np.empty(len(hashes), dtype=np.int64)
         self._native.l1_retire(
@@ -144,7 +155,7 @@ class L1Directory:
         if self._retired >= self.num_rows:
             self._native.l1_rebuild(self.address)
             self._retired = 0
-        return rows[rows >= 0]
+        return rows if aligned else rows[rows >= 0]
 
     def states(self, rows):
         rows = np.ascontiguousarray(rows, dtype=np.int64)

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from .directory import hash_words
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +39,10 @@ class L1Owner:
         # Retired rows awaiting their free action, then rows withheld from it.
         self._hold = set()
         self._zombies = set()
+        # Rows whose L2 write is in flight; they stay allocated until it lands.
+        self._writing = set()
+        # Set by the composite linker when L2 is written only for last copies.
+        self.last_replica_writer = None
         self.withheld_total = 0
         cache.tree_core.enable_l1_events = True
 
@@ -57,16 +63,52 @@ class L1Owner:
                 for key in keys:
                     self._pending.pop(key, None)
                     self._published.discard(key)
-                rows = self.directory.retire(keys)
+                aligned = self.directory.retire(keys, aligned=True)
+                rows = aligned[aligned >= 0]
                 self.linker.stats["retired_pages"] += len(rows)
                 if len(rows):
                     pins, _ = self.directory.states(rows)
                     self._hold.update(int(row) for row in rows[pins > 0])
+                    if self.last_replica_writer is not None:
+                        self._write_last_replicas(keys, aligned)
             else:
                 self._version += 1
                 for key in keys:
                     self._pending[key] = self._version
                 self._attaches.append((keys, [self._version] * len(keys), value))
+
+    def _write_last_replicas(self, keys, aligned):
+        """Write retired pages that no other rank publishes to L2, then hold them.
+
+        Runs after this rank's own retire, so of two ranks retiring the last two
+        copies at once at least one sees no other copy (both may write; L2 dedups).
+        """
+        index = np.flatnonzero(aligned >= 0)
+        hashes = hash_words([keys[i] for i in index])
+        elsewhere = np.zeros(len(index), dtype=bool)
+        for peer in self.linker.peers.values():
+            elsewhere |= peer.contains(hashes)
+        last = index[~elsewhere]
+        if not len(last):
+            return
+        rows = aligned[last]
+        if not self.last_replica_writer([keys[i] for i in last], rows):
+            self.linker.stats["last_replica_refused_pages"] += len(rows)
+            return
+        held = set(map(int, rows))
+        self._writing.update(held)
+        self._hold.update(held)
+        self.linker.stats["last_replica_written_pages"] += len(rows)
+
+    def release_written(self, rows):
+        """An L2 write landed (or failed): its rows may be freed again."""
+        rows = set(map(int, rows))
+        self._writing.difference_update(rows)
+        # Not freed yet: drop the hold unless a remote reader still pins the row.
+        unfreed = np.fromiter((row for row in rows if row in self._hold), dtype=np.int64)
+        if len(unfreed):
+            pins, _ = self.directory.states(unfreed)
+            self._hold.difference_update(map(int, unfreed[pins == 0]))
 
     def filter_free(self, indices):
         """Run before every FULL allocator free; normal frees do no D2H."""
@@ -101,6 +143,8 @@ class L1Owner:
         rows = np.fromiter(self._zombies, dtype=np.int64)
         pins, _ = self.directory.states(rows)
         ready = rows[pins == 0]
+        if self._writing:
+            ready = ready[[int(row) not in self._writing for row in ready]]
         if not len(ready):
             return 0
         page = self.cache.page_size

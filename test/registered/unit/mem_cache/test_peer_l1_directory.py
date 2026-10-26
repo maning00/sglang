@@ -398,3 +398,37 @@ def test_composite_reset_clears_unused_requests(composite, operation):
     assert not composite._queued and not composite._batches
     assert not composite.layer_done_counter._indices
     assert not composite.l1.reserved
+
+
+def test_last_replica_completions_release_rows_in_submission_order():
+    """L2 completions are positional: each must release the rows of the write
+    submitted in the same order, and none may reach the linker wrapper, which
+    has no offload of its own pending under the last-replica policy."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
+
+    l1, l2 = _Source(), _Source()
+    released = []
+    l1.owner = SimpleNamespace(release_written=released.append)
+    l1.bind_cache = lambda cache: None
+    offloads, results = [], []
+    l2.offload = lambda transfers: offloads.append(transfers) or True
+    l2.num_completed_offloads = lambda: len(results)
+    l2.pop_completed_offload = lambda: results.pop(0)
+    linker = PeerL1PlusL2Linker(l1, l2, l2_write="last_replica")
+    assert not linker.persists
+    linker.bind_cache(None)
+    first, second = np.array([3, 5]), np.array([7])
+    assert l1.owner.last_replica_writer(["a", "b"], first)
+    assert l1.owner.last_replica_writer(["c"], second)
+    (transfer,) = offloads[0]
+    assert transfer.name == PoolName.KV and transfer.keys == ["a", "b"]
+    assert transfer.device_indices.device.type == "cpu"
+    assert transfer.device_indices.tolist() == list(range(12, 16)) + list(range(20, 24))
+    results.extend([True, False])
+    assert linker.num_completed_offloads() == 0
+    assert [rows.tolist() for rows in released] == [[3, 5], [7]]
+    assert l1.stats["last_replica_failed_batches"] == 1

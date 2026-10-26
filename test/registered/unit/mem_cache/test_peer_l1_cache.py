@@ -208,3 +208,59 @@ def test_split_preserves_publications_and_eviction_retires_them(backend):
     retired = core.take_l1_events()
     assert all(value is None for _, value in retired)
     assert sorted(key for hashes, _ in retired for key in hashes) == sorted(keys)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="cache fixtures need CUDA")
+def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_path):
+    """With L2 written only for last copies, an evicted page that a peer still
+    publishes is freed at once, and a page no peer holds is handed to L2 and
+    stays allocated until that write lands (it is read asynchronously)."""
+    cache, allocator, _ = build_fixture(CacheConfig(page_size=4, kv_size=64, num_layers=2))
+    cache.tree_core.enable_external_cache_linker = True
+    cache.write_through_threshold = (1 << 63) - 1
+    directory = L1Directory(str(tmp_path / "own"), 17, 4, create=True)
+    peer = L1Directory(str(tmp_path / "peer"), 17, 4, create=True)
+    linker = SimpleNamespace(
+        directory=directory,
+        peers={1: peer},
+        device=allocator.device,
+        check_hooks=True,
+        stats=Counter(),
+        has_unstarted_reservations=False,
+        wait_seconds=0,
+    )
+    owner = L1Owner(cache, linker)
+    writes = []
+    owner.last_replica_writer = lambda keys, rows: writes.append((keys, rows)) or True
+    cache.peer_l1 = linker
+    try:
+        shared, last = allocator.alloc(8), allocator.alloc(8)
+        cache.insert(InsertParams(key=RadixKey(array("q", range(8))), value=shared))
+        cache.insert(InsertParams(key=RadixKey(array("q", range(100, 108))), value=last))
+        owner.poll(torch.cuda.current_stream())
+        owner.stream.synchronize()
+        owner.poll(torch.cuda.current_stream())
+        shared_rows = set((shared.reshape(-1, 4)[:, 0] // 4).tolist())
+        shared_keys = [
+            key
+            for key in owner._published
+            if int(directory.probe(hash_words([key]))[0][0]) in shared_rows
+        ]
+        assert len(shared_keys) == 2
+        peer.publish(shared_keys, [1, 2])
+
+        cache.evict(EvictParams(num_tokens=16))
+        assert len(writes) == 1
+        keys, rows = writes[0]
+        assert set(rows.tolist()) == set((last.reshape(-1, 4)[:, 0] // 4).tolist())
+        assert not set(keys) & set(shared_keys)
+        assert allocator.available_size() == 56 and owner.deferred_tokens == 8
+        assert owner.reclaim() == 0
+
+        owner.release_written(rows)
+        assert owner.reclaim() == 8
+        assert allocator.available_size() == 64 and owner.deferred_tokens == 0
+    finally:
+        owner.stream.synchronize()
+        peer.close()
+        directory.close()
