@@ -33,6 +33,9 @@ The extra-config object accepts:
 | `verify_bytes` | false | Compare every copied row before releasing its source pin |
 | `check_hooks` | false | Check allocator frees and reject collectives between pin and copy submission |
 | `stitch_stats` | false | Count the prefix pages restorable if runs could come from different peers (`lookup_stitched_pages` against `lookup_single_peer_pages`) |
+| `l2_write` | `write_through` | With an L2 (`PeerL1PlusL2Linker`): `write_through` keeps the wrapper's L2 write-through; `last_replica` writes a page to L2 only when its last HBM copy on the node is evicted, holding the row until the write lands |
+| `l2_write_max_inflight_pages` | 15% of page rows | `last_replica` only: a write that would put more pages in flight is refused (the page is freed without an L2 copy) |
+| `l2_write_timeout_s` | 60 | `last_replica` only: once a write is in flight this long, new writes are refused until it lands; the late write keeps its rows |
 
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;

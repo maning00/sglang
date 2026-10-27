@@ -432,3 +432,47 @@ def test_last_replica_completions_release_rows_in_submission_order():
     assert linker.num_completed_offloads() == 0
     assert [rows.tolist() for rows in released] == [[3, 5], [7]]
     assert l1.stats["last_replica_failed_batches"] == 1
+
+
+def test_last_replica_writes_are_bounded_while_in_flight(monkeypatch):
+    """Rows held for in-flight L2 writes cannot grow without bound: a write that
+    would exceed the in-flight cap is refused, and after one write outlives the
+    timeout every new write is refused until it lands. A late write keeps its rows
+    held, since the L2 copy may still be reading them."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import composite as composite_module
+
+    clock = [0.0]
+    monkeypatch.setattr(composite_module.time, "monotonic", lambda: clock[0])
+    l1, l2 = _Source(), _Source()
+    released = []
+    l1.owner = SimpleNamespace(release_written=released.append)
+    results = []
+    l2.offload = lambda transfers: True
+    l2.num_completed_offloads = lambda: len(results)
+    l2.pop_completed_offload = lambda: results.pop(0)
+    linker = composite_module.PeerL1PlusL2Linker(
+        l1, l2, l2_write="last_replica", max_inflight_write_pages=3, write_timeout_s=10
+    )
+    linker.bind_cache(None)
+    write = l1.owner.last_replica_writer
+
+    assert write(["a", "b"], np.array([3, 5]))
+    assert not write(["c", "d"], np.array([7, 8]))
+    assert l1.stats["last_replica_capped_pages"] == 2
+    results.append(True)
+    linker.num_completed_offloads()
+    assert write(["c", "d"], np.array([7, 8]))
+
+    clock[0] = 11.0
+    linker.num_completed_offloads()
+    assert not write(["e"], np.array([9]))
+    assert l1.stats["last_replica_stalled_pages"] == 1
+    assert l1.stats["last_replica_write_timeouts"] == 1
+    assert [rows.tolist() for rows in released] == [[3, 5]]
+    results.append(True)
+    linker.num_completed_offloads()
+    assert [rows.tolist() for rows in released] == [[3, 5], [7, 8]]
+    assert write(["e"], np.array([9]))
