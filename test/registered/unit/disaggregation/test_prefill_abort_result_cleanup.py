@@ -38,6 +38,7 @@ class _Req:
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
+        self.requeue_after_failed_load = False
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
@@ -375,3 +376,97 @@ class TestPrefillCompleteResult(CustomTestCase):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def _requeue_scheduler(*, chunked_req=None):
+    scheduler = _Scheduler()
+    scheduler._release_aborted_request = Mock()
+    scheduler.waiting_queue = []
+    scheduler.processed_tokens_counter = 0
+    scheduler.chunked_req = chunked_req
+    return scheduler
+
+
+def _failed_load_req(*, inflight_middle_chunks):
+    req = _Req(inflight_middle_chunks=inflight_middle_chunks)
+    req.to_finish = None
+    req.pending_bootstrap = False
+    req.requeue_after_failed_load = True
+    req.skip_external_cache = False
+    req.reset_for_retract = Mock(
+        side_effect=lambda: setattr(req, "inflight_middle_chunks", 0)
+    )
+    req.advance_cache_request_handle = Mock()
+    req.time_stats.reset_prefill_retry_time = Mock()
+    req.time_stats.set_wait_queue_entry_time = Mock()
+    return req
+
+
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+def test_failed_load_result_requeues_without_sending(
+    checkpoint_kv_cache, release_kv_cache
+):
+    """A request whose external KV never landed recomputes it: its KV is released
+    without reaching the tree, nothing goes to decode or the client, and it retries
+    first, without the external cache."""
+    scheduler = _requeue_scheduler()
+    req = _failed_load_req(inflight_middle_chunks=0)
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
+    checkpoint_kv_cache.assert_not_called()
+    scheduler.send_kv_chunk.assert_not_called()
+    req.disagg_kv_sender.abort.assert_not_called()
+    scheduler.output_streamer.stream_output.assert_not_called()
+    assert scheduler.waiting_queue == [req]
+    assert len(req.output_ids) == 0 and not req.finished()
+    assert req.skip_external_cache and not req.requeue_after_failed_load
+
+
+@pytest.mark.parametrize("overlap", [True, False])
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_failed_load_chunked_request_requeues_once_after_its_chunk(
+    release_kv_cache, overlap
+):
+    """A chunked request whose load failed launches no further chunk, sends nothing,
+    and is requeued once its in-flight chunk's result is in, whether that result is
+    processed after (overlap) or before (no overlap) the next scheduling step."""
+    req = _failed_load_req(inflight_middle_chunks=1)
+    req.extend_end = 50
+    scheduler = _requeue_scheduler(chunked_req=req)
+
+    if overlap:
+        scheduler.drop_chunked_req_after_failed_load()
+        assert scheduler.chunked_req is None and scheduler.waiting_queue == []
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    else:
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        assert scheduler.waiting_queue == []
+        release_kv_cache.assert_not_called()
+        scheduler.drop_chunked_req_after_failed_load()
+
+    assert scheduler.chunked_req is None
+    assert scheduler.waiting_queue == [req]
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
+    scheduler.send_kv_chunk.assert_not_called()
+
+
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_client_abort_wins_over_failed_load_requeue(release_kv_cache):
+    """A client abort that meets a failed load still finishes the request."""
+    scheduler = _requeue_scheduler()
+    req = _Req(inflight_middle_chunks=0)
+    req.requeue_after_failed_load = True
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    assert scheduler.waiting_queue == [] and req.finished()
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )

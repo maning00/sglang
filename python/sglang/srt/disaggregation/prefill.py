@@ -630,6 +630,7 @@ class SchedulerDisaggregationPrefillMixin:
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self.drop_chunked_req_after_failed_load()
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
@@ -931,6 +932,13 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
+                # Its KV never landed: send nothing and recompute it (a client
+                # abort still wins and retires it below).
+                if req.requeue_after_failed_load and not is_aborted(req):
+                    self.requeue_after_failed_load(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:
                     req.to_finish = req.discard_output_reason
@@ -1042,6 +1050,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_end is not None
                     and req.extend_end >= len(req.origin_input_ids)
                 )
+                # The chunk ran on KV that never landed: send nothing. Requeue once
+                # no chunk of it is left in flight; without overlap the next step's
+                # drop_chunked_req_after_failed_load does it instead.
+                if req.requeue_after_failed_load and not is_aborted(req):
+                    if not still_chunking and req.inflight_middle_chunks == 0:
+                        self.requeue_after_failed_load(req)
+                    advance_logprob_pt(i, req)
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
                 if is_aborted(req):
@@ -1682,6 +1699,42 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+    def drop_chunked_req_after_failed_load(self: Scheduler) -> None:
+        """Stop a chunked request whose external load failed before its next chunk
+        launches; requeue it here when no chunk of it is in flight, else when the
+        in-flight chunk's result is processed."""
+        req = self.chunked_req
+        if req is None or not req.requeue_after_failed_load:
+            return
+        self.chunked_req = None
+        if req.inflight_middle_chunks == 0:
+            self.requeue_after_failed_load(req)
+
+    def requeue_after_failed_load(self: Scheduler, req: Req) -> None:
+        """Release a request whose external KV load failed and queue it to recompute
+        that tail; nothing of the failed forward reaches decode or the tree."""
+        self._release_aborted_request(req)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        req.reset_for_retract()
+        req.output_ids = array("q")
+        # Decode keeps the device prefix already sent below start_send_idx: it is
+        # valid KV, so the retry sends on from there.
+        req.tmp_end_idx = -1
+        req.hidden_states_tensor = None
+        req.output_dsa_topk_indices = None
+        req.requeue_after_failed_load = False
+        req.skip_external_cache = True
+        req.time_stats.reset_prefill_retry_time()
+        req.advance_cache_request_handle()
+        req.storage_prefetch_retry_attempts = 0
+        req.storage_prefetch_last_match_len = None
+        logger.warning(
+            "Req %s: external KV load failed; requeued to recompute it", req.rid
+        )
+        req.time_stats.set_wait_queue_entry_time()
+        req.arrival_processed_tokens = self.processed_tokens_counter
+        self.waiting_queue.insert(0, req)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

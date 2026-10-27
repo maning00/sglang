@@ -274,7 +274,9 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
-        if device_hit_len >= len(key):
+        # A retry after a failed load recomputes; every rank of the attention group
+        # marks the request alike, so all of them skip the reduction below.
+        if device_hit_len >= len(key) or req.skip_external_cache:
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)

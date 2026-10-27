@@ -4838,8 +4838,15 @@ class Scheduler(
                 )
 
         if self.enable_unified_cache_external_linker:
-            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
-            if self.chunked_req in failed:
+            # A PD prefill request can be requeued; elsewhere it is aborted.
+            failed = self.tree_cache.finish_external_linker_loads(
+                batch.reqs,
+                requeue=self.disaggregation_mode == DisaggregationMode.PREFILL,
+            )
+            if (
+                self.chunked_req in failed
+                and not self.chunked_req.requeue_after_failed_load
+            ):
                 # Result processing finishes the others; a chunked one is
                 # released like a client abort so its next chunk never runs.
                 self._pending_chunked_abort_req = self.chunked_req

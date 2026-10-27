@@ -3532,12 +3532,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # Keep cache_protected_len unchanged so failed loads can be freed.
         return self.linker is None
 
-    def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
+    def finish_external_linker_loads(
+        self, reqs: list[Req], *, requeue: bool = False
+    ) -> list[Req]:
         """Wait for the external-linker loads of the batch that just ran and
         return the requests whose KV did not land, marked so their output is
         dropped and their KV never reaches the tree. Their slots are private
         (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
-        them."""
+        them.
+
+        With ``requeue`` a failed request is marked to be requeued and recompute
+        its tail without the external cache; otherwise it finishes with an abort.
+        The failed set is identical on every rank of the batch's attention group.
+        """
         if self.linker is None:
             return []
         failed_rids = set(self.linker.finish_loads())
@@ -3546,6 +3553,9 @@ class UnifiedRadixCache(BasePrefixCache):
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
             for req in failed:
+                if requeue and not req.skip_external_cache:
+                    req.requeue_after_failed_load = True
+                    continue
                 req.skip_radix_cache_insert = True
                 req.discard_output_reason = FINISH_ABORT(
                     "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE

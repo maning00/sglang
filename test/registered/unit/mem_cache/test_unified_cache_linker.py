@@ -613,7 +613,14 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
     def test_swa_failed_load_frees_private_slots_unpublished(self):
         self._run_swa_hit(load_landed=False)
 
-    def _run_swa_hit(self, load_landed):
+    def test_failed_load_requeues_and_retry_skips_external_cache(self):
+        """A PD prefill request whose load failed is marked for requeue instead of
+        aborted, leaves nothing in the tree, and its retry restores nothing from the
+        external cache (so it cannot fail the same way twice); a retry that still
+        fails is aborted."""
+        self._run_swa_hit(load_landed=False, requeue=True)
+
+    def _run_swa_hit(self, load_landed, requeue=False):
         cfg = CacheConfig(
             page_size=1,
             components=(ComponentType.FULL, ComponentType.SWA),
@@ -712,9 +719,14 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             )
         else:
             consumer_linker.load_landed = False
-            self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
-            self.assertEqual(req.discard_output_reason.status_code, 503)
-            self.assertTrue(req.skip_radix_cache_insert)
+            failed = consumer.finish_external_linker_loads([req], requeue=requeue)
+            self.assertEqual(failed, [req])
+            if requeue:
+                self.assertTrue(req.requeue_after_failed_load)
+                self.assertIsNone(req.discard_output_reason)
+            else:
+                self.assertEqual(req.discard_output_reason.status_code, 503)
+                self.assertTrue(req.skip_radix_cache_insert)
             release_kv_cache(req, consumer, checkpoint=False)
             self.assertFalse(req.kv.holds_kv)
             self.assertTrue(req.kv.is_kv_released)
@@ -726,6 +738,21 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
             )
             self.assertEqual(unpublished.device_prefix_len, 3)
+            if requeue:
+                req.skip_external_cache = True
+                lookups = len(consumer_linker.lookup_calls)
+                retry = consumer.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+                )
+                self.assertEqual(retry.host_hit_length, 0)
+                self.assertEqual(len(consumer_linker.lookup_calls), lookups)
+                # Replay the failed batch as the retry's: it is aborted this time.
+                consumer.linker.inflight_load_rids = [req.rid]
+                consumer.linker.inflight_load_index = 0
+                self.assertEqual(
+                    consumer.finish_external_linker_loads([req], requeue=True), [req]
+                )
+                self.assertIsNotNone(req.discard_output_reason)
         consumer.sanity_check()
 
 
@@ -1292,7 +1319,9 @@ def test_linker_filters_request_relative_swa_from_lookup(
         best_match_node=0,
     )
     matched = wrapper.match(
-        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="match"), result
+        RadixKey(array("q", [1, 2, 3, 4])),
+        SimpleNamespace(rid="match", skip_external_cache=False),
+        result,
     )
     assert matched.host_hit_length == 4
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
