@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.peer_l1.copier import distinct_stream
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
 from sglang.srt.mem_cache.unified_cache.peer_l1.owner import L1Owner
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -52,6 +53,16 @@ def test_flush_refuses_private_loads_offloads_and_remote_pins(tmp_path, caplog):
         directory.unpin(rows)
     finally:
         directory.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="streams need a GPU")
+def test_stream_alias_fallback_keeps_priority():
+    """A peer L1 stream that aliases the scheduler's is replaced by one of the same
+    high priority; a normal-priority replacement stalls the scheduler's syncs."""
+    stream = torch.cuda.Stream(priority=-1)
+    replacement = distinct_stream(stream, (stream,))
+    assert replacement.cuda_stream != stream.cuda_stream
+    assert replacement.priority == stream.priority
 
 
 def test_hip_event_waits_for_host_callback():

@@ -34,15 +34,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def allocate_distinct_stream(device_module, avoid_streams):
-    """Draw a stream that aliases none of ``avoid_streams``.
+def allocate_distinct_stream(device_module, avoid_streams, *, priority=0):
+    """Draw a stream of ``priority`` that aliases none of ``avoid_streams``.
 
     CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
     may hand back one that is already in use.
     """
     avoid = {stream.cuda_stream for stream in avoid_streams}
     for _ in range(65):
-        stream = device_module.Stream(priority=0)
+        stream = device_module.Stream(priority=priority)
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")

@@ -223,6 +223,18 @@ class CopyBatch:
     keepalive: list = field(default_factory=list)
 
 
+def distinct_stream(stream, avoid):
+    """Return ``stream``, or a same-priority replacement if it aliases one of ``avoid``
+    (PyTorch draws streams from a round-robin pool)."""
+    if stream.cuda_stream not in {other.cuda_stream for other in avoid}:
+        return stream
+    from sglang.srt.managers.utils import allocate_distinct_stream
+
+    # A normal-priority replacement would share a hardware queue with the
+    # scheduler and stall its syncs while waiting on the forward stream.
+    return allocate_distinct_stream(torch.cuda, avoid, priority=stream.priority)
+
+
 class L1Copier:
     def __init__(
         self,
@@ -258,17 +270,7 @@ class L1Copier:
 
     def submit(self, plans, forward_stream):
         schedule_stream = torch.cuda.current_stream()
-        # PyTorch streams come from a round-robin pool. A fresh stream is not
-        # necessarily distinct from the scheduler's subsequently drawn stream.
-        if self.stream.cuda_stream in (
-            schedule_stream.cuda_stream,
-            forward_stream.cuda_stream,
-        ):
-            from sglang.srt.managers.utils import allocate_distinct_stream
-
-            self.stream = allocate_distinct_stream(
-                torch.cuda, (schedule_stream, forward_stream)
-            )
+        self.stream = distinct_stream(self.stream, (schedule_stream, forward_stream))
         index = self.counter.update_producer()
         events, finish = self.counter.events[index]
         self.stream.wait_stream(schedule_stream)

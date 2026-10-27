@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from .copier import distinct_stream
 from .directory import hash_words
 
 logger = logging.getLogger(__name__)
@@ -199,15 +200,7 @@ class L1Owner:
         if not self._attaches:
             return
         schedule_stream = torch.cuda.current_stream()
-        if self.stream.cuda_stream in (
-            schedule_stream.cuda_stream,
-            forward_stream.cuda_stream,
-        ):
-            from sglang.srt.managers.utils import allocate_distinct_stream
-
-            self.stream = allocate_distinct_stream(
-                torch.cuda, (schedule_stream, forward_stream)
-            )
+        self.stream = distinct_stream(self.stream, (schedule_stream, forward_stream))
         attaches, self._attaches = self._attaches, []
         keys = [key for item in attaches for key in item[0]]
         versions = [version for item in attaches for version in item[1]]
