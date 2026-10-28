@@ -14,12 +14,15 @@ object range the restore wrote is compared with the original bytes.
 With --control the written slots are rewritten right after the write is
 submitted, as if the rows were not held; the check must then report mismatches,
 or it could not catch a broken hold.
+
+With --stitch only the pages past HEAD are written, as when the head is still in
+a peer's HBM: the composite must restore the head from the peer (a stand-in that
+writes the original bytes into the slots it is given) and the rest from L2.
 """
 
 import argparse
 import ctypes
 import json
-import os
 import time
 from collections import Counter
 from types import SimpleNamespace
@@ -34,6 +37,9 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import UMBPDirectLinker
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+)
 from sglang.srt.runtime_context import get_context
 
 PAGE = 256
@@ -43,6 +49,8 @@ RATIOS = [128, 128, 4, 128, 4, 128]
 WRITTEN = list(range(8, 24))
 RESTORED = list(range(40, 56))
 OTHERS = [page for page in range(PAGES) if page not in WRITTEN + RESTORED]
+# --stitch: pages of WRITTEN the peer still holds.
+HEAD = 6
 
 hip = ctypes.CDLL("libamdhip64.so")
 hip.hipMemcpy.argtypes = [
@@ -89,10 +97,63 @@ def read(spans):
     return out
 
 
+class Peer:
+    """Peer L1 stand-in for the pages in ``held``: its load writes each page's
+    original bytes into the slots the composite hands it."""
+
+    def __init__(self, linker, num_layers, held):
+        self.linker, self.held = linker, held
+        self.layer_done_counter = LayerWiseLoadCounter(num_layers)
+        self.owner = None
+        self.stats = Counter()
+        self.queued = []
+
+    def lookup(self, rid, transfers):
+        (transfer,) = transfers
+        hits = 0
+        while hits < len(transfer.keys) and transfer.keys[hits] in self.held:
+            hits += 1
+        return list(range(1, hits + 1))
+
+    def reserve(self, rid, num_pages):
+        return True
+
+    def release_reservation(self, rid):
+        pass
+
+    def load(self, rid, transfers):
+        self.queued.extend(transfers)
+        return True
+
+    def cancel_queued_load(self, rid):
+        return False
+
+    def start_layer_wise_loading(self):
+        if not self.queued:
+            return -1
+        for transfer in self.queued:
+            slots = transfer.device_indices.tolist()
+            for i, key in enumerate(transfer.keys):
+                dest = ranges(self.linker, [slots[i * PAGE] // PAGE])
+                for (_, _, ptr, size), data in zip(dest, self.held[key]):
+                    assert size == data.size
+                    assert hip.hipMemcpy(ptr, data.ctypes.data, size, H2D) == 0
+        self.queued = []
+        index = self.layer_done_counter.update_producer()
+        for layer in range(self.layer_done_counter.num_layers):
+            self.layer_done_counter.complete(index, layer)
+        return index
+
+    def finish_layer_wise_loading(self, index):
+        return self.layer_done_counter.finish(index)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--control", action="store_true")
-    control = parser.parse_args().control
+    parser.add_argument("--stitch", action="store_true")
+    args = parser.parse_args()
+    control, head = args.control, HEAD if args.stitch else 0
     torch.cuda.set_device(0)
     get_context().override_server_args(dsv4_attn_backend="flashmla").install()
     kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
@@ -141,14 +202,6 @@ def main():
         components={ComponentType.FULL, ComponentType.SWA},
         extra_config={"dram_capacity_bytes": 4 << 30, "ssd_enabled": False},
     )
-    released = []
-    l1 = SimpleNamespace(
-        layer_done_counter=SimpleNamespace(num_layers=l2.layer_done_counter.num_layers),
-        owner=SimpleNamespace(release_written=released.append),
-        stats=Counter(),
-    )
-    composite = PeerL1PlusL2Linker(l1, l2, l2_write="last_replica")
-
     rng = np.random.default_rng(0)
     written, restored, others = (
         ranges(l2, pages) for pages in (WRITTEN, RESTORED, OTHERS)
@@ -157,7 +210,12 @@ def main():
     fill(others, rng)
     original = read(written)
     keys = [f"f3check-{page:04d}" for page in WRITTEN]
-    assert composite._write_last_replicas(keys, np.array(WRITTEN))
+    held = {keys[i]: read(ranges(l2, [WRITTEN[i]])) for i in range(head)}
+    released = []
+    l1 = Peer(l2, l2.layer_done_counter.num_layers, held)
+    l1.owner = SimpleNamespace(release_written=released.append)
+    composite = PeerL1PlusL2Linker(l1, l2, l2_write="last_replica")
+    assert composite._write_last_replicas(keys[head:], np.array(WRITTEN[head:]))
     if control:
         fill(written, rng)
     # Allocator pressure on slots that are not held while the write is in flight.
@@ -174,16 +232,19 @@ def main():
 
     indices = torch.tensor([p * PAGE + i for p in RESTORED for i in range(PAGE)])
     lookup = [PoolTransfer(name=PoolName.KV, keys=keys)]
-    hit = l2.lookup("check", lookup)
+    hit = composite.lookup("check", lookup)
     assert hit and hit[-1] == len(WRITTEN), (
         f"lookup found {hit[-1] if hit else 0} of {len(WRITTEN)} pages"
     )
-    assert l2.load(
+    assert composite.reserve("check", len(WRITTEN))
+    assert composite.load(
         "check", [PoolTransfer(name=PoolName.KV, keys=keys, device_indices=indices)]
     )
-    index = l2.start_layer_wise_loading()
-    assert l2.finish_layer_wise_loading(index), "the L2 load failed"
+    index = composite.start_layer_wise_loading()
+    assert composite.finish_layer_wise_loading(index), "the load failed"
     torch.cuda.synchronize()
+    loaded = (l1.stats["l1_loaded_pages"], l1.stats["l2_loaded_pages"])
+    assert loaded == (head, len(WRITTEN) - head), f"loaded (L1, L2) pages {loaded}"
 
     got = read(restored)
     assert len(got) == len(original)
@@ -202,6 +263,7 @@ def main():
                 "rewrites_during_write": rewrites,
                 "mismatched_ranges": dict(bad),
                 "control": control,
+                "peer_head_pages": head,
             }
         )
     )

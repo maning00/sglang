@@ -1,11 +1,12 @@
-"""Choose one source per request: peer HBM when it covers the hit, else UMBP."""
+"""Restore a request from peer HBM, from UMBP, or from a peer prefix that UMBP
+continues (last-replica writes only)."""
 
 from __future__ import annotations
 
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -60,9 +61,15 @@ class CompositeLayerCounter:
 
 @dataclass
 class _Restore:
-    source: str
-    pages: int
+    l1_pages: int
+    l2_pages: int
     queued: bool = False
+
+    @property
+    def source(self):
+        if not self.l1_pages:
+            return "l2"
+        return "l1+l2" if self.l2_pages else "l1"
 
 
 class PeerL1PlusL2Linker(UnifiedCacheLinker):
@@ -74,6 +81,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         l2_write="write_through",
         max_inflight_write_pages=None,
         write_timeout_s=60.0,
+        stitch_l2=True,
     ):
         if l2_write not in ("write_through", "last_replica"):
             raise ValueError(f"Unknown peer_l1 l2_write policy: {l2_write!r}")
@@ -82,6 +90,9 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         # last_replica: L2 receives a page only when its last HBM copy on the node
         # is evicted (the wrapper writes through only for a persisting linker).
         self.persists = l2_write == "write_through"
+        # Last-replica writes leave a page out of L2 while any HBM holds it, so a
+        # prefix whose head is still in a peer has its evicted tail only in L2.
+        self.stitch = stitch_l2 and not self.persists
         # In-flight last-replica writes, oldest first: (rows, submit time). Their
         # rows stay allocated until the write lands, so both bounds cap held HBM.
         self._writes = deque()
@@ -127,6 +138,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
                 )
             ),
             write_timeout_s=float(l1_config.get("l2_write_timeout_s", 60.0)),
+            stitch_l2=bool(l1_config.get("l2_stitch", True)),
         )
 
     def bind_cache(self, cache):
@@ -149,7 +161,9 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         page = self.page_size
         # CPU indices: the L2 offload snapshots them without a device sync.
         indices = torch.from_numpy((rows[:, None] * page + np.arange(page)).reshape(-1))
-        transfer = PoolTransfer(name=PoolName.KV, device_indices=indices, keys=list(keys))
+        transfer = PoolTransfer(
+            name=PoolName.KV, device_indices=indices, keys=list(keys)
+        )
         if not self.l2.offload([transfer]):
             return False
         self._writes.append((rows, time.monotonic()))
@@ -179,34 +193,53 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         self._lookups.pop(rid, None)
         if rid in self._requests:
             return []
-        keys = next(t.keys for t in transfers if t.name == PoolName.KV)
+        kv = next(t for t in transfers if t.name == PoolName.KV)
+        keys = kv.keys
         # Both sources restore contiguous prefixes in the supported unified KV
-        # layout. A request uses exactly one source for the selected boundary.
+        # layout: pages [0, a) from one peer, [start, b) from L2.
         l1_hits = self.l1.lookup(rid, transfers)
-        l2_hits = self.l2.lookup(rid, transfers)
         a = l1_hits[-1] if l1_hits else 0
-        b = l2_hits[-1] if l2_hits else 0
-        self._lookups[rid] = (a, b)
         if a == len(keys):
             self.l1.stats["lookup_l1_covers_tail"] += 1
+        if self.stitch and a:
+            # L2 continues the peer prefix. It also covers any longer L2 prefix:
+            # L2 holding [0, n) holds [a, n).
+            start = a
+            l2_hits = (
+                self.l2.lookup(rid, [replace(kv, keys=keys[a:])])
+                if a < len(keys)
+                else []
+            )
+            b = a + (l2_hits[-1] if l2_hits else 0)
+            if b > a:
+                self.l1.stats["stitch_lookups"] += 1
+                self.l1.stats["stitch_lookup_l2_pages"] += b - a
+        else:
+            start = 0
+            l2_hits = self.l2.lookup(rid, transfers)
+            b = l2_hits[-1] if l2_hits else 0
+        self._lookups[rid] = (a, b, start)
         return list(range(1, max(a, b) + 1))
 
     def reserve(self, rid, num_pages):
         hit = self._lookups.pop(rid, None)
         if rid in self._requests or hit is None:
             return False
-        a, b = hit
+        a, b, start = hit
         if num_pages <= a and self.l1.reserve(rid, num_pages):
-            source = "l1"
+            l1_pages = num_pages
+        elif start and num_pages <= b and self.l1.reserve(rid, start):
+            l1_pages = start
         else:
             self.l1.release_reservation(rid)
-            if num_pages > b:
+            # A continuation is useless without its peer prefix.
+            if start or num_pages > b:
                 self.l1.stats["reserve_fallback_to_recompute"] += 1
                 return False
-            source = "l2"
+            l1_pages = 0
             if num_pages <= a:
                 self.l1.stats["l1_reserve_fallback_to_l2"] += 1
-        self._requests[rid] = _Restore(source, num_pages)
+        self._requests[rid] = _Restore(l1_pages, num_pages - l1_pages)
         return True
 
     def release_reservation(self, rid):
@@ -216,14 +249,35 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         if state is not None and not state.queued:
             del self._requests[rid]
 
+    def _pages(self, transfer, start, end):
+        tokens = slice(start * self.page_size, end * self.page_size)
+        return replace(
+            transfer,
+            keys=transfer.keys[start:end],
+            device_indices=transfer.device_indices[tokens],
+        )
+
     def load(self, rid, transfers):
         state = self._requests[rid]
         if len(transfers) != 1 or transfers[0].name != PoolName.KV:
             raise ValueError("mori_peer_l1 supports unified KV transfers only")
-        backend = self.l1 if state.source == "l1" else self.l2
-        if not backend.load(rid, transfers):
-            self.release_reservation(rid)
-            return False
+        if not state.l2_pages:
+            parts = [(self.l1, transfers)]
+        elif not state.l1_pages:
+            parts = [(self.l2, transfers)]
+        else:
+            (kv,) = transfers
+            split, end = state.l1_pages, len(kv.keys)
+            parts = [
+                (self.l1, [self._pages(kv, 0, split)]),
+                (self.l2, [self._pages(kv, split, end)]),
+            ]
+        for index, (backend, part) in enumerate(parts):
+            if not backend.load(rid, part):
+                if index:  # The peer prefix is already queued.
+                    self.l1.cancel_queued_load(rid)
+                self.release_reservation(rid)
+                return False
         state.queued = True
         self._queued[rid] = state
         return True
@@ -246,7 +300,10 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         for rid in self._batches.pop(counter_index, ()):
             state = self._requests.pop(rid)
             if landed:
-                self.l1.stats[f"{state.source}_loaded_pages"] += state.pages
+                self.l1.stats["l1_loaded_pages"] += state.l1_pages
+                self.l1.stats["l2_loaded_pages"] += state.l2_pages
+                if state.l1_pages and state.l2_pages:
+                    self.l1.stats["stitched_loads"] += 1
         if not landed:
             self.l1.stats["failed_composite_load_batches"] += 1
         return landed
@@ -255,9 +312,12 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         state = self._queued.get(rid)
         if state is None:
             return False
-        backend = self.l1 if state.source == "l1" else self.l2
-        if not backend.cancel_queued_load(rid):
+        # Both parts are queued and submitted together; L2's cancel has no side
+        # effect to undo if L1's then fails.
+        if state.l2_pages and not self.l2.cancel_queued_load(rid):
             return False
+        if state.l1_pages and not self.l1.cancel_queued_load(rid):
+            raise RuntimeError(f"peer_l1: only the L2 part of {rid} was still queued")
         del self._queued[rid]
         del self._requests[rid]
         return True

@@ -400,6 +400,54 @@ def test_composite_reset_clears_unused_requests(composite, operation):
     assert not composite.l1.reserved
 
 
+class _HeldKeys(_Source):
+    """An L2 that answers lookups from the keys it holds."""
+
+    def __init__(self, held):
+        super().__init__()
+        self.held, self.probed = set(held), []
+
+    def lookup(self, rid, transfers):
+        (transfer,) = transfers
+        self.probed.append(list(transfer.keys))
+        hits = 0
+        while hits < len(transfer.keys) and transfer.keys[hits] in self.held:
+            hits += 1
+        return list(range(1, hits + 1))
+
+
+@pytest.mark.parametrize("l2_accepts", [True, False])
+def test_last_replica_restores_a_peer_head_with_its_l2_tail(l2_accepts):
+    """Last-replica writes keep a page out of L2 while some HBM holds it, so a
+    prefix whose head is still in a peer has its tail only in L2. The restore
+    takes the head from the peer and the tail from L2, each into its own slots;
+    a rejected L2 part leaves the peer part neither queued nor pinned."""
+    from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
+
+    l1, l2 = _Source(), _HeldKeys({_key(2), _key(3)})
+    l2.accept_load = l2_accepts
+    linker = PeerL1PlusL2Linker(l1, l2, l2_write="last_replica")
+    assert linker.lookup("r", _transfers(5)) == [1, 2, 3, 4]
+    assert l2.probed == [[_key(2), _key(3), _key(4)]]
+    assert linker.reserve("r", 4)
+    assert linker.load("r", _transfers(4)) == l2_accepts
+    if not l2_accepts:
+        assert not l1.pending and not l1.reserved and not linker._requests
+        return
+    ((head,),), ((tail,),) = l1.pending.values(), l2.pending.values()
+    assert head.keys == [_key(0), _key(1)] and tail.keys == [_key(2), _key(3)]
+    assert head.device_indices.tolist() == list(range(8))
+    assert tail.device_indices.tolist() == list(range(8, 16))
+    index = linker.start_layer_wise_loading()
+    for source in (l1, l2):
+        counter = source.layer_done_counter
+        for layer in range(2):
+            counter.complete(counter.producer_index, layer)
+    assert linker.finish_layer_wise_loading(index)
+    assert (l1.stats["l1_loaded_pages"], l1.stats["l2_loaded_pages"]) == (2, 2)
+    assert l1.stats["stitched_loads"] == 1 and not l1.reserved
+
+
 def test_last_replica_completions_release_rows_in_submission_order():
     """L2 completions are positional: each must release the rows of the write
     submitted in the same order, and none may reach the linker wrapper, which

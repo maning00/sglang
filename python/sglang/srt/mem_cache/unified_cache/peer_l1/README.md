@@ -36,6 +36,7 @@ The extra-config object accepts:
 | `l2_write` | `write_through` | With an L2 (`PeerL1PlusL2Linker`): `write_through` keeps the wrapper's L2 write-through; `last_replica` writes a page to L2 only when its last HBM copy on the node is evicted, holding the row until the write lands |
 | `l2_write_max_inflight_pages` | 15% of page rows | `last_replica` only: a write that would put more pages in flight is refused (the page is freed without an L2 copy) |
 | `l2_write_timeout_s` | 60 | `last_replica` only: once a write is in flight this long, new writes are refused until it lands; the late write keeps its rows |
+| `l2_stitch` | true | `last_replica` only: UMBP continues a peer prefix (the peer's pages, then UMBP's from where they end), since UMBP lacks the pages still in some HBM |
 
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;
@@ -79,10 +80,14 @@ level and peer options go in `peer_l1`, for example:
 {"ssd_enabled":false,"peer_l1":{"blocks":32,"layer_group":8,"pin_cap":16384}}
 ```
 
-This requires the same UMBP standalone setup as the `mori` backend. Each request
-uses one source: peer HBM when it covers the selected prefix and can reserve it,
-otherwise UMBP when it covers the whole prefix. A failed peer reservation with
-only a shorter UMBP prefix falls back to recomputation. Writes always go to UMBP.
+This requires the same UMBP standalone setup as the `mori` backend. With
+`write_through`, each request uses one source: peer HBM when it covers the
+selected prefix and can reserve it, otherwise UMBP when it covers the whole
+prefix. A failed peer reservation with only a shorter UMBP prefix falls back to
+recomputation. With `last_replica` and `l2_stitch`, UMBP is probed only past the
+peer prefix, and a request may take its head from the peer and the rest from
+UMBP (`stitched_loads`); if the peer reservation then fails, it recomputes.
+Writes always go to UMBP.
 Restores stay private until their whole load succeeds and checkpoint inserts them.
 An L1 or L2 failure aborts every restoring request in that batch.
 Flush checks both loaders and UMBP offloads; it clears device directories while
