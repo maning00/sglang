@@ -230,6 +230,15 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
     """Release the current role's disaggregation structures (queues, metadata
     buffers, KV transfer manager) so the other role can be rebuilt."""
     mode = scheduler.disaggregation_mode
+    from sglang.srt.mem_cache.unified_cache.peer_l1.lend.lifecycle import (
+        prefill_linker,
+        unbind_decode_lend,
+    )
+
+    linker = prefill_linker(scheduler)
+    if hasattr(linker, "unbind_pd"):
+        linker.unbind_pd()
+    unbind_decode_lend(scheduler)
     if mode == DisaggregationMode.PREFILL:
         q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
         if q is not None:

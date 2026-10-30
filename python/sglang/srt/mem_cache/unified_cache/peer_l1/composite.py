@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 
@@ -123,9 +124,22 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         l1 = PeerL1Linker(
             server_args, params, components=components, extra_config=l1_config
         )
-        l2 = UMBPDirectLinker(
-            server_args, params, components=components, extra_config=config
+        backend = l1_config.get("l2_backend", "umbp")
+        if backend not in ("umbp", "decode_lend", "decode_lend+umbp"):
+            raise ValueError(f"Unknown peer_l1 l2_backend: {backend!r}")
+        if backend != "umbp" and not getattr(l1.pool_group, "rank_replicated", False):
+            raise ValueError("decode lend requires rank-replicated unified KV")
+        l2 = (
+            UMBPDirectLinker(
+                server_args, params, components=components, extra_config=config
+            )
+            if backend != "decode_lend"
+            else None
         )
+        if backend != "umbp":
+            from .lend.tiered import TieredL2
+
+            l2 = TieredL2(l1, l2)
         return cls(
             l1,
             l2,
@@ -140,6 +154,14 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
             write_timeout_s=float(l1_config.get("l2_write_timeout_s", 60.0)),
             stitch_l2=bool(l1_config.get("l2_stitch", True)),
         )
+
+    def bind_pd(self, manager):
+        if hasattr(self.l2, "bind_pd"):
+            self.l2.bind_pd(manager)
+
+    def unbind_pd(self):
+        if hasattr(self.l2, "unbind_pd"):
+            self.l2.unbind_pd()
 
     def bind_cache(self, cache):
         self.l1.bind_cache(cache)

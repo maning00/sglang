@@ -137,6 +137,10 @@ class SchedulerInvariantChecker:
             full_evictable_size = ceil_align(full_evictable_size, allocator.page_size)
         peer = getattr(self.tree_cache, "peer_l1", None)
         deferred = peer.owner.deferred_tokens if peer is not None else 0
+        if ps.lend_pages is not None:
+            deferred += (
+                ps.lend_pages["writing"] + ps.lend_pages["pinned"]
+            ) * allocator.page_size
         leak, msg = self._check_pool_invariant(
             "full",
             full_available,
@@ -404,6 +408,22 @@ class SchedulerInvariantChecker:
         # the classed sharding allocator, whose free lists hold logical page
         # ids in the same unit).
         owner_pages = owner_locs // sub_allocs[0].page_size
+        lend = getattr(sub_allocs[0], "lend_pool", None)
+        if lend is not None:
+            with lend.lock:
+                borrowed_ids = list(lend.pages)
+            borrowed = torch.tensor(
+                borrowed_ids, device=rtt.device, dtype=owner_pages.dtype
+            )
+            overlap = owner_pages[torch.isin(owner_pages, borrowed)]
+            if overlap.numel():
+                raise_error_or_warn(
+                    self,
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                    "count_memory_leak_warnings",
+                    f"Decode lend pages still owned by requests: {overlap[:8].tolist()}",
+                )
+            owner_pages = torch.cat((owner_pages, borrowed))
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
             free = sub.get_all_free_pages()

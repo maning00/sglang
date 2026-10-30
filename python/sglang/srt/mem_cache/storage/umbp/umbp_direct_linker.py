@@ -463,6 +463,19 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
+    def page_exists(self, transfers: list[PoolTransfer]) -> list[bool]:
+        """Per-page coverage across every physical pool of unified KV."""
+        kv = next(t for t in transfers if t.name == PoolName.KV)
+        keys = list(kv.keys or [])
+        expanded = self.pool_group.resolve_transfers(transfers)
+        if not expanded:
+            return [False] * len(keys)
+        present = [True] * len(keys)
+        for transfer in expanded:
+            exists = self._page_exists(keys, transfer)
+            present = [a and b for a, b in zip(present, exists)]
+        return present
+
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
@@ -670,7 +683,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             finally:
                 self._load_queue.task_done()
 
-    def _all_layer_ranges(self, plan: _PoolRangePlan):
+    def _all_layer_ranges(self, plan: _PoolRangePlan, *, entry=None):
         """Every layer's ranges, accumulated per object.
 
         Offload requires one call to carry ranges that tile the object exactly,
@@ -680,7 +693,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         and the None return is unreachable; rejecting it keeps a future caller
         that passes a foreign plan from failing on a tuple unpack instead.
         """
-        meta = self._layer_group_ranges(plan, self.pool_layers[plan.name])
+        meta = self._layer_group_ranges(plan, self.pool_layers[plan.name], entry=entry)
         if meta is None:
             raise ValueError(
                 f"UMBP pool {plan.name} covers none of its own layers "
@@ -703,7 +716,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 plans.append(plan)
         return plans
 
-    def _range_items(self, plan: _PoolRangePlan, layers: list[int]):
+    def _range_items(self, plan: _PoolRangePlan, layers: list[int], *, entry=None):
         """(base_ptr, row_stride, size, offset) per emitted range, in wire order.
 
         Grouped by layer, and within a layer by component. Every object emits
@@ -711,7 +724,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         the pointer, by ``row * row_stride``. That invariant is what the
         vectorized builder rests on.
         """
-        entry = self.pools[plan.name]
+        entry = self.pools[plan.name] if entry is None else entry
         items: list[list[tuple[int, int, int, int]]] = []
         for logical_layer in layers:
             buffer_index = entry.layer_mapping.get(logical_layer)
@@ -727,7 +740,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         return items
 
-    def _layer_group_ranges(self, plan: _PoolRangePlan, layers: list[int]):
+    def _layer_group_ranges(
+        self, plan: _PoolRangePlan, layers: list[int], *, entry=None
+    ):
         """One group of layers' ranges, one nested list per object.
 
         Built column-wise rather than object by object. A 256K restore emits
@@ -745,7 +760,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         Returns None when this pool covers none of the group, so the caller can
         skip the call.
         """
-        items = self._range_items(plan, layers)
+        entry = self.pools[plan.name] if entry is None else entry
+        items = self._range_items(plan, layers, entry=entry)
         if not items:
             return None
         rows = np.asarray(plan.locations, dtype=np.int64)
@@ -760,7 +776,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 f"{len(rows)} rows at {plan.entries_per_page} per page."
             )
 
-        if self.pools[plan.name].packed:
+        if entry.packed:
             # One object per page, its ranges running (layer, component).
             flat = [item for layer_items in items for item in layer_items]
             base = np.fromiter((item[0] for item in flat), np.int64, len(flat))

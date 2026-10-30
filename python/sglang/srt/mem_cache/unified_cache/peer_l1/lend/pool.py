@@ -1,0 +1,289 @@
+"""Decode-owned lent pages. No GPU or allocator calls occur under this lock."""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from collections import Counter, OrderedDict, deque
+from dataclasses import dataclass, field
+from itertools import chain, islice
+
+
+@dataclass
+class Page:
+    generation: int
+    state: str = "free"
+    key: str = ""
+    writer: str = ""
+    alloc_seq: int = 0
+    pins: set[int] = field(default_factory=set)
+    demote_deadline: float = 0.0
+
+
+class LendPool:
+    def __init__(
+        self,
+        capacity,
+        *,
+        idle=0.05,
+        limit=0.02,
+        growth=0.10,
+        watermark=0.02,
+        lease_s=30.0,
+        clock=time.monotonic,
+    ):
+        if capacity < 1 or not (
+            0 < limit < 1
+            and 0 <= idle < 1
+            and 0 <= growth < 1
+            and 0 < watermark < 1
+            and lease_s > 0
+        ):
+            raise ValueError("Invalid decode lend limits")
+        self.capacity, self.idle, self.growth = capacity, idle, growth
+        self.limit = max(1, int(capacity * limit))
+        self.write_limit = max(1, self.limit // 2)
+        self.pin_limit = max(1, self.limit - self.write_limit)
+        self.watermark, self.lease_s, self.clock = watermark, lease_s, clock
+        self.epoch = uuid.uuid4().hex
+        self.lock = threading.RLock()
+        self.pages: dict[int, Page] = {}
+        self.generations = Counter()
+        self.free = OrderedDict()
+        self.lru = OrderedDict()
+        self.keys = {}
+        self.leases = {}
+        self._next_lease = 0
+        self.events = deque()
+        self.stats = Counter()
+        self.decode_used = 0
+        self.draining = False
+        self.writing = 0
+        self.pinned = 0
+        self.demoting = OrderedDict()
+
+    def _unavailable(self):
+        return self.writing + self.pinned
+
+    @property
+    def reclaimable(self):
+        with self.lock:
+            return len(self.pages) - self._unavailable()
+
+    def _admit(self, extra):
+        allowed = (
+            not self.draining
+            and self._unavailable() + extra <= self.limit
+            and self.decode_used
+            + self._unavailable()
+            + extra
+            + int(self.capacity * self.growth)
+            <= self.capacity
+        )
+        if not allowed:
+            self.stats["gate_refused"] += extra
+        return allowed
+
+    def add_free(self, pages):
+        with self.lock:
+            for page in pages:
+                page = int(page)
+                if not 0 < page <= self.capacity or page in self.pages:
+                    raise ValueError("Lent page is invalid or already owned")
+                self.pages[page] = Page(self.generations[page])
+                self.free[page] = None
+
+    def _record(self, page):
+        p = self.pages[page]
+        return [page, p.generation, p.key]
+
+    def _matches(self, page, gen):
+        return page in self.pages and self.pages[page].generation == gen
+
+    def allocate(self, writer, count, seq=0):
+        with self.lock:
+            count = max(0, min(count, len(self.free), self.write_limit - self.writing))
+            if not count or not self._admit(count):
+                return []
+            result = []
+            for _ in range(count):
+                page, _ = self.free.popitem(last=False)
+                self.generations[page] += 1
+                self.pages[page] = Page(
+                    self.generations[page], "writing", writer=writer, alloc_seq=seq
+                )
+                result.append(self._record(page))
+                self.writing += 1
+            return result
+
+    def cancel_allocation(self, writer, seq):
+        """The caller timed out before receiving this grant, so posted no writes."""
+        with self.lock:
+            for page, p in list(self.pages.items()):
+                if p.state == "writing" and p.writer == writer and p.alloc_seq == seq:
+                    self._discard(page)
+
+    def commit(self, writer, records):
+        with self.lock:
+            result = []
+            for page, gen, key in records:
+                if not self._matches(page, gen):
+                    result.append(False)
+                    continue
+                p = self.pages[page]
+                # A lost reply may be retried without republishing another key.
+                if (
+                    p.writer == writer
+                    and p.key == key
+                    and p.state in ("valid", "demoting")
+                ):
+                    result.append(True)
+                elif p.state != "writing" or p.writer != writer:
+                    result.append(False)
+                elif key in self.keys:
+                    self._discard(page)
+                    result.append(False)
+                else:
+                    self.writing -= 1
+                    p.state, p.key = "valid", key
+                    self.keys[key] = page
+                    self.lru[page] = None
+                    result.append(True)
+            return result
+
+    def abort(self, writer, records):
+        with self.lock:
+            for page, gen, *_ in records:
+                if self._matches(page, gen):
+                    p = self.pages[page]
+                    if p.state == "writing" and p.writer == writer:
+                        self._discard(page)
+
+    def pin(self, reader, records):
+        with self.lock:
+            self.expire()
+            selected = []
+            for page, gen, key in records:
+                if not self._matches(page, gen):
+                    return 0
+                p = self.pages[page]
+                if p.state not in ("valid", "demoting") or p.key != key:
+                    return 0
+                selected.append(page)
+            selected = list(dict.fromkeys(selected))
+            extra = sum(not self.pages[p].pins for p in selected)
+            if (
+                not selected
+                or self.pinned + extra > self.pin_limit
+                or not self._admit(extra)
+            ):
+                return 0
+            self.pinned += extra
+            self._next_lease += 1
+            lease = self._next_lease
+            self.leases[lease] = (reader, selected, self.clock() + self.lease_s)
+            for page in selected:
+                self.pages[page].pins.add(lease)
+                self.lru.move_to_end(page)
+            return lease
+
+    def unpin(self, reader, lease):
+        with self.lock:
+            saved = self.leases.get(lease)
+            if saved is None or saved[0] != reader:
+                return
+            del self.leases[lease]
+            for page in saved[1]:
+                p = self.pages.get(page)
+                if p is None:
+                    continue
+                p.pins.remove(lease)
+                if not p.pins:
+                    self.pinned -= 1
+                if p.state == "retired" and not p.pins:
+                    self._discard(page)
+
+    def _discard(self, page):
+        p = self.pages[page]
+        assert not p.pins
+        if p.state == "writing":
+            self.writing -= 1
+        self.demoting.pop(page, None)
+        if p.key:
+            if self.keys.get(p.key) == page:
+                del self.keys[p.key]
+            self.events.append(("EVICTED", p.writer, [self._record(page)]))
+        self.lru.pop(page, None)
+        self.pages[page] = Page(p.generation)
+        self.free[page] = None
+
+    def demoted(self, writer, records):
+        with self.lock:
+            for page, gen, key in records:
+                if self._matches(page, gen):
+                    p = self.pages[page]
+                    if p.writer == writer and p.key == key and p.state == "demoting":
+                        self.demoting.pop(page, None)
+                        if p.pins:
+                            p.state = "retired"
+                            self.lru.pop(page, None)
+                        else:
+                            self._discard(page)
+
+    def expire(self):
+        with self.lock:
+            now = self.clock()
+            for lease, (reader, _, deadline) in list(self.leases.items()):
+                if now >= deadline:
+                    self.unpin(reader, lease)
+            for page, deadline in list(self.demoting.items()):
+                if now < deadline:
+                    break
+                self.demoting.pop(page)
+                p = self.pages[page]
+                if p.state == "demoting":
+                    if p.pins:
+                        p.state = "retired"
+                        self.lru.pop(page, None)
+                    else:
+                        self._discard(page)
+
+    def request_demotions(self, count):
+        with self.lock:
+            if count <= 0:
+                return
+            records = {}
+            for page in self.lru:
+                if count <= 0:
+                    break
+                p = self.pages[page]
+                if p.state != "valid":
+                    continue
+                p.state, p.demote_deadline = "demoting", self.clock() + self.lease_s
+                self.demoting[page] = p.demote_deadline
+                records.setdefault(p.writer, []).append(self._record(page))
+                count -= 1
+            for writer, pages in records.items():
+                self.events.append(("DEMOTE", writer, pages))
+
+    def reclaim(self, count):
+        """Called only by the scheduler; service threads never return pages."""
+        with self.lock:
+            self.expire()
+            candidates = list(
+                islice(
+                    chain(self.free, (p for p in self.lru if not self.pages[p].pins)),
+                    max(0, count),
+                )
+            )
+            result = []
+            for page in candidates:
+                p = self.pages[page]
+                if p.state != "free":
+                    self._discard(page)
+                    self.stats["sync_discard"] += 1
+                self.free.pop(page)
+                del self.pages[page]
+                result.append(page)
+            return result

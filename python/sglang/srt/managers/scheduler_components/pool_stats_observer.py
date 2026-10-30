@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -68,6 +69,8 @@ class PoolStats:
     swa_token_usage: Optional[float] = None
     swa_available_size: Optional[int] = None
     swa_evictable_size: Optional[int] = None
+
+    lend_pages: Optional[dict] = None
 
     # For mamba pools
     mamba_num_used: Optional[int] = None
@@ -304,12 +307,26 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        (full_capacity, full_available_size), (swa_capacity, swa_available_size) = (
-            self.token_to_kv_pool_allocator.swa_capacity_and_available(
-                full_capacity=self.full_tokens_per_layer,
-                swa_capacity=self.swa_tokens_per_layer,
+        inner = self.token_to_kv_pool_allocator.full_attn_allocator
+        lend = getattr(inner, "lend_pool", None)
+        lend_pages = None
+        with lend.lock if lend is not None else nullcontext():
+            (full_capacity, full_available_size), (swa_capacity, swa_available_size) = (
+                self.token_to_kv_pool_allocator.swa_capacity_and_available(
+                    full_capacity=self.full_tokens_per_layer,
+                    swa_capacity=self.swa_tokens_per_layer,
+                )
             )
-        )
+            if lend is not None:
+                lend_pages = {
+                    "total": len(lend.pages),
+                    "free": len(lend.free),
+                    "writing": lend.writing,
+                    "pinned": lend.pinned,
+                    "demoting": len(lend.demoting),
+                    "sync_discard": lend.stats["sync_discard"],
+                    "gate_refused": lend.stats["gate_refused"],
+                }
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         # Per-request SWA ring: released with the req slot, yet cached radix
@@ -339,6 +356,7 @@ class SchedulerPoolStatsObserver:
             swa_token_usage = swa_num_used / swa_capacity
 
         return PoolStats(
+            lend_pages=lend_pages,
             is_hybrid_swa=True,
             full_capacity=full_capacity,
             swa_capacity=swa_capacity,

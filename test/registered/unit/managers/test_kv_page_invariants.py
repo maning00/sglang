@@ -1,5 +1,6 @@
 """Unit tests for SGLANG_CHECK_KV_PAGE_INVARIANTS: watermark + double-free checks."""
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -61,6 +62,19 @@ class _FakeOwner:
 
 
 class TestKVPageInvariants(CustomTestCase):
+    def test_lent_page_overlap_respects_relaxed_check_policy(self):
+        from sglang.srt.environ import envs
+
+        chk, rtt, _, alloc = _make_checker(free_pages=torch.tensor([100, 101]))
+        alloc.lend_pool = SimpleNamespace(lock=threading.RLock(), pages={5: object()})
+        rtt[0, :1] = torch.tensor([5 * _PAGE_SIZE])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeOwner(0, 1, 1, rid="overlap")]
+        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(False):
+            chk._check_kv_page_invariants()
+        self.assertEqual(chk.count_memory_leak_warnings, 1)
+
     def test_clean_layout_no_warning(self):
         chk, rtt, tc, alloc = _make_checker(
             free_pages=torch.arange(100, 200, dtype=torch.int64)

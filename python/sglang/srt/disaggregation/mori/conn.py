@@ -215,6 +215,8 @@ class KVArgsRegisterInfo:
     dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    lend_port: Optional[int] = None
+    decode_dp_rank: Optional[int] = None
 
     @property
     def engine_key(self) -> str:
@@ -275,6 +277,10 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=dst_dcp_rank,
             dst_state_layer_ids=dst_state_layer_ids,
             dst_kv_layer_ids=dst_kv_layer_ids,
+            lend_port=int(payload[17]) if len(payload) > 17 and payload[17] else None,
+            decode_dp_rank=int(payload[18])
+            if len(payload) > 18 and payload[18]
+            else None,
         )
 
 
@@ -2229,6 +2235,10 @@ class MoriKVReceiver(CommonKVReceiver):
                             dcp_rank,
                             packed_state_layer_ids,
                             packed_kv_layer_ids,
+                            str(getattr(self.kv_mgr, "lend_port", "")).encode("ascii"),
+                            str(getattr(self.kv_mgr, "lend_dp_rank", "")).encode(
+                                "ascii"
+                            ),
                         ]
                     )
             except zmq.ZMQError:

@@ -998,6 +998,8 @@ class SchedulerMetricsReporter:
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
+            if pool_stats.lend_pages is not None:
+                msg += f"lend pages: {pool_stats.lend_pages}, "
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "

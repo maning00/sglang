@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
@@ -87,6 +88,7 @@ class PeerL1Linker(UnifiedCacheLinker):
                 "peer_l1 requires 2–8 local DP workers with attention TP=1, CP=1, PP=1"
             )
         self.device = torch.device("cuda", torch.cuda.current_device())
+        self.page_size = params.page_size
         if torch.cuda.device_count() < world:
             raise ValueError("Every peer_l1 worker must see every participating GPU")
         config = (

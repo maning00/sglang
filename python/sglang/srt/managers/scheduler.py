@@ -1559,6 +1559,13 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+            if get_disagg().disaggregation_decode_lend_kv:
+                from sglang.srt.mem_cache.unified_cache.peer_l1.lend.lifecycle import (
+                    install_decode_lend,
+                )
+
+                install_decode_lend(self)
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -1593,6 +1600,14 @@ class Scheduler(
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+            from sglang.srt.mem_cache.unified_cache.peer_l1.lend.lifecycle import (
+                prefill_linker,
+            )
+
+            linker = prefill_linker(self)
+            if hasattr(linker, "bind_pd"):
+                linker.bind_pd(self.disagg_prefill_bootstrap_queue.kv_manager)
 
         if (
             self.enable_unified_memory
@@ -5441,6 +5456,14 @@ class Scheduler(
             peer = getattr(self.tree_cache, "peer_l1", None)
             if peer is not None and not peer.begin_flush():
                 return False
+            lend = getattr(self, "decode_lend_service", None)
+            if lend is not None:
+                with lend.pool.lock:
+                    if lend.pool.writing or lend.pool.pinned:
+                        if peer is not None:
+                            peer.end_flush()
+                        return False
+                    lend.pool.draining = True
             try:
                 self.cur_batch_for_debug = None
                 self.last_batch = None
@@ -5462,6 +5485,9 @@ class Scheduler(
                     logger.info("Cache flushed successfully!")
                 success = True
             finally:
+                if lend is not None:
+                    with lend.pool.lock:
+                        lend.pool.draining = False
                 if peer is not None:
                     peer.end_flush()
         else:

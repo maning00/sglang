@@ -561,6 +561,7 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
 
 def _radix_scheduler(disable_radix_cache):
     s = MagicMock()
+    s.decode_lend_service = None
     s.disable_radix_cache = disable_radix_cache
     tree = MagicMock()
     del tree.clear_storage_backend  # plain RadixCache has none
