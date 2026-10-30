@@ -138,9 +138,7 @@ class SchedulerInvariantChecker:
         peer = getattr(self.tree_cache, "peer_l1", None)
         deferred = peer.owner.deferred_tokens if peer is not None else 0
         if ps.lend_pages is not None:
-            deferred += (
-                ps.lend_pages["writing"] + ps.lend_pages["pinned"]
-            ) * allocator.page_size
+            deferred += ps.lend_pages["held"] * allocator.page_size
         leak, msg = self._check_pool_invariant(
             "full",
             full_available,

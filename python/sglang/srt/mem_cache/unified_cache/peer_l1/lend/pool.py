@@ -71,6 +71,13 @@ class LendPool:
         with self.lock:
             return len(self.pages) - self._unavailable()
 
+    @property
+    def assured_reclaimable(self):
+        # Service threads may still take reclaimable pages for writes or pins
+        # up to the limit before the scheduler allocates; budgets exclude them.
+        with self.lock:
+            return max(0, len(self.pages) - max(self.limit, self._unavailable()))
+
     def _admit(self, extra):
         allowed = (
             not self.draining

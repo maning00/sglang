@@ -244,7 +244,8 @@ def check_failed_load_source_hold(manager, info, target_args, lower, rng):
 def check_gpu_reclaim():
     for method in ("alloc", "alloc_extend", "alloc_decode"):
         pool = LendPool(PAGES)
-        pool.add_free([7])
+        # One lent page beyond what lend I/O may still pin or write.
+        pool.add_free(range(7, 8 + pool.limit))
         original = PagedTokenToKVPoolAllocator(
             PAGES * PAGE, PAGE, torch.int64, "cuda:0", None, True
         )
@@ -271,7 +272,7 @@ def check_gpu_reclaim():
                 torch.tensor([-1], device="cuda:0"),
             )
         assert result is not None and result[0].item() == 7 * PAGE
-        assert not pool.pages
+        assert len(pool.pages) == pool.limit
 
 
 def check_overlap_lending(prefill, decode):

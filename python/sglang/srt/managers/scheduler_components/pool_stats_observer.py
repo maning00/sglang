@@ -324,6 +324,7 @@ class SchedulerPoolStatsObserver:
                     "writing": lend.writing,
                     "pinned": lend.pinned,
                     "demoting": len(lend.demoting),
+                    "held": len(lend.pages) - lend.assured_reclaimable,
                     "sync_discard": lend.stats["sync_discard"],
                     "gate_refused": lend.stats["gate_refused"],
                 }

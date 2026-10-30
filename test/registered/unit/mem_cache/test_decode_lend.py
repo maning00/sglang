@@ -232,8 +232,8 @@ def test_allocator_all_entrypoints_reclaim_before_kernels():
     for method in ("alloc", "alloc_extend", "alloc_decode"):
         p = pool()
         a = allocator(p)
-        # Leave a single lent page reclaimable and no actual free pages.
-        p.reclaim(99)
+        # Leave one lent page beyond the lend I/O limit and no actual free pages.
+        p.reclaim(99 - p.limit)
         a.free_pages = torch.empty(0, dtype=torch.int64)
         assert a.available_size() == 256
         if method == "alloc":
@@ -251,8 +251,8 @@ def test_allocator_all_entrypoints_reclaim_before_kernels():
             result = a.alloc_decode(
                 torch.tensor([1]), torch.tensor([1]), torch.tensor([-1])
             )
-        assert result is not None and len(p.pages) == 0
-        assert result[0].item() == 100 * 256
+        assert result is not None and len(p.pages) == p.limit
+        assert result[0].item() == (100 - p.limit) * 256
 
 
 @pytest.mark.parametrize("return_to_decode", [False, True])
@@ -265,7 +265,7 @@ def test_pending_lend_needs_forward_and_copy_and_remains_allocatable(return_to_d
     copied.query.return_value = False
     forwarded.query.return_value = True
     a._pending_lend = (pages, pages.clone(), copied, forwarded)
-    assert a.available_size() == 1000 * 256
+    assert a.available_size() == (1000 - p.limit) * 256
     assert a.get_all_free_pages().unique().numel() == 900
     a._publish_ready_lend()
     assert pages[0].item() not in p.pages
@@ -275,12 +275,25 @@ def test_pending_lend_needs_forward_and_copy_and_remains_allocatable(return_to_d
     assert pages[0].item() not in p.pages
     if return_to_decode:
         assert a.alloc(900 * 256) is not None
-        assert a.available_size() == 100 * 256
+        assert a.available_size() == (100 - p.limit) * 256
     forwarded.query.return_value = True
     a._publish_ready_lend()
     assert (pages[0].item() in p.pages) != return_to_decode
     assert a._pending_lend is None
-    assert a.available_size() == (100 if return_to_decode else 1000) * 256
+    assert a.available_size() == ((100 if return_to_decode else 1000) - p.limit) * 256
+
+
+def test_admission_budget_survives_concurrent_lend_io():
+    """Decode can allocate what available_size() reported after lend I/O pins or
+    writes lent pages up to the limit in between."""
+    p = pool()
+    a = allocator(p)
+    a.free_pages = torch.empty(0, dtype=torch.int64)
+    budget = a.available_size()
+    records = committed(p, p.pin_limit)
+    assert p.pin("reader", records)
+    assert p.allocate("writer", p.write_limit)
+    assert a.alloc(budget) is not None
 
 
 def test_restore_bypasses_full_write_queue(monkeypatch):

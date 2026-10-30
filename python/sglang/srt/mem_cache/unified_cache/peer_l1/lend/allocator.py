@@ -93,7 +93,8 @@ class LendablePagedAllocator(PagedTokenToKVPoolAllocator):
     def available_size(self):
         return (
             super().available_size()
-            + (self._pending_pages() + self.lend_pool.reclaimable) * self.page_size
+            + (self._pending_pages() + self.lend_pool.assured_reclaimable)
+            * self.page_size
         )
 
     def _ensure_pages(self, count):
