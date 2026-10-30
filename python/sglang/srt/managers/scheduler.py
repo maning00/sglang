@@ -4841,7 +4841,19 @@ class Scheduler(
             # A PD prefill request can be requeued; elsewhere it is aborted.
             failed = self.tree_cache.finish_external_linker_loads(
                 batch.reqs,
-                requeue=self.disaggregation_mode == DisaggregationMode.PREFILL,
+                requeue=(
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    # Quiescence is local to this MoRI manager. Until retries
+                    # have a group-wide readiness decision, keep queues equal
+                    # across attention ranks by aborting multi-rank failures.
+                    and get_parallel().attn_tp_size == 1
+                    and get_parallel().attn_cp_size == 1
+                    and self.disagg_prefill_bootstrap_queue.kv_manager.enable_deferred_decode_kv_release
+                    and hasattr(
+                        self.disagg_prefill_bootstrap_queue.kv_manager,
+                        "transfer_quiescent",
+                    )
+                ),
             )
             if (
                 self.chunked_req in failed
@@ -5279,6 +5291,7 @@ class Scheduler(
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= not getattr(self, "_failed_load_requeues", {})
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -5608,6 +5621,10 @@ class Scheduler(
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in getattr(self, "_failed_load_requeues", {}).values():
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    prepare_abort(req, "Aborted while draining failed external load")
+                    req.disagg_kv_sender.abort()
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):

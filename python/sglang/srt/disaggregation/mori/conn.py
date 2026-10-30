@@ -538,7 +538,6 @@ class MoriKVManager(CommonKVManager):
             # alone can never wake a parked worker during a role switch.
             if kv_chunk is None:
                 break
-            self._mark_transfer_started(kv_chunk)
             try:
                 is_quiescent = self._process_transfer_chunk(kv_chunk)
             except _MoriTransferSubmissionError as exc:
@@ -592,6 +591,13 @@ class MoriKVManager(CommonKVManager):
             return
         with self._abort_ack_lock:
             self._staging_outstanding[kv_chunk.room] += 1
+
+    def transfer_quiescent(self, room: int) -> bool:
+        """Include queued chunks: their source pages must remain owned too."""
+        if not self.enable_deferred_decode_kv_release:
+            return False
+        with self._abort_ack_lock:
+            return self._staging_outstanding.get(room, 0) == 0
 
     def _mark_transfer_quiescent(self, kv_chunk: TransferKVChunk) -> None:
         if not self.enable_deferred_decode_kv_release:
@@ -798,18 +804,22 @@ class MoriKVManager(CommonKVManager):
             return
 
         shard_idx = bootstrap_room % self._num_shards
-        self._transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            wait_event=wait_event,
         )
+        self._mark_transfer_started(chunk)
+        try:
+            self._transfer_queues[shard_idx].put(chunk)
+        except BaseException:
+            self._mark_transfer_quiescent(chunk)
+            raise
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.

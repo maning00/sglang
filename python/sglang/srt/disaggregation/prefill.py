@@ -589,6 +589,21 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
+        pending = getattr(self, "_failed_load_requeues", {})
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        for rid, req in list(pending.items()):
+            if manager.check_status(
+                req.bootstrap_room
+            ) == KVPoll.Failed and not is_aborted(req):
+                prepare_abort(
+                    req, "PD transfer failed while waiting to retry an external load"
+                )
+            if manager.transfer_quiescent(req.bootstrap_room):
+                del pending[rid]
+                if is_aborted(req):
+                    self.handle_bootstrap_failure(req)
+                else:
+                    self.requeue_after_failed_load(req)
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
         if not candidates:
             return
@@ -1314,6 +1329,14 @@ class SchedulerDisaggregationPrefillMixin:
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
 
+        if req.requeue_after_failed_load:
+            manager = self.disagg_prefill_bootstrap_queue.kv_manager
+            if not manager.transfer_quiescent(req.bootstrap_room):
+                if not hasattr(self, "_failed_load_requeues"):
+                    self._failed_load_requeues = {}
+                self._failed_load_requeues[req.rid] = req
+                return False
+
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
@@ -1714,6 +1737,12 @@ class SchedulerDisaggregationPrefillMixin:
     def requeue_after_failed_load(self: Scheduler, req: Req) -> None:
         """Release a request whose external KV load failed and queue it to recompute
         that tail; nothing of the failed forward reaches decode or the tree."""
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if not manager.transfer_quiescent(req.bootstrap_room):
+            if not hasattr(self, "_failed_load_requeues"):
+                self._failed_load_requeues = {}
+            self._failed_load_requeues[req.rid] = req
+            return
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()

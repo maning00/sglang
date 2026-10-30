@@ -25,6 +25,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _Req:
     def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
         self.rid = "aborted-prefill"
+        self.bootstrap_room = 123
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
         self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
@@ -384,6 +385,10 @@ def _requeue_scheduler(*, chunked_req=None):
     scheduler.waiting_queue = []
     scheduler.processed_tokens_counter = 0
     scheduler.chunked_req = chunked_req
+    scheduler.scheduler_stage_metrics = None
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+        kv_manager=SimpleNamespace(transfer_quiescent=Mock(return_value=True))
+    )
     return scheduler
 
 
@@ -400,6 +405,43 @@ def _failed_load_req(*, inflight_middle_chunks):
     req.time_stats.reset_prefill_retry_time = Mock()
     req.time_stats.set_wait_queue_entry_time = Mock()
     return req
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+@patch(
+    "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+    return_value=[],
+)
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_failed_load_keeps_source_until_pd_quiescent(release_kv_cache, _poll, aborted):
+    from sglang.srt.disaggregation.base.conn import KVPoll
+
+    scheduler = _requeue_scheduler()
+    scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
+    scheduler.handle_bootstrap_failure = Mock()
+    manager = scheduler.disagg_prefill_bootstrap_queue.kv_manager
+    manager.check_status = Mock(return_value=KVPoll.Transferring)
+    manager.transfer_quiescent.return_value = False
+    req = _failed_load_req(inflight_middle_chunks=0)
+
+    scheduler.requeue_after_failed_load(req)
+    scheduler.resolve_waiting_queue_bootstrap()
+    release_kv_cache.assert_not_called()
+    assert req.kv.req_pool_idx == 1 and scheduler.waiting_queue == []
+
+    if aborted:
+        req.to_finish = FINISH_ABORT()
+    manager.transfer_quiescent.return_value = True
+    scheduler.resolve_waiting_queue_bootstrap()
+    assert not scheduler._failed_load_requeues
+    if aborted:
+        scheduler.handle_bootstrap_failure.assert_called_once_with(req)
+        release_kv_cache.assert_not_called()
+    else:
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, checkpoint=False
+        )
+        assert scheduler.waiting_queue == [req]
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
@@ -469,4 +511,66 @@ def test_client_abort_wins_over_failed_load_requeue(release_kv_cache):
     assert scheduler.waiting_queue == [] and req.finished()
     release_kv_cache.assert_called_once_with(
         req, scheduler.tree_cache, checkpoint=False
+    )
+
+
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_client_abort_during_failed_load_keeps_inflight_pd_source(release_kv_cache):
+    scheduler = _requeue_scheduler()
+    scheduler.disagg_prefill_bootstrap_queue.kv_manager.transfer_quiescent.return_value = False
+    req = _failed_load_req(inflight_middle_chunks=0)
+    req.to_finish = FINISH_ABORT()
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    release_kv_cache.assert_not_called()
+    assert scheduler._failed_load_requeues == {req.rid: req}
+    assert req.kv.req_pool_idx == 1 and scheduler.waiting_queue == []
+
+
+@pytest.mark.parametrize(
+    "tp,cp,deferred,quiescence_supported,requeue",
+    [
+        (1, 1, True, True, True),
+        (2, 1, True, True, False),
+        (1, 2, True, True, False),
+        (2, 2, True, True, False),
+        (1, 1, False, True, False),
+        (1, 1, True, False, False),
+    ],
+)
+def test_forward_only_enables_safe_single_rank_failed_load_retries(
+    tp, cp, deferred, quiescence_supported, requeue
+):
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    scheduler = Mock()
+    scheduler.scheduler_stage_metrics = None
+    scheduler.forward_ct = 0
+    scheduler.scripted_scheduler_hook = scheduler.forward_sleep_time = None
+    scheduler.is_generation = scheduler.enable_overlap = False
+    scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+    scheduler.enable_unified_cache_external_linker = True
+    scheduler.chunked_req = None
+    manager = SimpleNamespace(enable_deferred_decode_kv_release=deferred)
+    if quiescence_supported:
+        manager.transfer_quiescent = Mock(return_value=True)
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=manager)
+    scheduler.tree_cache.finish_external_linker_loads.return_value = []
+    scheduler.tp_worker.forward_batch_embedding.return_value = (Mock(), False)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, extend_num_tokens=0, reqs=[]
+    )
+    with (
+        patch("sglang.srt.managers.scheduler.resolve_forward_inputs"),
+        patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=tp, attn_cp_size=cp),
+        ),
+    ):
+        Scheduler.run_batch(scheduler, batch)
+    scheduler.tree_cache.finish_external_linker_loads.assert_called_once_with(
+        [], requeue=requeue
     )

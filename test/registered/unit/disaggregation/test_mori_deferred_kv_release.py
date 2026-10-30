@@ -232,6 +232,24 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         self.assertNotIn(11, manager._staging_outstanding)
         manager.conclude_failure.assert_called_once()
 
+    def test_queued_chunk_prevents_retry_release_before_worker_dequeues(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        manager = _manager()
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager._num_shards = 1
+        manager._transfer_queues = [Queue()]
+        manager.request_status[11] = KVPoll.Transferring
+        manager.transfer_infos[11] = object()
+        manager.add_transfer_request(11, np.array([1], np.int32), slice(0, 1), False)
+        self.assertFalse(manager.transfer_quiescent(11))
+        chunk = manager._transfer_queues[0].get_nowait()
+        # A skipped queued chunk also relinquishes its outstanding reference.
+        manager.request_status.pop(11)
+        self.assertTrue(manager._process_transfer_chunk(chunk))
+        manager._mark_transfer_quiescent(chunk)
+        self.assertTrue(manager.transfer_quiescent(11))
+
     def test_room_cleared_after_drain_handoff_keeps_single_owner(self):
         manager = _manager()
         manager.request_status[11] = KVPoll.Transferring
@@ -248,14 +266,18 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.engine.wait_all.side_effect = wait_all
         manager.conclude_failure = MagicMock()
         queue = MagicMock()
-        queue.get.side_effect = (_chunk(), KeyboardInterrupt())
+        chunk = _chunk()
+        manager._mark_transfer_started(chunk)
+        queue.get.side_effect = (chunk, KeyboardInterrupt())
 
-        with patch(
-            "sglang.srt.disaggregation.mori.conn.time.perf_counter",
-            side_effect=(0.0, 0.002),
+        with (
+            patch(
+                "sglang.srt.disaggregation.mori.conn.time.perf_counter",
+                side_effect=(0.0, 0.002),
+            ),
+            self.assertRaises(KeyboardInterrupt),
         ):
-            with self.assertRaises(KeyboardInterrupt):
-                manager._transfer_worker(queue)
+            manager._transfer_worker(queue)
 
         self.assertEqual(manager._staging_outstanding[11], 1)
         self.assertEqual(manager._drain_queue.qsize(), 1)
@@ -287,6 +309,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         chunk.wait_event = MagicMock()
         chunk.wait_event.synchronize.side_effect = RuntimeError("event failed")
         queue = MagicMock()
+        manager._mark_transfer_started(chunk)
         queue.get.side_effect = (chunk, KeyboardInterrupt())
 
         with patch("sglang.srt.disaggregation.mori.conn.logger.exception"):
