@@ -174,6 +174,13 @@ class UnifiedCacheLinker(ABC):
         """Wait until the batch started as ``counter_index`` stops writing to
         device memory; True when every layer landed."""
 
+    def finish_loads(self, counter_index: int, rids: Sequence[str]) -> set[str]:
+        """Return failed requests after draining all batch I/O.
+
+        Backends without request-level results conservatively fail the batch.
+        """
+        return set() if self.finish_layer_wise_loading(counter_index) else set(rids)
+
     @abstractmethod
     def cancel_queued_load(self, rid: str) -> bool:
         """Cancel a load that has not started yet."""
@@ -574,19 +581,20 @@ class UnifiedCacheLinkerWrapper:
         if not rids:
             return []
         index, self.inflight_load_index = self.inflight_load_index, -1
-        landed = torch.tensor(
-            [int(self.cache_linker.finish_layer_wise_loading(index))],
-            dtype=torch.int,
-        )
+        failed = self.cache_linker.finish_loads(index, rids)
+        landed = torch.tensor([int(rid not in failed) for rid in rids], dtype=torch.int)
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)
-        if landed.item():
+        failed_rids = [rid for rid, ok in zip(rids, landed.tolist()) if not ok]
+        if not failed_rids:
             return []
         logger.error(
-            "External linker load failed; aborting %d request(s): %s", len(rids), rids
+            "External linker load failed; aborting %d request(s): %s",
+            len(failed_rids),
+            failed_rids,
         )
-        return rids
+        return failed_rids
 
     # ---- lifecycle ----
 

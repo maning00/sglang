@@ -1106,6 +1106,21 @@ def test_finish_loads_adopts_a_peer_rank_failure():
     reduce.assert_called_once()
 
 
+def test_finish_loads_reduces_failures_per_request():
+    def reduce(mask, op):
+        assert mask.tolist() == [0, 1, 1]
+        mask[1] = 0  # Another attention rank failed only request b.
+
+    backend = _FakeLinker()
+    backend.finish_loads = lambda index, rids: {"a"}
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(_all_reduce_attn_groups=reduce), backend
+    )
+    wrapper.inflight_load_rids = ["a", "b", "c"]
+    wrapper.start_layer_wise_loading()
+    assert wrapper.finish_loads() == ["a", "b"]
+
+
 @pytest.mark.parametrize("device_len", [0, 2])
 @pytest.mark.parametrize("tail_len", [0, 4])
 def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len):

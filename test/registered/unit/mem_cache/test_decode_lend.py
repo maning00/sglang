@@ -308,6 +308,7 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
     l2._wake = threading.Event()
     l2._stop = threading.Event()
     l2._pending = {"r": (None, {0: []})}
+    l2._failed_loads = {}
     l2._demotions = []
     l2._peers = {}
     l2._load_counter = LayerWiseLoadCounter(1)
@@ -325,7 +326,7 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
         ),
     )
     order = []
-    l2._read = lambda _: order.append("read")
+    l2._read = lambda _: order.append("read") or set()
 
     def write(_):
         order.append("write")
@@ -340,6 +341,71 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
     assert order == ["read", "write"]
     assert l2.finish_layer_wise_loading(index)
     assert l2._results.get_nowait() is True
+
+
+@pytest.mark.parametrize("stage", [0, 4])
+def test_stale_lend_page_only_recomputes_its_request(monkeypatch, stage):
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+        LayerWiseLoadCounter,
+        UnifiedCacheLinkerWrapper,
+    )
+
+    p = pool()
+    records = committed(p, 3)
+    with p.lock:
+        p._discard(records[1][0])  # Discovery still holds the evicted key.
+    service = LendService(p, "127.0.0.1")
+    peer = LendPeer(
+        SimpleNamespace(endpoint="127.0.0.1", lend_port=service.port), lambda *_: None
+    )
+    transport = LendTransport(
+        SimpleNamespace(engine=None, kv_args=SimpleNamespace(kv_item_lens=[])),
+        acquire=bool(stage),
+    )
+    copied = []
+    transport.transfer = lambda info, local, remote, **kw: copied.extend(local) or True
+    l2 = TieredL2.__new__(TieredL2)
+    l2.indexer_stage, l2.page_size, l2.num_layers = stage, 1, 1
+    l2.directory = None if stage else MagicMock()
+    l2.transport, l2._peers, l2.lower = transport, {0: peer}, None
+    l2._loads, l2._wake, l2._failed_loads = Queue(), threading.Event(), {}
+    l2._load_counter = l2.layer_done_counter = LayerWiseLoadCounter(1)
+    l2.stats = Counter()
+    l2._pending = {
+        rid: (
+            PoolTransfer(
+                name=PoolName.KV, keys=[record[2]], device_indices=torch.tensor([i])
+            ),
+            {0: [(0, record)]},
+        )
+        for i, (rid, record) in enumerate(zip(("before", "missing", "after"), records))
+    }
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_cache.peer_l1.lend.tiered.get_device_module",
+        lambda: SimpleNamespace(Event=MagicMock),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(_all_reduce_attn_groups=lambda *args: None)
+    wrapper.cache_linker = l2
+    wrapper.inflight_load_rids = list(l2._pending)
+    wrapper.private_load_indices = {
+        rid: kv.device_indices for rid, (kv, _) in l2._pending.items()
+    }
+    try:
+        wrapper.inflight_load_index = l2.start_layer_wise_loading()
+        assert l2._serve_load()
+        assert wrapper.finish_loads() == ["missing"]
+        assert copied == [0, 2]  # A miss must not skip later requests in the batch.
+        assert l2.stats["failed_restore_requests"] == 1
+        assert not l2._failed_loads and not wrapper.private_load_indices
+        peer.flush_cleanup()
+        # A normal RPC also drains preceding cleanup acknowledgments.
+        assert peer.call("HELLO") is not None
+        assert p.pinned == 0
+    finally:
+        peer.close()
+        service.close()
 
 
 def test_failed_peer_discovery_cools_down_and_new_registration_retries(monkeypatch):
@@ -382,8 +448,8 @@ def test_restore_runs_while_lower_write_is_pending():
     l2.stats = Counter()
     l2._load_counter = LayerWiseLoadCounter(1)
     index = l2._load_counter.update_producer()
-    l2._read = MagicMock()
-    l2._loads.put_nowait(("load", (index, []), MagicMock()))
+    l2._read = MagicMock(return_value=set())
+    l2._loads.put_nowait(("load", (index, [], set()), MagicMock()))
     l2.lower = MagicMock()
     l2.lower.num_completed_offloads.side_effect = [0, 0, 1]
     l2.lower.pop_completed_offload.return_value = True

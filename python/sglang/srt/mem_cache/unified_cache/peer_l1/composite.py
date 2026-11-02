@@ -59,6 +59,16 @@ class CompositeLayerCounter:
         self._indices = {}
         self._next_index = 0
 
+    def finish_loads(self, index, l1_rids, l2_rids):
+        indices = self._indices.get(index)
+        if indices is None:
+            return set()
+        a, b = indices
+        failed_l1 = self.l1.finish_loads(a, l1_rids)
+        failed_l2 = self.l2.finish_loads(b, l2_rids)
+        del self._indices[index]
+        return failed_l1 | failed_l2
+
 
 @dataclass
 class _Restore:
@@ -329,17 +339,27 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         return index
 
     def finish_layer_wise_loading(self, counter_index):
-        landed = self.layer_done_counter.finish(counter_index)
-        for rid in self._batches.pop(counter_index, ()):
+        return not self.finish_loads(counter_index, ())
+
+    def finish_loads(self, counter_index, rids):
+        batch = self._batches.get(counter_index, ())
+        failed = self.layer_done_counter.finish_loads(
+            counter_index,
+            [rid for rid in batch if self._requests[rid].l1_pages],
+            [rid for rid in batch if self._requests[rid].l2_pages],
+        )
+        self._batches.pop(counter_index, None)
+        for rid in batch:
             state = self._requests.pop(rid)
-            if landed:
+            if rid not in failed:
                 self.l1.stats["l1_loaded_pages"] += state.l1_pages
                 self.l1.stats["l2_loaded_pages"] += state.l2_pages
                 if state.l1_pages and state.l2_pages:
                     self.l1.stats["stitched_loads"] += 1
-        if not landed:
+        if failed:
             self.l1.stats["failed_composite_load_batches"] += 1
-        return landed
+            self.l1.stats["failed_composite_load_requests"] += len(failed)
+        return failed
 
     def cancel_queued_load(self, rid):
         state = self._queued.get(rid)

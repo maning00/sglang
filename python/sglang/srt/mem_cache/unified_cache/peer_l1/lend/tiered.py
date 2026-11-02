@@ -78,6 +78,7 @@ class TieredL2(UnifiedCacheLinker):
         )
         self.stats = Counter()
         self._pending, self._results = {}, Queue()
+        self._failed_loads = {}
         self._tasks = Queue(maxsize=256)
         # Forward bounds the number of outstanding loads. They must never wait
         # for write queue capacity or sit behind a backlog of F3 writes.
@@ -300,25 +301,37 @@ class TieredL2(UnifiedCacheLinker):
 
     def start_layer_wise_loading(self):
         pending, self._pending = self._pending, {}
-        batches = [(kv, grouped) for kv, grouped in pending.values() if grouped]
+        batches = [
+            (rid, kv, grouped) for rid, (kv, grouped) in pending.items() if grouped
+        ]
+        failed = set()
         index = -1
         if batches:
             index = self._load_counter.update_producer()
             event = get_device_module().Event()
             event.record()
-            self._loads.put_nowait(("load", (index, batches), event))
+            self._loads.put_nowait(("load", (index, batches, failed), event))
             self._wake.set()
         lower_index = self.lower.start_layer_wise_loading() if self.lower else -1
         if index == lower_index == -1:
             return -1
-        return (
+        result = (
             self.layer_done_counter.register(index, lower_index)
             if self.lower
             else index
         )
+        self._failed_loads[result] = failed
+        return result
 
     def finish_layer_wise_loading(self, index):
-        return self.layer_done_counter.finish(index)
+        landed = self.layer_done_counter.finish(index)
+        failed = self._failed_loads.pop(index, set())
+        return landed and not failed
+
+    def finish_loads(self, index, rids):
+        landed = self.layer_done_counter.finish(index)
+        failed = self._failed_loads.pop(index, set())
+        return failed if landed else set(rids)
 
     def offload(self, transfers):
         if self.manager is None:
@@ -406,13 +419,13 @@ class TieredL2(UnifiedCacheLinker):
 
     def _serve_load(self):
         try:
-            _, (index, batches), event = self._loads.get_nowait()
+            _, (index, batches, failed), event = self._loads.get_nowait()
         except Empty:
             return False
         started = time.monotonic()
         try:
             event.synchronize()
-            self._read(batches)
+            failed.update(self._read(batches))
             for layer in range(self.num_layers):
                 self._load_counter.complete(index, layer)
         except Exception as exc:
@@ -482,7 +495,8 @@ class TieredL2(UnifiedCacheLinker):
                 self._stop.wait(0.05)
 
     def _read(self, batches):
-        for kv, grouped in batches:
+        failed = set()
+        for rid, kv, grouped in batches:
             pages = (
                 kv.device_indices.reshape(-1, self.page_size)[:, 0].cpu()
                 // self.page_size
@@ -492,8 +506,14 @@ class TieredL2(UnifiedCacheLinker):
                     if self.directory is not None:
                         self.directory.remove(rank, [r for _, r in items])
                     self.stats["pin_or_read_miss_pages"] += len(items)
-                    raise RuntimeError("Decode lend PIN or read failed")
+                    failed.add(rid)
+                    self.stats["failed_restore_requests"] += 1
+                    logger.warning(
+                        "Decode lend PIN or read failed; recomputing request %s", rid
+                    )
+                    break
                 self.stats["read_pages"] += len(items)
+        return failed
 
     def _read_pinned(self, peer, kv, items, pages):
         # A decode rank pins at most 1% of its pages; one PIN for a long prefix is
@@ -629,6 +649,7 @@ class TieredL2(UnifiedCacheLinker):
         self._tasks.join()
         self._loads.join()
         self._pending.clear()
+        self._failed_loads.clear()
         if self.indexer_stage:
             self.l1.placements.clear()
         if self.lower:

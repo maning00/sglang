@@ -62,8 +62,12 @@ KV writes. The consumer queues layer events for forward and a separate batch
 event after verification and the native unpin callback. Batch cleanup and event
 slot reuse use the latter. Loads stay request-private until the forward finishes;
 checkpoint insertion publishes them through the same events as computed KV.
-A failed batch is aborted by the scheduler without publishing its pages. Queued
-loads can be cancelled before the request frees its private slots.
+Failed loads are discarded before publication. A missing lending page that
+DRAM cannot restore fails only its request; other requests in the batch finish
+restoring. Failure masks are reduced per request across attention ranks. The
+existing prefill retry path recomputes the failed request only after PD source
+I/O quiesces. Unknown batch I/O failures remain conservative. Queued loads can
+be cancelled before the request frees its private slots.
 
 Flush checks local activity, atomically freezes new remote reservations, then
 withdraws the directory before clearing the pool. Completed offloads are reaped
@@ -93,10 +97,13 @@ peer prefix, and a request may take its head from the peer and the rest from
 UMBP (`stitched_loads`); if the peer reservation then fails, it recomputes.
 Writes always go to UMBP.
 Restores stay private until their whole load succeeds and checkpoint inserts them.
-An L1 or L2 failure aborts every restoring request in that batch.
+A batch-level L1 or L2 failure aborts requests using that source; lending misses
+can identify and fail individual requests.
 Flush checks both loaders and UMBP offloads; it clears device directories while
 preserving the UMBP tier. The periodic peer stats distinguish `l1_loaded_pages`
-and `l2_loaded_pages` for successful batches, and `failed_composite_load_batches`.
+and `l2_loaded_pages` for successful requests, and
+`failed_composite_load_batches/requests`. Lending also reports
+`failed_restore_requests` for missing-page restores.
 Restored tails follow upstream write-through behavior when checkpoint inserts them,
 including a repeated write for a tail loaded from UMBP.
 
@@ -158,10 +165,22 @@ authorizes access to a row.
 
 `timeout_s` defaults to 0.01 for discovery and peer L1 control, `cooldown_s` to
 1.0, and `recovery_s` to 600. Reports have a minimum one-second RPC deadline.
-Each owner restores soft state with CLEAR, a snapshot, then buffered deltas on
-failure or reconnection, and periodically with staggered phases. The publisher
-runs outside the scheduler thread. A request shares one discovery result between
-peer L1 and lending; requests over 16,384 pages require multiple bounded RPCs.
+Each owner restores soft state with CLEAR, a snapshot, then buffered deltas at
+startup and periodically with staggered phases. READY alone does not prove a
+server restart: the protocol has no server incarnation ID, so lost state after
+a restart is repaired by the periodic fallback (600 s by default).
+Timeout, UNAVAILABLE, and RESOURCE_EXHAUSTED retry the same batch and sequence
+up to five times, preserving order with newer deltas. Backoff doubles from
+`cooldown_s`, is capped at 30 s, and is staggered by worker identity. A partially
+sent snapshot resumes at its failed batch without repeating CLEAR.
+After retry exhaustion or a non-transient rejection, publication pauses until
+the next periodic recovery. Pending deltas coalesce by key; above 65,536 keys,
+they are discarded until periodic recovery rebuilds from current ownership.
+This bounds outage backlog while retaining authoritative local records. Discovery
+can remain stale during an outage; ACQUIRE still checks complete keys and pins.
+The publisher runs outside the scheduler thread. A request shares one discovery
+result between peer L1 and lending; requests over 16,384 pages require multiple
+bounded RPCs.
 Indexer failures use local shm probes before stage 3 and parallel LOOKUP from
 stage 3 onwards; lending falls back to DRAM. Namespaced requests skip Indexer,
 using local discovery and the DRAM tier. Partial peer L1 grants are released and
@@ -187,7 +206,10 @@ take per-rank window deltas before summing them:
   bounds CLEAR-to-snapshot gaps, including failed attempts and retry cooldown;
   `recovery_active_ms` shows an unfinished gap. These are time bounds, not lost
   page counts. `live_records/pending_records` are gauges; `report_rpcs` and
-  `report_ms_total/max` measure publication RPCs.
+  `report_ms_total/max` measure publication RPCs. `report_retries/backoff_ms`,
+  `report_pauses`, `report_pause_remaining_ms`, and `pending_overflows/overflow`
+  distinguish retry, pause, and backlog saturation. `reconnects` counts READY
+  notifications, independently of recovery attempts.
 - `peer_l1`: `f3_contains_pages/elsewhere_pages` count retired pages examined
   and pages for which F3 skips writing because another owner holds a copy.
   `f3_contains_ms_total` measures the query cost. A failed CONTAINS still writes

@@ -279,6 +279,9 @@ class _Source:
             self.reserved.discard(rid)
         return landed
 
+    def finish_loads(self, index, rids):
+        return set() if self.finish_layer_wise_loading(index) else set(rids)
+
     def cancel_queued_load(self, rid):
         if self.pending.pop(rid, None) is None:
             return False
@@ -453,11 +456,12 @@ def test_composite_finishes_both_sources_before_batch_verdict(composite, failed_
         SimpleNamespace(rid=rid, skip_radix_cache_insert=False) for rid in ("a", "b")
     ]
     failed = UnifiedRadixCache.finish_external_linker_loads(cache, reqs)
-    assert failed == (reqs if failed_source else [])
+    expected = {"l1": reqs[:1], "l2": reqs[1:]}.get(failed_source, [])
+    assert failed == expected
     if failed_source:
         assert all(
             req.skip_radix_cache_insert and req.discard_output_reason.status_code == 503
-            for req in reqs
+            for req in expected
         )
     assert not wrapper.private_load_indices and not wrapper.inflight_load_rids
     assert not composite._requests and not composite._batches

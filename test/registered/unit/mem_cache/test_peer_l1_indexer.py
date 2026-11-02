@@ -486,19 +486,22 @@ def test_publisher_stats_include_failed_recovery_and_retry_gap(monkeypatch):
     try:
         publisher.publish([(key(1), None)])
         publisher._flush()
-        publisher._subscription()  # READY callback requests recovery.
+        publisher._subscription()  # READY alone does not prove state loss.
+        publisher._flush()
+        assert publisher.stats_snapshot()["recovery_started"] == 1
+        publisher.recover()
         fail[0] = True
         with pytest.raises(RuntimeError, match="lost snapshot"):
             publisher._flush()
         now[0] += 1.0  # Retry cooldown remains part of the visibility gap.
         assert publisher.stats_snapshot()["recovery_active_ms"] == pytest.approx(1400)
-        publisher.recover("error")
+        publisher.recover()
         publisher._flush()
         stats = publisher.stats_snapshot()
         assert stats["recovery_started"] == 3
         assert stats["recovery_ok"] == 2 and stats["recovery_failed"] == 1
-        assert stats["recovery_requested_reconnect"] == 1
-        assert stats["recovery_requested_error"] == 1
+        assert stats["reconnects"] == 1
+        assert stats["recovery_requested_manual"] == 2
         assert stats["recovery_ms_total"] == pytest.approx(1200)
         assert stats["recovery_ms_max"] == pytest.approx(400)
         assert stats["recovery_gap_ms_total"] == pytest.approx(2200)
@@ -506,6 +509,150 @@ def test_publisher_stats_include_failed_recovery_and_retry_gap(monkeypatch):
         assert stats["recovery_active_ms"] == 0
         assert stats["report_rpcs"] == 6
         assert stats["live_records"] == 1 and stats["pending_records"] == 0
+    finally:
+        publisher.close()
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "report", "revoke"])
+def test_publisher_retries_exact_batch_before_newer_deltas(monkeypatch, operation):
+    from types import SimpleNamespace
+
+    import grpc
+
+    from sglang.srt.grpc import kv_indexer_pb2 as pb
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
+
+    monkeypatch.setattr(indexer.PlacementPublisher, "_run", lambda self: None)
+    monkeypatch.setattr(indexer, "MAX_HASHES", 1)
+    sent, held, waits = [], set(), []
+    fail = [False]
+
+    class LostAck(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.DEADLINE_EXCEEDED
+
+    def apply(request, timeout):
+        sent.append(request.SerializeToString())
+        action = request.actions[0]
+        if action.type == pb.ACTION_CLEAR_ALL_AT_TIER:
+            held.clear()
+        elif action.type == pb.ACTION_REPORT:
+            held.update(action.hashes)
+        else:
+            held.difference_update(action.hashes)
+        expected = pb.ACTION_REVOKE if operation == "revoke" else pb.ACTION_REPORT
+        if fail[0] and action.type == expected:
+            fail[0] = False
+            # A conflicting delta arrives after application but before the ACK.
+            if operation == "revoke":
+                publisher.publish([(key(1), None)])
+            else:
+                publisher.retire([key(1)])
+            raise LostAck()
+
+    client = SimpleNamespace(
+        pb=pb,
+        apply=apply,
+        on_reconnect=lambda callback: callback,
+        channel=SimpleNamespace(unsubscribe=lambda callback: None),
+    )
+    publisher = indexer.PlacementPublisher(
+        config=indexer.IndexerConfig(), worker_id="test/lend/dp0", client=client
+    )
+    publisher._stop = SimpleNamespace(
+        wait=lambda delay: waits.append(delay) or False, set=lambda: None
+    )
+    try:
+        if operation != "snapshot":
+            publisher._flush()
+        publisher.publish([(key(1), None), (key(2), key(1))])
+        if operation == "revoke":
+            publisher._flush()
+            publisher.retire([key(1)])
+        fail[0] = True
+        publisher._flush()
+        publisher._flush()  # Apply the delta queued during the lost ACK.
+        requests = [pb.ApplyExternalKvBatchRequest.FromString(data) for data in sent]
+        assert (
+            sum(r.actions[0].type == pb.ACTION_CLEAR_ALL_AT_TIER for r in requests) == 1
+        )
+        assert sum(a == b for a, b in zip(sent, sent[1:])) == 1
+        assert held == {indexer.block_hash(key(2))} | (
+            {indexer.block_hash(key(1))} if operation == "revoke" else set()
+        )
+        assert len(waits) == 1 and 0 < waits[0] <= 1.0
+        assert publisher.stats_snapshot()["report_retries"] == 1
+        assert publisher.stats_snapshot()["recovery_started"] == 1
+    finally:
+        publisher.close()
+
+
+def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import grpc
+
+    from sglang.srt.grpc import kv_indexer_pb2 as pb
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
+
+    offset, outage, sent, held = [0.0], [False], [], set()
+    monkeypatch.setattr(
+        indexer, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0])
+    )
+    monkeypatch.setattr(indexer, "_PENDING_LIMIT", 2)
+
+    class Unavailable(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.UNAVAILABLE
+
+    def apply(request, timeout):
+        sent.append(request.SerializeToString())
+        if outage[0]:
+            raise Unavailable()
+        for action in request.actions:
+            if action.type == pb.ACTION_CLEAR_ALL_AT_TIER:
+                held.clear()
+            elif action.type == pb.ACTION_REPORT:
+                held.update(action.hashes)
+            else:
+                held.difference_update(action.hashes)
+
+    client = SimpleNamespace(
+        pb=pb,
+        apply=apply,
+        on_reconnect=lambda callback: callback,
+        channel=SimpleNamespace(unsubscribe=lambda callback: None),
+    )
+    publisher = indexer.PlacementPublisher(
+        config=indexer.IndexerConfig(cooldown_s=0.001, recovery_s=60),
+        worker_id="test/lend/dp0",
+        client=client,
+    )
+    try:
+        eventually(lambda: publisher.stats_snapshot()["recovery_ok"] == 1)
+        outage[0] = True
+        publisher.publish([(key(1), None)])
+        eventually(lambda: publisher.stats_snapshot().get("report_pauses") == 1)
+        assert len(sent) == 1 + indexer._REPORT_RETRIES + 1
+        assert len(set(sent[1:])) == 1
+        publisher.retire([key(1)])
+        for i in range(2, 10):
+            publisher.publish([(key(i), None)])
+            publisher.retire([key(i)])
+        publisher.publish([(key(10), None)])
+        stats = publisher.stats_snapshot()
+        assert stats["pending_overflow"] and stats["pending_records"] <= 2
+        assert stats["live_records"] == 1
+        outage[0] = False
+        publisher._subscription()  # Reconnect must not reset the retry budget.
+        assert publisher.stats_snapshot()["recovery_started"] == 1
+        offset[0] += 60
+        eventually(lambda: publisher.stats_snapshot()["recovery_ok"] == 2)
+        assert held == {indexer.block_hash(key(10))}
+        assert not publisher.stats_snapshot()["pending_overflow"]
+        assert publisher.stats_snapshot()["recovery_requested_periodic"] == 1
     finally:
         publisher.close()
 
