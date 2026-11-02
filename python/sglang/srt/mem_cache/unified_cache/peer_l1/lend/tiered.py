@@ -183,12 +183,15 @@ class TieredL2(UnifiedCacheLinker):
             self.staging.close()
         self.manager = self.transport = None
 
+    def discover(self, keys):
+        return self.directory.query(keys)
+
     def lookup(self, rid, transfers):
         kv = next(t for t in transfers if t.name == PoolName.KV)
         # The directory is node-wide; a page on a decode rank this prefill rank has
         # no live peer for cannot be read here, and lend holds its only copy.
         present = (
-            [v[0] >= 0 and v[0] in self._peers for v in self.directory.query(kv.keys)]
+            [v[0] >= 0 and v[0] in self._peers for v in self.discover(kv.keys)]
             if self.manager
             else [False] * len(kv.keys)
         )
@@ -208,7 +211,7 @@ class TieredL2(UnifiedCacheLinker):
             raise RuntimeError(f"Decode lend load already queued: {rid}")
         kv = next(t for t in transfers if t.name == PoolName.KV)
         values = (
-            self.directory.query(kv.keys)
+            self.discover(kv.keys)
             if self.manager
             else [[-1, 0, 0]] * len(kv.keys)
         )

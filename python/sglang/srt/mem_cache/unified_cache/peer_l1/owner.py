@@ -11,7 +11,6 @@ import numpy as np
 import torch
 
 from .copier import distinct_stream
-from .directory import hash_words
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +84,7 @@ class L1Owner:
         copies at once at least one sees no other copy (both may write; L2 dedups).
         """
         index = np.flatnonzero(aligned >= 0)
-        hashes = hash_words([keys[i] for i in index])
-        elsewhere = np.zeros(len(index), dtype=bool)
-        for peer in self.linker.peers.values():
-            elsewhere |= peer.contains(hashes)
+        elsewhere = self.linker.contains_peers([keys[i] for i in index])
         last = index[~elsewhere]
         if not len(last):
             return

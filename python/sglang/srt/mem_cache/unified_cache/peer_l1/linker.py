@@ -213,14 +213,8 @@ class PeerL1Linker(UnifiedCacheLinker):
             transfer.keys for transfer in transfers if transfer.name == PoolName.KV
         )
         hashes = hash_words(keys)
-        best = None
-        # Rotate the first peer so ties distribute load without an RNG call.
-        peers = list(self.peers)
-        start = self.stats["lookups"] % len(peers)
-        for peer in peers[start:] + peers[:start]:
-            rows, gens = self.peers[peer].probe(hashes)
-            if len(rows) and (best is None or len(rows) > len(best.rows)):
-                best = Reservation(peer, list(keys[: len(rows)]), rows, gens)
+        start = self.stats["lookups"] % len(self.peers)
+        best = self.discover(keys, start=start)
         self.stats["lookups"] += 1
         self.stats["lookup_tail_pages"] += len(keys)
         if self.stitch_stats and best is not None:
@@ -233,6 +227,24 @@ class PeerL1Linker(UnifiedCacheLinker):
             self.stats["lookup_capped"] += 1
         self._lookups[rid] = best
         return list(range(1, len(best.rows) + 1))
+
+    def discover(self, keys, *, start):
+        hashes = hash_words(keys)
+        best = None
+        # Rotate the first peer so ties distribute load without an RNG call.
+        peers = list(self.peers)
+        for peer in peers[start:] + peers[:start]:
+            rows, gens = self.peers[peer].probe(hashes)
+            if len(rows) and (best is None or len(rows) > len(best.rows)):
+                best = Reservation(peer, list(keys[: len(rows)]), rows, gens)
+        return best
+
+    def contains_peers(self, keys):
+        hashes = hash_words(keys)
+        found = np.zeros(len(keys), dtype=bool)
+        for peer in self.peers.values():
+            found |= peer.contains(hashes)
+        return found
 
     def _count_stitchable(self, hashes, *, start):
         """Diagnostic: the prefix restorable if consecutive runs could come
