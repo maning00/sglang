@@ -93,8 +93,7 @@ inline void check_sdma(hipError_t result, const char* what) {
 
 // Connects `channels` queues from this GPU to each peer and writes their device handle
 // pointers into handles, peer-major. peers is CPU int64 [P], handles CPU int64 [P * channels].
-inline void sdma_connect(
-    int64_t local, tvm::ffi::TensorView peers, int64_t channels, tvm::ffi::TensorView handles) {
+inline void sdma_connect(int64_t local, tvm::ffi::TensorView peers, int64_t channels, tvm::ffi::TensorView handles) {
   static bool initialized = false;
   int can_wait = 0;
   check_sdma(
@@ -107,13 +106,16 @@ inline void sdma_connect(
   }
   const auto* p = static_cast<const int64_t*>(peers.data_ptr());
   auto* out = static_cast<int64_t*>(handles.data_ptr());
+  // Anvil queues use KFD node ids, while the copier passes HIP device ordinals.
+  const auto local_node = anvil::AnvilLib::nodeForHipDevice(static_cast<int>(local));
   if (handles.numel() != peers.numel() * channels) throw std::invalid_argument("handles must hold peers * channels");
   for (int64_t i = 0; i < peers.numel(); ++i) {
     const int peer = static_cast<int>(p[i]);
-    if (!anvil::anvil.connect(static_cast<int>(local), peer, static_cast<int>(channels)))
+    const auto peer_node = anvil::AnvilLib::nodeForHipDevice(peer);
+    if (!anvil::anvil.connect(local_node, peer_node, static_cast<int>(channels)))
       throw std::runtime_error("anvil connect failed for peer " + std::to_string(peer));
     for (int64_t c = 0; c < channels; ++c) {
-      auto* queue = anvil::anvil.getSdmaQueue(static_cast<int>(local), peer, static_cast<int>(c));
+      auto* queue = anvil::anvil.getSdmaQueue(local_node, peer_node, static_cast<int>(c));
       if (queue == nullptr) throw std::runtime_error("no SDMA queue for peer " + std::to_string(peer));
       out[i * channels + c] = reinterpret_cast<int64_t>(queue->deviceHandle());
     }
