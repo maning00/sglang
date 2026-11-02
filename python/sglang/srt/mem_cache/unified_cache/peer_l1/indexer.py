@@ -26,8 +26,9 @@ PLACEMENT_TTL_S = 0.1
 class Placement(msgspec.Struct):
     keys: tuple[str, ...]
     full: np.ndarray
-    hashes: np.ndarray
-    by_key: dict[str, int]
+    hashes: list[int]
+    short: np.ndarray
+    by_key: dict[str, int] | None = None
     matches: dict | None = None
     expires: float = 0.0
     eligible: bool = False
@@ -42,8 +43,10 @@ class Placements:
         item = self.entries.pop(rid, None)
         if item is None or item.keys != tuple(keys):
             full = full_keys(keys)
-            hashes = full.view(">i8").reshape(-1)[::4]
-            item = Placement(tuple(keys), full, hashes, dict(zip(keys, hashes)))
+            hashes = full.view(">i8").reshape(-1)[::4].tolist()
+            item = Placement(
+                tuple(keys), full, hashes, np.ascontiguousarray(full[:, :2])
+            )
         if item.eligible != eligible:
             item.expires = 0.0
             item.eligible = eligible

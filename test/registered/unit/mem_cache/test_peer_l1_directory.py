@@ -251,7 +251,7 @@ class _Source:
             self.reserved.add(rid)
         return self.pin
 
-    def release_reservation(self, rid):
+    def release_reservation(self, rid, *, keep_placement=False):
         self.hints.discard(rid)
         if rid not in self.active:
             self.reserved.discard(rid)
@@ -302,6 +302,53 @@ def composite():
     from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
 
     return PeerL1PlusL2Linker(_Source(), _Source())
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+def test_l1_reserve_failure_reuses_l2_placement_and_eligibility(peer_linker, eligible):
+    """Falling back to L2 must not repeat discovery or query excluded namespaces."""
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+    from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
+    from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
+        IndexerConfig,
+        Placements,
+    )
+    from sglang.srt.mem_cache.unified_cache.peer_l1.lend.tiered import TieredL2
+
+    l1, directory = peer_linker
+    calls = []
+
+    def lookup(hashes):
+        calls.append(hashes)
+        return {"peer": set(hashes), "lend": set(hashes)}
+
+    l1.indexer = SimpleNamespace(lookup=lookup, rpc_count=0)
+    l1.indexer_config = IndexerConfig(stage=2, endpoint="unused", deployment="test")
+    l1.indexer_discovery = True
+    l1.placements = Placements(l1.indexer)
+    l1.worker_ids = {1: "peer"}
+    l1.layer_done_counter = _Source().layer_done_counter
+    l2 = TieredL2.__new__(TieredL2)
+    l2.indexer_stage, l2.l1, l2.manager = 2, l1, object()
+    l2.page_size = 4
+    l2.layer_done_counter = _Source().layer_done_counter
+    l2._peers = {0: SimpleNamespace(worker_id="lend")}
+    l2._pending = {}
+    l2.lower = SimpleNamespace(page_exists=lambda _: [True, True], load=lambda *_: True)
+    combined = PeerL1PlusL2Linker(l1, l2)
+    transfer = PoolTransfer(
+        name=PoolName.KV, keys=[_key(1), _key(2)], indexer_eligible=eligible
+    )
+    assert combined.lookup("r", [transfer]) == [1, 2]
+    directory.retire(transfer.keys)
+    assert combined.reserve("r", 2)
+    if not eligible:
+        l1.placements.clear()  # Even an evicted hint must retain the request's eligibility.
+    assert combined.load("r", [transfer])
+    assert len(calls) == int(eligible)
+    assert not l1.placements.entries
 
 
 def _transfers(pages=2):

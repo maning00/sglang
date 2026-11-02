@@ -257,7 +257,9 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         elif start and num_pages <= b and self.l1.reserve(rid, start):
             l1_pages = start
         else:
-            self.l1.release_reservation(rid)
+            self.l1.release_reservation(
+                rid, keep_placement=not start and num_pages <= b
+            )
             # A continuation is useless without its peer prefix.
             if start or num_pages > b:
                 self.l1.stats["reserve_fallback_to_recompute"] += 1

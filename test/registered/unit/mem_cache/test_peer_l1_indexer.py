@@ -507,8 +507,9 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
         1: SimpleNamespace(worker_id="lend1"),
     }
     l2._lookups, l2._pending, l2.stats = {}, {}, Counter()
-    assert l2.lookup("r", [PoolTransfer(name=PoolName.KV, keys=keys)])[-1] == 130
-    assert l2.load("r", [PoolTransfer(name=PoolName.KV, keys=keys)])
+    transfer = PoolTransfer(name=PoolName.KV, keys=keys, indexer_eligible=True)
+    assert l2.lookup("r", [transfer])[-1] == 130
+    assert l2.load("r", [transfer])
     _, grouped = l2._pending["r"]
     assert len(grouped[0]) == len(grouped[1]) == 65
     assert {record[2] for _, record in grouped[0]} == set(keys[::2])

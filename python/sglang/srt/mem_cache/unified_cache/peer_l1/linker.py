@@ -331,9 +331,7 @@ class PeerL1Linker(UnifiedCacheLinker):
             lengths = {p: f.result() for p, f in queries.items()}
         else:
             hashes = (
-                np.ascontiguousarray(self.placement.full[:, :2])
-                if self.placement is not None
-                else hash_words(keys)
+                self.placement.short if self.placement is not None else hash_words(keys)
             )
             best = None
             for peer in order:
@@ -348,9 +346,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         if stage >= 3:
             rows, gens = np.empty(count, dtype=np.int64), np.empty(0, dtype=np.int64)
         else:
-            rows, gens = self.peers[peer].probe(
-                np.ascontiguousarray(self.placement.full[:count, :2])
-            )
+            rows, gens = self.peers[peer].probe(self.placement.short[:count])
         return (
             Reservation(
                 peer,
@@ -424,8 +420,6 @@ class PeerL1Linker(UnifiedCacheLinker):
             else:
                 pinned = self.peers[found.peer].pin(found.rows, found.gens)
             if not pinned:
-                if self.placements:
-                    self.placements.pop(rid)
                 self.stats["reserve_failures"] += 1
                 self.stats["reserve_failed_pages"] += num_pages
                 return False
@@ -442,8 +436,8 @@ class PeerL1Linker(UnifiedCacheLinker):
     def _forget_reservation(self, rid):
         return self._reservations.pop(rid)
 
-    def release_reservation(self, rid):
-        if self.placements:
+    def release_reservation(self, rid, *, keep_placement=False):
+        if self.placements and not keep_placement:
             self.placements.pop(rid)
         self._lookups.pop(rid, None)
         if (

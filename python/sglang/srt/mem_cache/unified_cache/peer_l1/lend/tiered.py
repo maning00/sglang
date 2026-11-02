@@ -197,15 +197,17 @@ class TieredL2(UnifiedCacheLinker):
             self.staging.close()
         self.manager = self.transport = None
 
-    def discover(self, keys, *, rid=None):
+    def discover(self, keys, *, rid=None, eligible=False):
         if not self.indexer_stage:
             return self.directory.query(keys)
         placement = self.l1.placements.entries.get(rid)
-        if placement is None:
-            placement = self.l1.placements.get(rid, keys)
+        if placement is None or placement.eligible != eligible:
+            placement = self.l1.placements.get(rid, keys, eligible=eligible)
         matches = placement.matches
         if matches is None:
             return [[-1, 0, 0]] * len(keys)
+        if placement.by_key is None:
+            placement.by_key = dict(zip(placement.keys, placement.hashes))
         candidates = [
             (rank, matches[peer.worker_id])
             for rank, peer in list(self._peers.items())
@@ -236,7 +238,7 @@ class TieredL2(UnifiedCacheLinker):
         # The directory is node-wide; a page on a decode rank this prefill rank has
         # no live peer for cannot be read here, and lend holds its only copy.
         values = (
-            self.discover(kv.keys, rid=rid)
+            self.discover(kv.keys, rid=rid, eligible=kv.indexer_eligible)
             if self.manager
             else [[-1, 0, 0]] * len(kv.keys)
         )
@@ -257,7 +259,7 @@ class TieredL2(UnifiedCacheLinker):
             raise RuntimeError(f"Decode lend load already queued: {rid}")
         kv = next(t for t in transfers if t.name == PoolName.KV)
         values = (
-            self.discover(kv.keys, rid=rid)
+            self.discover(kv.keys, rid=rid, eligible=kv.indexer_eligible)
             if self.manager
             else [[-1, 0, 0]] * len(kv.keys)
         )
