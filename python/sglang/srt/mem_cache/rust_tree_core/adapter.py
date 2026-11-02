@@ -916,6 +916,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def enable_l1_events(self, value: bool) -> None:
         self._binding.set_enable_l1_events(value)
 
+    @property
+    def enable_l1_metadata(self) -> bool:
+        return self._binding.enable_l1_metadata()
+
+    @enable_l1_metadata.setter
+    def enable_l1_metadata(self, value: bool) -> None:
+        self._binding.set_enable_l1_metadata(value)
+
     def take_l1_events(self):
         return self._binding.take_l1_events()
 
@@ -1182,11 +1190,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         transfers = self._binding.build_external_linker_offload_transfers(node_id)
         if transfers is None:
             return None
+        if not self.enable_l1_metadata:
+            return [_transfer_from_binding(transfer) for transfer in transfers]
         result = []
         for transfer, parents, eligible in transfers:
             transfer = _transfer_from_binding(transfer)
             if transfer.name == PoolName.KV:
-                transfer.parent_keys = parents
+                transfer.first_parent = parents
                 transfer.indexer_eligible = eligible
             result.append(transfer)
         return result

@@ -611,7 +611,7 @@ pub struct EvictionStepResult {
 pub(crate) struct L1Event {
     pub keys: Vec<String>,
     pub value: Option<Tensor>,
-    pub parents: Vec<Option<String>>,
+    pub first_parent: Option<String>,
     pub eligible: bool,
 }
 
@@ -657,6 +657,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Whether a direct device-to-external-cache linker is wired.
     pub(crate) enable_external_cache_linker: bool,
     pub(crate) enable_l1_events: bool,
+    pub(crate) enable_l1_metadata: bool,
     pub(crate) l1_events: Vec<L1Event>,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
@@ -941,6 +942,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_storage: false,
             enable_external_cache_linker: false,
             enable_l1_events: false,
+            enable_l1_metadata: false,
             l1_events: Vec::new(),
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
@@ -2373,18 +2375,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .expect("L1 pages require storage hashes")
             .clone();
         let value = attach.then(|| node.device_value(FULL).shallow_clone());
-        let (parents, eligible) = self.l1_metadata_(node_id);
+        let (first_parent, eligible) = self.l1_metadata_(node_id);
         self.l1_events.push(L1Event {
             keys: hashes,
             value,
-            parents,
+            first_parent,
             eligible,
         });
     }
 
-    pub(crate) fn l1_metadata_(&self, node_id: NodeIdx_) -> (Vec<Option<String>>, bool) {
+    pub(crate) fn l1_metadata_(&self, node_id: NodeIdx_) -> (Option<String>, bool) {
+        if !self.enable_l1_metadata {
+            return (None, false);
+        }
         let node = self.arena.node(node_id);
-        let hashes = node.hash_value.as_deref().unwrap_or_default();
         let parent = node.try_parent().and_then(|id| {
             self.arena
                 .node(id)
@@ -2393,13 +2397,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 .and_then(|keys| keys.last())
                 .cloned()
         });
-        let parents = std::iter::once(parent)
-            .chain(hashes.iter().cloned().map(Some))
-            .take(hashes.len())
-            .collect();
         let eligible =
             node.namespace.extra_key().is_none() && node.namespace.cache_salt().is_none();
-        (parents, eligible)
+        (parent, eligible)
     }
 
     /// Update both device and host leaf sets for a node.

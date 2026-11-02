@@ -169,7 +169,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         if not self.persists:
             self.l1.owner.last_replica_writer = self._write_last_replicas
 
-    def _write_last_replicas(self, keys, rows, *, parents=None, eligible=True):
+    def _write_last_replicas(self, keys, rows, *, first_parent=None, eligible=False):
         # A refused page is freed without an L2 copy: L2 coverage, not HBM, pays.
         if self._writes_stalled:
             self.l1.stats["last_replica_stalled_pages"] += len(rows)
@@ -187,7 +187,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
             name=PoolName.KV,
             device_indices=indices,
             keys=list(keys),
-            parent_keys=parents,
+            first_parent=first_parent,
             indexer_eligible=eligible,
         )
         if not self.l2.offload([transfer]):
@@ -262,10 +262,13 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
             if start or num_pages > b:
                 self.l1.stats["reserve_fallback_to_recompute"] += 1
                 self.l1.stats["reserve_recompute_tokens"] += num_pages * self.page_size
+                self.l2.release_reservation(rid)
                 return False
             l1_pages = 0
             if num_pages <= a:
                 self.l1.stats["l1_reserve_fallback_to_l2"] += 1
+        if l1_pages == num_pages:
+            self.l2.release_reservation(rid)
         self._requests[rid] = _Restore(l1_pages, num_pages - l1_pages)
         return True
 

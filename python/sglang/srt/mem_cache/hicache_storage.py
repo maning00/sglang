@@ -124,8 +124,8 @@ class PoolTransfer:
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
-    parent_keys: list[str | None] | None = None
-    indexer_eligible: bool = True
+    first_parent: str | None = None
+    indexer_eligible: bool = False
 
 
 @dataclass(frozen=True)

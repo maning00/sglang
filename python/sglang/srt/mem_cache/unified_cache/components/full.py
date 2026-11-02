@@ -485,11 +485,11 @@ class FullComponent(TreeComponent):
                 name=PoolName.KV,
                 device_indices=value.to(torch.int64),
                 keys=list(node.hash_value),
-                parent_keys=[
-                    node.parent.hash_value[-1] if node.parent.hash_value else None
-                ]
-                + list(node.hash_value[:-1]),
-                indexer_eligible=node.key.extra_key is None
+                first_parent=node.parent.hash_value[-1]
+                if self.tree_core.enable_l1_metadata and node.parent.hash_value
+                else None,
+                indexer_eligible=self.tree_core.enable_l1_metadata
+                and node.key.extra_key is None
                 and node.key.cache_salt is None,
             )
 
