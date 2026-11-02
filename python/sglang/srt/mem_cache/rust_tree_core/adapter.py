@@ -1182,7 +1182,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         transfers = self._binding.build_external_linker_offload_transfers(node_id)
         if transfers is None:
             return None
-        return [_transfer_from_binding(transfer) for transfer in transfers]
+        result = []
+        for transfer, parents, eligible in transfers:
+            transfer = _transfer_from_binding(transfer)
+            if transfer.name == PoolName.KV:
+                transfer.parent_keys = parents
+                transfer.indexer_eligible = eligible
+            result.append(transfer)
+        return result
 
     def mark_external_cache_stored_path(
         self, from_node_id: NodeId, until_node_id: NodeId

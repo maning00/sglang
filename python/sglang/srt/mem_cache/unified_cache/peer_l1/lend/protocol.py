@@ -25,10 +25,11 @@ decoder = msgspec.msgpack.Decoder(Message)
 
 
 class LendService:
-    def __init__(self, pool, address, *, layout=None):
+    def __init__(self, pool, address, *, layout=None, worker_id=""):
         self.pool = pool
         self.address = address
         self.layout = layout
+        self.worker_id = worker_id
         self.port = None
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -67,7 +68,12 @@ class LendService:
                         data = []
                         if request.op == "HELLO":
                             peers.add(identity)
-                            data = [len(self.pool.free), self.pool.lease_s, self.layout]
+                            data = [
+                                len(self.pool.free),
+                                self.pool.lease_s,
+                                self.layout,
+                                self.worker_id,
+                            ]
                         elif identity in peers and request.epoch == self.pool.epoch:
                             op, args = request.op, request.data
                             if op == "ALLOC":
@@ -78,6 +84,12 @@ class LendService:
                                 data = self.pool.commit(writer, args)
                             elif op == "ABORT":
                                 self.pool.abort(writer, args)
+                            elif op == "ACQUIRE":
+                                data = self.pool.acquire(writer, request.seq, args)
+                            elif op == "CANCEL_ACQUIRE":
+                                self.pool.cancel_acquire(writer, args[0])
+                            elif op == "RELEASE":
+                                self.pool.unpin(writer, args[0])
                             elif op == "PIN":
                                 data = [self.pool.pin(writer, args)]
                             elif op == "UNPIN":
@@ -114,6 +126,8 @@ class LendService:
     def close(self):
         self._stop.set()
         self._thread.join()
+        if self.pool.publisher:
+            self.pool.publisher.close()
 
 
 class LendPeer:
@@ -130,10 +144,14 @@ class LendPeer:
             host = f"[{host}]" if not host.startswith("[") else host
         self.socket.connect(f"tcp://{host}:{info.lend_port}")
         self.seq, self.epoch, self.lease_s = 0, "", 30.0
+        self.worker_id = ""
+        self._cleanup = {}
+        self._cleanup_seqs = {}
         reply = self.call("HELLO")
         if reply is not None:
             self.epoch = reply.epoch
             self.lease_s = reply.data[1]
+            self.worker_id = reply.data[3]
             if layout is not None and reply.data[2] != layout:
                 self.close()
                 raise ValueError("Decode lend peers have different KV region layouts")
@@ -142,6 +160,10 @@ class LendPeer:
         if not self.socket.poll(timeout):
             return None
         reply = decoder.decode(self.socket.recv())
+        cleanup = self._cleanup_seqs.pop(reply.seq, None)
+        if cleanup is not None:
+            self._cleanup.pop(cleanup, None)
+            return None
         if reply.seq == 0:
             if reply.epoch == self.epoch:
                 self.on_event(self, reply)
@@ -161,12 +183,36 @@ class LendPeer:
                 if op != "HELLO" and reply.epoch != self.epoch:
                     return None
                 return reply
+        if op == "ACQUIRE":
+            self.cleanup("CANCEL_ACQUIRE", seq)
         if op == "ALLOC":
             # Same DEALER connection preserves ordering after ALLOC. No RDMA was
             # posted for an unseen grant. The cancellation is safe even if its
             # late ALLOC reply is discarded while waiting for this ACK.
             self.call("CANCEL_ALLOC", [seq])
         return None
+
+    def cleanup(self, op, identifier):
+        key = (op, identifier, self.epoch)
+        if key not in self._cleanup:
+            self.seq += 1
+            self._cleanup[key] = (self.seq, 0.0, 0.01)
+            self._cleanup_seqs[self.seq] = key
+        self.flush_cleanup()
+
+    def flush_cleanup(self):
+        now = time.monotonic()
+        for key, (seq, deadline, delay) in list(self._cleanup.items()):
+            if now < deadline:
+                continue
+            op, identifier, epoch = key
+            try:
+                self.socket.send(
+                    encode(Message(seq, op, epoch, [identifier])), zmq.DONTWAIT
+                )
+            except zmq.ZMQError:
+                pass
+            self._cleanup[key] = (seq, now + delay, min(1.0, delay * 2))
 
     def close(self):
         self.socket.close()

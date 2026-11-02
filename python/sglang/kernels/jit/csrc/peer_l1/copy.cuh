@@ -102,4 +102,16 @@ inline void enqueue_unpin(tvm::ffi::TensorView entries, int64_t stream) {
   batch.release();
 }
 
+/// Enqueue preallocated cleanup nodes only after every source read has completed.
+inline void enqueue_cleanup(tvm::ffi::TensorView entries, int64_t stream) {
+  if (entries.ndim() != 2 || entries.size(1) != 2 || entries.device().device_type != kDLCPU)
+    throw std::invalid_argument("peer L1 cleanup entries must be a CPU [N,2] tensor");
+  const auto* data = static_cast<const int64_t*>(entries.data_ptr());
+  for (int64_t i = 0; i < entries.numel(); i += 2)
+    check_hip(hipLaunchHostFunc(
+        reinterpret_cast<hipStream_t>(stream),
+        reinterpret_cast<hipHostFn_t>(data[i]),
+        reinterpret_cast<void*>(data[i + 1])));
+}
+
 }  // namespace sglang::peer_l1

@@ -290,6 +290,7 @@ class UnifiedCacheLinkerWrapper:
             )
             if transfer is None:
                 return result
+            transfer.indexer_eligible = key.extra_key is None and key.cache_salt is None
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 

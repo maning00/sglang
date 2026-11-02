@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
@@ -108,6 +109,8 @@ def worker(rank, args, port):
             indices=destination,
             directory=remote,
             reserved_rows=source_rows,
+            cleanup=0,
+            cleanup_queue=None,
         )
         if args.skip_copy:
             jobs = torch.stack(

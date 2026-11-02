@@ -1581,6 +1581,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 (
                     list(node.hash_value),
                     node.component_data[BASE_COMPONENT_TYPE].value if attach else None,
+                    [
+                        node.parent.hash_value[-1]
+                        if node.parent is not None and node.parent.hash_value
+                        else None
+                    ]
+                    + list(node.hash_value[:-1]),
+                    node.key.extra_key is None and node.key.cache_salt is None,
                 )
             )
 

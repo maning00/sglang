@@ -608,6 +608,13 @@ pub struct EvictionStepResult {
     pub swa_backup_num_tokens: usize,
 }
 
+pub(crate) struct L1Event {
+    pub keys: Vec<String>,
+    pub value: Option<Tensor>,
+    pub parents: Vec<Option<String>>,
+    pub eligible: bool,
+}
+
 /// The radix tree mechanism: owns the tree structure, per-node values, the
 /// per-component LRUs, the size/leaf bookkeeping, and the component drivers,
 /// plus `reset()`.
@@ -650,7 +657,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Whether a direct device-to-external-cache linker is wired.
     pub(crate) enable_external_cache_linker: bool,
     pub(crate) enable_l1_events: bool,
-    pub(crate) l1_events: Vec<(Vec<String>, Option<Tensor>)>,
+    pub(crate) l1_events: Vec<L1Event>,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -2366,7 +2373,33 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .expect("L1 pages require storage hashes")
             .clone();
         let value = attach.then(|| node.device_value(FULL).shallow_clone());
-        self.l1_events.push((hashes, value));
+        let (parents, eligible) = self.l1_metadata_(node_id);
+        self.l1_events.push(L1Event {
+            keys: hashes,
+            value,
+            parents,
+            eligible,
+        });
+    }
+
+    pub(crate) fn l1_metadata_(&self, node_id: NodeIdx_) -> (Vec<Option<String>>, bool) {
+        let node = self.arena.node(node_id);
+        let hashes = node.hash_value.as_deref().unwrap_or_default();
+        let parent = node.try_parent().and_then(|id| {
+            self.arena
+                .node(id)
+                .hash_value
+                .as_ref()
+                .and_then(|keys| keys.last())
+                .cloned()
+        });
+        let parents = std::iter::once(parent)
+            .chain(hashes.iter().cloned().map(Some))
+            .take(hashes.len())
+            .collect();
+        let eligible =
+            node.namespace.extra_key().is_none() && node.namespace.cache_salt().is_none();
+        (parents, eligible)
     }
 
     /// Update both device and host leaf sets for a node.

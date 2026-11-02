@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 
@@ -23,6 +24,7 @@ def copy_module():
         cuda_wrappers=[
             ("copy", "peer_l1::launch_copy"),
             ("unpin", "peer_l1::enqueue_unpin"),
+            ("cleanup", "peer_l1::enqueue_cleanup"),
         ],
     )
 
@@ -254,7 +256,9 @@ class L1Copier:
         # The kernel engine copies on CUs; sdma moves rows on the DMA engines and
         # keeps the kernel only for byte verification.
         self.sdma = (
-            SdmaEngine(memory, peer_devices, sdma_channels) if engine == "sdma" else None
+            SdmaEngine(memory, peer_devices, sdma_channels)
+            if engine == "sdma"
+            else None
         )
         # Normal-priority streams share a few hardware queues (GPU_MAX_HW_QUEUES), so
         # this stream's wait on the forward stream can stall the scheduler's syncs.
@@ -283,17 +287,23 @@ class L1Copier:
         sources = torch.empty(
             (len(keys), 2), dtype=torch.int64, device="cpu", pin_memory=True
         )
-        unpins = []
+        unpins, cleanups = [], []
         offset = 0
         for plan in plans:
             count = len(plan.keys)
             sources[offset : offset + count, 0] = plan.peer
             sources[offset : offset + count, 1].copy_(torch.from_numpy(plan.rows))
             offset += count
-            unpins.extend(
-                (plan.directory.address, int(row)) for row in plan.reserved_rows
-            )
+            if plan.cleanup:
+                cleanups.append((plan.cleanup_queue.callback, plan.cleanup))
+            else:
+                unpins.extend(
+                    (plan.directory.address, int(row)) for row in plan.reserved_rows
+                )
         unpins = torch.tensor(unpins, dtype=torch.int64, device="cpu").reshape(-1, 2)
+        cleanups = torch.tensor(cleanups, dtype=torch.int64, device="cpu").reshape(
+            -1, 2
+        )
         with torch.cuda.stream(self.stream):
             destinations = (
                 torch.cat([plan.indices.reshape(-1, 256)[:, 0] for plan in plans])
@@ -339,7 +349,10 @@ class L1Copier:
                     1, dtype=torch.int64, device="cpu", pin_memory=True
                 )
                 error_cpu.copy_(error, non_blocking=True)
-            self.module.unpin(unpins, self.stream.cuda_stream)
+            if len(cleanups):
+                self.module.cleanup(cleanups, self.stream.cuda_stream)
+            else:
+                self.module.unpin(unpins, self.stream.cuda_stream)
             finish.record(self.stream)
         return CopyBatch(
             [plan.rid for plan in plans],
@@ -381,7 +394,9 @@ class L1Copier:
         for g, first in enumerate(range(0, self.counter.num_layers, self.layer_group)):
             for signal in sdma.signal_ptrs:
                 sdma.module.wait(stream, signal, sdma.base + g + 1)
-            for layer in range(first, min(first + self.layer_group, self.counter.num_layers)):
+            for layer in range(
+                first, min(first + self.layer_group, self.counter.num_layers)
+            ):
                 events[layer].record(self.stream)
         sdma.base += groups
         return [job_begin, job_begin_gpu]

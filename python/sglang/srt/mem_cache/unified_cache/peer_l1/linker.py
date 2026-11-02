@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,9 +22,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_parallel
 
+from .control import CleanupQueue, OwnerPeer, OwnerService
 from .copier import L1Copier, PeerMemoryMap
 from .debug import CollectiveGuard
 from .directory import L1Directory, hash_words
+from .indexer import IndexerClient, IndexerConfig, PlacementPublisher, block_hash
 from .owner import L1Owner
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,7 @@ class Reservation:
     keys: list[str]
     rows: np.ndarray
     gens: np.ndarray
+    cleanup: int = 0
 
 
 @dataclass
@@ -48,10 +53,19 @@ class LoadPlan:
     indices: torch.Tensor
     directory: L1Directory
     reserved_rows: np.ndarray
+    cleanup_queue: object = None
+    cleanup: int = 0
 
 
 class PeerL1Linker(UnifiedCacheLinker):
     persists = False
+    indexer_config = IndexerConfig()
+    indexer = None
+    publisher = None
+    control = None
+    cleanup = None
+    controls = None
+    _rpc_pool = None
 
     def __init__(self, server_args, params, *, components, extra_config=None):
         if not torch.version.hip or params.page_size != 256:
@@ -119,6 +133,11 @@ class PeerL1Linker(UnifiedCacheLinker):
             raise ValueError(
                 "peer_l1 sizes must be positive and wait_timeout_ms nonnegative"
             )
+        self.indexer_config = IndexerConfig(**config.get("indexer", {}))
+        self.indexer = (
+            IndexerClient(self.indexer_config) if self.indexer_config.stage else None
+        )
+        self.placement = (None, None)
         self.stats = Counter()
         self._next_stats_log = time.monotonic() + _STATS_LOG_SECONDS
         self._lookups = {}
@@ -137,9 +156,20 @@ class PeerL1Linker(UnifiedCacheLinker):
             components=components,
         )
         rows = min(entry._row_count for entry in self.pool_group.entries)
-        path = f"/dev/shm/sglang_l1_{uuid.uuid4().hex}_{self.rank}"
+        stage = self.indexer_config.stage
+        self.worker_id = f"{self.indexer_config.deployment}/prefill/{socket.gethostname()}/dp{self.rank}"
+        path = (
+            f"/dev/shm/sglang_l1_{uuid.uuid4().hex}_{self.rank}" if stage < 4 else None
+        )
         self.directory = L1Directory(path, rows, self.pin_cap, create=True)
+        if stage >= 3:
+            self.control = OwnerService(self.directory)
+            self.cleanup = CleanupQueue(timeout_s=self.indexer_config.timeout_s)
+            self._rpc_pool = ThreadPoolExecutor(
+                max_workers=world - 1, thread_name_prefix="l1-query"
+            )
         self.peers = {}
+        self.controls = {}
         try:
             self.memory = PeerMemoryMap(
                 self.pool_group,
@@ -147,16 +177,49 @@ class PeerL1Linker(UnifiedCacheLinker):
                 world,
                 self.device,
                 self.cpu_group,
-                (path, rows, self.pin_cap, self.device.index),
+                (
+                    path,
+                    rows,
+                    self.pin_cap,
+                    self.device.index,
+                    stage,
+                    self.worker_id,
+                    self.control.endpoint if self.control else "",
+                    self.control.epoch if self.control else 0,
+                ),
             )
             device_ids = [info[3] for info in self.memory.directory_infos]
             if len(set(device_ids)) != world:
                 raise ValueError("peer_l1 requires a distinct GPU per DP worker")
-            self.peers = {
-                peer: L1Directory(*info[:3], create=False)
+            if any(info[4] != stage for info in self.memory.directory_infos):
+                raise ValueError("peer_l1 indexer stages differ across ranks")
+            self.worker_ids = {
+                peer: info[5]
                 for peer, info in enumerate(self.memory.directory_infos)
                 if peer != self.rank
             }
+            self.peers = {
+                peer: L1Directory(*info[:3], create=False)
+                for peer, info in enumerate(self.memory.directory_infos)
+                if peer != self.rank and stage < 4
+            }
+            if stage >= 3:
+                self.controls = {
+                    peer: OwnerPeer(
+                        endpoint=info[6],
+                        epoch=info[7],
+                        pin_cap=info[2],
+                        cleanup=self.cleanup,
+                        timeout_s=self.indexer_config.timeout_s,
+                        cooldown_s=self.indexer_config.cooldown_s,
+                    )
+                    for peer, info in enumerate(self.memory.directory_infos)
+                    if peer != self.rank
+                }
+            if stage >= 2:
+                self.publisher = PlacementPublisher(
+                    config=self.indexer_config, worker_id=self.worker_id
+                )
             # Every rank has mapped every peer directory, so a crash after this
             # point leaves no named segment behind in /dev/shm.
             torch.distributed.barrier(group=self.cpu_group)
@@ -178,6 +241,16 @@ class PeerL1Linker(UnifiedCacheLinker):
             )
             self.layer_done_counter = self.copier.counter
         except BaseException:
+            if self.publisher:
+                self.publisher.close()
+            if self._rpc_pool:
+                self._rpc_pool.shutdown()
+            if self.cleanup:
+                self.cleanup.close()
+            if self.control:
+                self.control.close()
+            if self.indexer:
+                self.indexer.close()
             for directory in self.peers.values():
                 directory.close()
             self.directory.close()
@@ -187,7 +260,7 @@ class PeerL1Linker(UnifiedCacheLinker):
             self.rank,
             rows,
             len(self.memory.buffers),
-            len(self.peers),
+            world - 1,
             self.pin_cap,
         )
 
@@ -209,41 +282,103 @@ class PeerL1Linker(UnifiedCacheLinker):
         # A request can have only one reservation at a time.
         if rid in self._reservations:
             return []
-        keys = next(
-            transfer.keys for transfer in transfers if transfer.name == PoolName.KV
+        kv = next(t for t in transfers if t.name == PoolName.KV)
+        keys = kv.keys
+        self.placement = (
+            rid,
+            self.indexer.lookup(keys) if self.indexer and kv.indexer_eligible else None,
         )
-        hashes = hash_words(keys)
-        start = self.stats["lookups"] % len(self.peers)
+        start = self.stats["lookups"] % len(
+            self.controls if self.indexer_config.stage >= 3 else self.peers
+        )
         best = self.discover(keys, start=start)
         self.stats["lookups"] += 1
         self.stats["lookup_tail_pages"] += len(keys)
-        if self.stitch_stats and best is not None:
-            self._count_stitchable(hashes, start=len(best.rows))
+        if self.stitch_stats and best is not None and self.indexer_config.stage < 3:
+            self._count_stitchable(hash_words(keys), start=len(best.rows))
         if best is None or len(best.rows) < self.min_pages:
             return []
         self.stats["lookup_hits"] += 1
         self.stats["lookup_hit_pages"] += len(best.rows)
-        if len(best.rows) == self.pin_cap < len(keys):
+        selected_cap = (
+            self.controls if self.indexer_config.stage >= 3 else self.peers
+        )[best.peer].pin_cap
+        if len(best.rows) == selected_cap < len(keys):
             self.stats["lookup_capped"] += 1
         self._lookups[rid] = best
         return list(range(1, len(best.rows) + 1))
 
     def discover(self, keys, *, start):
-        hashes = hash_words(keys)
-        best = None
-        # Rotate the first peer so ties distribute load without an RNG call.
-        peers = list(self.peers)
-        for peer in peers[start:] + peers[:start]:
-            rows, gens = self.peers[peer].probe(hashes)
+        stage = self.indexer_config.stage
+        peers = self.controls if stage >= 3 else self.peers
+        order = list(peers)
+        order = order[start:] + order[:start]
+        matches = self.placement[1] if stage >= 2 else None
+        if stage >= 2 and matches is not None:
+            hashes = [block_hash(k) for k in keys]
+            lengths = {}
+            for peer in order:
+                held = matches.get(self.worker_ids[peer], set())
+                cap = min(len(keys), peers[peer].pin_cap)
+                lengths[peer] = next(
+                    (i for i in range(cap) if hashes[i] not in held), cap
+                )
+            peer = max(order, key=lambda p: lengths[p])
+            count = lengths[peer]
+            if not count:
+                return None
+            if stage >= 3:
+                return Reservation(
+                    peer,
+                    list(keys[:count]),
+                    np.empty(count, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                )
+            rows, gens = peers[peer].probe(hash_words(keys[:count]))
+            return (
+                Reservation(peer, list(keys[: len(rows)]), rows, gens)
+                if len(rows)
+                else None
+            )
+        if stage >= 3:
+            queries = {p: self._rpc_pool.submit(peers[p].lookup, keys) for p in order}
+            lengths = {p: f.result() for p, f in queries.items()}
+            peer = max(order, key=lambda p: lengths[p])
+            count = lengths[peer]
+            return (
+                Reservation(
+                    peer,
+                    list(keys[:count]),
+                    np.empty(count, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                )
+                if count
+                else None
+            )
+        hashes, best = hash_words(keys), None
+        for peer in order:
+            rows, gens = peers[peer].probe(hashes)
             if len(rows) and (best is None or len(rows) > len(best.rows)):
                 best = Reservation(peer, list(keys[: len(rows)]), rows, gens)
         return best
 
     def contains_peers(self, keys):
-        hashes = hash_words(keys)
         found = np.zeros(len(keys), dtype=bool)
-        for peer in self.peers.values():
-            found |= peer.contains(hashes)
+        if self.indexer_config.stage >= 4:
+            queries = [
+                self._rpc_pool.submit(peer.contains, keys)
+                for peer in self.controls.values()
+            ]
+            answers = [query.result() for query in queries]
+            if any(answer is None for answer in answers):
+                self.stats["contains_failures"] += 1
+                return found
+            for answer in answers:
+                found |= answer
+        else:
+            hashes = hash_words(keys)
+            for peer in self.peers.values():
+                found |= peer.contains(hashes)
         return found
 
     def _count_stitchable(self, hashes, *, start):
@@ -275,7 +410,15 @@ class PeerL1Linker(UnifiedCacheLinker):
         if self._collective_guard is not None:
             self._collective_guard.enable()
         try:
-            if not self.peers[found.peer].pin(found.rows, found.gens):
+            self.stats["reserve_attempts"] += 1
+            if self.indexer_config.stage >= 3:
+                granted = self.controls[found.peer].acquire(found.keys)
+                pinned = granted is not None
+                if pinned:
+                    found.rows, found.cleanup = granted
+            else:
+                pinned = self.peers[found.peer].pin(found.rows, found.gens)
+            if not pinned:
                 self.stats["reserve_failures"] += 1
                 self.stats["reserve_failed_pages"] += num_pages
                 return False
@@ -301,7 +444,10 @@ class PeerL1Linker(UnifiedCacheLinker):
         ):
             return
         reservation = self._forget_reservation(rid)
-        self.peers[reservation.peer].unpin(reservation.rows)
+        if reservation.cleanup:
+            self.cleanup.enqueue(reservation.cleanup)
+        else:
+            self.peers[reservation.peer].unpin(reservation.rows)
         self._stop_collective_guard_if_submitted()
 
     def load(self, rid, transfers):
@@ -315,8 +461,10 @@ class PeerL1Linker(UnifiedCacheLinker):
             list(transfer.keys),
             reservation.rows,
             transfer.device_indices,
-            self.peers[reservation.peer],
+            self.peers.get(reservation.peer),
             reservation.rows,
+            self.cleanup,
+            reservation.cleanup,
         )
         return True
 
@@ -326,9 +474,11 @@ class PeerL1Linker(UnifiedCacheLinker):
         if self.forward_stream is None:
             raise RuntimeError("peer_l1 forward stream was not registered")
         plans = list(self._queued.values())
+        # A failed submission may already have queued source reads or callbacks.
+        # Keep those reservations protected until engine teardown.
+        self._inflight.update(plan.rid for plan in plans)
         batch = self.copier.submit(plans, self.forward_stream)
         self._batches[batch.index] = batch
-        self._inflight.update(batch.rids)
         self._queued.clear()
         self._stop_collective_guard_if_submitted()
         self.stats["loaded_pages"] += len(batch.keys)
@@ -428,7 +578,17 @@ class PeerL1Linker(UnifiedCacheLinker):
         torch.distributed.barrier(group=self.cpu_group)
         self.memory.peer_storages.clear()
         torch.distributed.barrier(group=self.cpu_group)
+        if self.publisher:
+            self.publisher.close()
+        if self._rpc_pool:
+            self._rpc_pool.shutdown()
+        if self.cleanup:
+            self.cleanup.close()
+        if self.control:
+            self.control.close()
         for directory in self.peers.values():
             directory.close()
         self.directory.close()
+        if self.indexer:
+            self.indexer.close()
         self._closed = True

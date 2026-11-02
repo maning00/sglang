@@ -62,6 +62,10 @@ class LendPool:
         self.writing = 0
         self.pinned = 0
         self.demoting = OrderedDict()
+        self.publisher = None
+        self._acquires = {}
+        self._lease_requests = {}
+        self._completed = Counter()
 
     def _unavailable(self):
         return self.writing + self.pinned
@@ -134,7 +138,8 @@ class LendPool:
     def commit(self, writer, records):
         with self.lock:
             result = []
-            for page, gen, key in records:
+            for record in records:
+                page, gen, key = record[:3]
                 if not self._matches(page, gen):
                     result.append(False)
                     continue
@@ -156,6 +161,8 @@ class LendPool:
                     p.state, p.key = "valid", key
                     self.keys[key] = page
                     self.lru[page] = None
+                    if self.publisher and len(record) == 4 and record[3][1]:
+                        self.publisher.publish([(key, record[3][0])])
                     result.append(True)
             return result
 
@@ -166,6 +173,36 @@ class LendPool:
                     p = self.pages[page]
                     if p.state == "writing" and p.writer == writer:
                         self._discard(page)
+
+    def acquire(self, reader, seq, keys):
+        with self.lock:
+            self.expire()
+            request = (reader, seq)
+            if request in self._acquires:
+                return self._acquires[request]
+            if seq <= self._completed[reader]:
+                return [0, []]
+            records = []
+            for key in keys[:64]:
+                page = self.keys.get(key)
+                if page is None or self.pages[page].state not in ("valid", "demoting"):
+                    break
+                records.append(self._record(page))
+            lease = self.pin(reader, records)
+            if not lease:
+                self._completed[reader] = max(seq, self._completed[reader])
+                return [0, []]
+            result = [lease, records]
+            self._acquires[request] = result
+            self._lease_requests[lease] = request
+            return result
+
+    def cancel_acquire(self, reader, seq):
+        with self.lock:
+            saved = self._acquires.get((reader, seq))
+            if saved:
+                self.unpin(reader, saved[0])
+            self._completed[reader] = max(seq, self._completed[reader])
 
     def pin(self, reader, records):
         with self.lock:
@@ -201,6 +238,10 @@ class LendPool:
             if saved is None or saved[0] != reader:
                 return
             del self.leases[lease]
+            request = self._lease_requests.pop(lease, None)
+            if request is not None:
+                self._acquires.pop(request)
+                self._completed[reader] = max(request[1], self._completed[reader])
             for page in saved[1]:
                 p = self.pages.get(page)
                 if p is None:
@@ -218,6 +259,8 @@ class LendPool:
             self.writing -= 1
         self.demoting.pop(page, None)
         if p.key:
+            if self.publisher:
+                self.publisher.retire([p.key])
             if self.keys.get(p.key) == page:
                 del self.keys[p.key]
             self.events.append(("EVICTED", p.writer, [self._record(page)]))
@@ -234,6 +277,8 @@ class LendPool:
                         self.demoting.pop(page, None)
                         if p.pins:
                             p.state = "retired"
+                            if self.publisher:
+                                self.publisher.retire([p.key])
                             self.lru.pop(page, None)
                         else:
                             self._discard(page)
@@ -252,6 +297,8 @@ class LendPool:
                 if p.state == "demoting":
                     if p.pins:
                         p.state = "retired"
+                        if self.publisher:
+                            self.publisher.retire([p.key])
                         self.lru.pop(page, None)
                     else:
                         self._discard(page)

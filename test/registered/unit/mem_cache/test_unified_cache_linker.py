@@ -595,7 +595,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self._insert(cache, allocator, req_pool, tokens)
         events = cache.tree_core.take_l1_events()
         self.assertTrue(events)
-        for _, indices in events:
+        for _, indices, _, _ in events:
             self.assertFalse(torch.isin(indices, loaded).any().item())
         cache.ready_to_load_host_cache()
         self._bind_loaded_request(cache, req_pool, req, tokens, loaded)

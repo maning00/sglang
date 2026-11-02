@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_unified_radix_cache_unittest import CacheConfig, build_fixture
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -16,9 +18,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import distinct_stream
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
+from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import IndexerConfig
+from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker
 from sglang.srt.mem_cache.unified_cache.peer_l1.owner import L1Owner
 from sglang.test.ci.ci_register import register_cuda_ci
-from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
@@ -105,6 +108,9 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
     directory = L1Directory(str(tmp_path / "directory"), 17, 4, create=True)
     linker = SimpleNamespace(
         directory=directory,
+        control=None,
+        publisher=None,
+        indexer_config=IndexerConfig(),
         device=allocator.device,
         check_hooks=True,
         stats=Counter(),
@@ -211,14 +217,14 @@ def test_split_preserves_publications_and_eviction_retires_them(backend):
     cache.insert(InsertParams(key=RadixKey(array("q", range(12))), value=value))
     events = core.take_l1_events()
     assert len(events) == 1 and len(events[0][0]) == 3
-    keys, attached = events[0]
+    keys, attached, parents, eligible = events[0]
     assert torch.equal(attached, value)
     cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(4)))))
     assert core.take_l1_events() == []
     cache.evict(EvictParams(num_tokens=12))
     retired = core.take_l1_events()
-    assert all(value is None for _, value in retired)
-    assert sorted(key for hashes, _ in retired for key in hashes) == sorted(keys)
+    assert all(value is None for _, value, _, _ in retired)
+    assert sorted(key for hashes, _, _, _ in retired for key in hashes) == sorted(keys)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache fixtures need CUDA")
@@ -226,13 +232,18 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
     """With L2 written only for last copies, an evicted page that a peer still
     publishes is freed at once, and a page no peer holds is handed to L2 and
     stays allocated until that write lands (it is read asynchronously)."""
-    cache, allocator, _ = build_fixture(CacheConfig(page_size=4, kv_size=64, num_layers=2))
+    cache, allocator, _ = build_fixture(
+        CacheConfig(page_size=4, kv_size=64, num_layers=2)
+    )
     cache.tree_core.enable_external_cache_linker = True
     cache.write_through_threshold = (1 << 63) - 1
     directory = L1Directory(str(tmp_path / "own"), 17, 4, create=True)
     peer = L1Directory(str(tmp_path / "peer"), 17, 4, create=True)
     linker = SimpleNamespace(
         directory=directory,
+        control=None,
+        publisher=None,
+        indexer_config=IndexerConfig(),
         peers={1: peer},
         device=allocator.device,
         check_hooks=True,
@@ -240,6 +251,7 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
         has_unstarted_reservations=False,
         wait_seconds=0,
     )
+    linker.contains_peers = lambda keys: PeerL1Linker.contains_peers(linker, keys)
     owner = L1Owner(cache, linker)
     linker.owner = owner
     writes = []
@@ -248,7 +260,9 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
     try:
         shared, last = allocator.alloc(8), allocator.alloc(8)
         cache.insert(InsertParams(key=RadixKey(array("q", range(8))), value=shared))
-        cache.insert(InsertParams(key=RadixKey(array("q", range(100, 108))), value=last))
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", range(100, 108))), value=last)
+        )
         owner.poll(torch.cuda.current_stream())
         owner.stream.synchronize()
         owner.poll(torch.cuda.current_stream())

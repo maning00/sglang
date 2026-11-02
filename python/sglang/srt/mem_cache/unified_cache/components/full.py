@@ -485,6 +485,12 @@ class FullComponent(TreeComponent):
                 name=PoolName.KV,
                 device_indices=value.to(torch.int64),
                 keys=list(node.hash_value),
+                parent_keys=[
+                    node.parent.hash_value[-1] if node.parent.hash_value else None
+                ]
+                + list(node.hash_value[:-1]),
+                indexer_eligible=node.key.extra_key is None
+                and node.key.cache_salt is None,
             )
 
         if not keys:

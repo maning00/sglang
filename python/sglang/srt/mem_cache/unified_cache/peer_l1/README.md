@@ -117,3 +117,61 @@ establish which data path was exercised.
 Pass `--combined` for `mori_peer_l1`: after flush it requires an L2 hit, followed
 by another peer read of that restored prefix. Check both loaded-page counters
 in the server log to confirm the selected sources.
+
+## Indexer migration
+
+`peer_l1.indexer` selects cumulative migration stages. For the standalone
+`peer_l1` backend, put `indexer` directly in the extra-config object. Use the
+same stage, endpoint, and deployment on all prefill and decode ranks:
+
+```json
+{"peer_l1":{"l2_backend":"decode_lend+umbp","l2_write":"last_replica","indexer":{"stage":4,"endpoint":"127.0.0.1:50051","deployment":"example"}}}
+```
+
+| Stage | Discovery and ownership |
+|---|---|
+| 0 (default) | Original shm discovery and pins; directory names are unlinked after every rank maps them |
+| 1 | Decode lending reports to Indexer and grants pages by complete key with ACQUIRE |
+| 2 | Peer L1 also reports to Indexer; the selected candidate's shm provides rows and generations |
+| 3 | Native Unix socket owner RPCs grant pins; HIP callbacks enqueue reliable batched cleanup; shm is retained for F3 only |
+| 4 | Batched authoritative CONTAINS replaces F3 shm reads; peer directories use private anonymous memory |
+
+Stage 0 restores the original path for comparisons. These are engine startup
+options; changing a stage requires restarting all ranks. Stage 1 and later do
+not create the decode lending shm directory. Stage 4 creates neither directory.
+The deprecated multi-peer stitching diagnostic is disabled at stages 3 and 4,
+where remote shm probes are no longer permitted.
+
+Run `kv-indexer-server` separately, using the wire protocol from SGLang upstream
+commit `2c362af4cc`. The vendored protobuf is under `sglang/srt/grpc/`; regenerate
+it with `python -m grpc_tools.protoc -I python --python_out=python
+python/sglang/srt/grpc/kv_indexer.proto`. Clients report directly by gRPC, without
+a bridge. Worker addresses are empty so these entries do not become Router
+prefix destinations. A deployment must have a unique name and consistent hash,
+page size, model, and KV layout. Discovery returns known peers only and never
+authorizes access to a row.
+
+`timeout_s` defaults to 0.01 for discovery and peer L1 control, `cooldown_s` to
+1.0, and `recovery_s` to 600. Reports have a minimum one-second RPC deadline.
+Each owner restores soft state with CLEAR, a snapshot, then buffered deltas on
+failure or reconnection, and periodically with staggered phases. The publisher
+runs outside the scheduler thread. A request shares one discovery result between
+peer L1 and lending; requests over 16,384 pages require multiple bounded RPCs.
+Indexer failures use local shm probes before stage 3 and parallel LOOKUP from
+stage 3 onwards; lending falls back to DRAM. Namespaced requests skip Indexer,
+using local discovery and the DRAM tier. Partial peer L1 grants are released and
+remain misses; they do not introduce a different L2 stitching boundary.
+
+Peer L1 never releases source pins on a control disconnect or a timer. Old
+outstanding grants stop new grants to that reader after 30 seconds, but stay
+pinned until RELEASE or whole-engine teardown. CANCEL and RELEASE are retried
+until acknowledgment; an owner epoch change makes old cleanup obsolete. A
+per-reader completion watermark rejects late cancelled ACQUIRE requests without
+retaining a tombstone per request. Flush retains busy/retry behavior. Lending
+keeps its original expiry policy and checks elapsed read time before using data.
+
+CPU protocol checks are in `test_peer_l1_indexer.py`, alongside the existing
+peer and lending tests. They do not establish HIP callback ordering, RDMA byte
+correctness, or end-to-end performance. Validate both copy engines, flush and
+cancellation, owner disconnect during copying, and the approved throughput,
+TTFT, hit-rate and reserve-failure budgets on matching hardware before rollout.

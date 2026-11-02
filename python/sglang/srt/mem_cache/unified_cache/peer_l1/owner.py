@@ -28,11 +28,13 @@ class L1Owner:
     def __init__(self, cache, linker):
         self.cache, self.linker = cache, linker
         self.directory = linker.directory
+        self.authority = linker.control or linker.directory
         # High priority for the same reason as the copier's stream: it waits on
         # the forward stream and must not share a hardware queue with the scheduler.
         self.stream = torch.cuda.Stream(device=linker.device, priority=-1)
         self._version = 0
         self._pending = {}
+        self._metadata = {}
         self._attaches = []
         self._publications = deque()
         self._published = set()
@@ -58,24 +60,41 @@ class L1Owner:
         return max(0, refs) * self.cache.page_size
 
     def consume_events(self):
-        for keys, value in self.cache.tree_core.take_l1_events():
+        retired, retired_keys = [], set()
+        for keys, value, parents, eligible in self.cache.tree_core.take_l1_events():
+            self._metadata.update((k, (p, eligible)) for k, p in zip(keys, parents))
             if value is None:
+                retired_keys.update(keys)
                 for key in keys:
                     self._pending.pop(key, None)
                     self._published.discard(key)
-                aligned = self.directory.retire(keys, aligned=True)
+                aligned = self.authority.retire(keys, aligned=True)
+                if self.linker.publisher:
+                    self.linker.publisher.retire(keys)
                 rows = aligned[aligned >= 0]
                 self.linker.stats["retired_pages"] += len(rows)
                 if len(rows):
                     pins, _ = self.directory.states(rows)
                     self._hold.update(int(row) for row in rows[pins > 0])
                     if self.last_replica_writer is not None:
-                        self._write_last_replicas(keys, aligned)
+                        if self.linker.indexer_config.stage >= 4:
+                            retired.append((keys, aligned))
+                        else:
+                            self._write_last_replicas(keys, aligned)
             else:
                 self._version += 1
                 for key in keys:
                     self._pending[key] = self._version
                 self._attaches.append((keys, [self._version] * len(keys), value))
+
+        if retired:
+            keys = [key for batch, _ in retired for key in batch]
+            self._write_last_replicas(
+                keys, np.concatenate([rows for _, rows in retired])
+            )
+        for key in retired_keys:
+            if key not in self._pending:
+                self._metadata.pop(key, None)
 
     def _write_last_replicas(self, keys, aligned):
         """Write retired pages that no other rank publishes to L2, then hold them.
@@ -89,7 +108,14 @@ class L1Owner:
         if not len(last):
             return
         rows = aligned[last]
-        if not self.last_replica_writer([keys[i] for i in last], rows):
+        selected = [keys[i] for i in last]
+        metadata = {}
+        if self.linker.indexer_config.stage:
+            metadata = dict(
+                parents=[self._metadata[k][0] for k in selected],
+                eligible=all(self._metadata[k][1] for k in selected),
+            )
+        if not self.last_replica_writer(selected, rows, **metadata):
             self.linker.stats["last_replica_refused_pages"] += len(rows)
             return
         held = set(map(int, rows))
@@ -102,7 +128,9 @@ class L1Owner:
         rows = set(map(int, rows))
         self._writing.difference_update(rows)
         # Not freed yet: drop the hold unless a remote reader still pins the row.
-        unfreed = np.fromiter((row for row in rows if row in self._hold), dtype=np.int64)
+        unfreed = np.fromiter(
+            (row for row in rows if row in self._hold), dtype=np.int64
+        )
         if len(unfreed):
             pins, _ = self.directory.states(unfreed)
             self._hold.difference_update(map(int, unfreed[pins == 0]))
@@ -188,7 +216,13 @@ class L1Owner:
             keys = [publication.keys[i] for i in selected]
             rows = publication.rows.numpy()[selected]
             if keys:
-                self.directory.publish(keys, rows)
+                self.authority.publish(keys, rows)
+                if self.linker.publisher:
+                    self.linker.publisher.publish(
+                        (key, self._metadata[key][0])
+                        for key in keys
+                        if self._metadata[key][1]
+                    )
                 self.linker.stats["published_pages"] += len(keys)
                 self._published.update(keys)
                 for key in keys:
@@ -250,9 +284,12 @@ class L1Owner:
     def reset(self):
         # Called only after begin_flush, or after the whole worker quiesces.
         if self._published:
-            self.directory.retire(list(self._published))
+            self.authority.retire(list(self._published))
+            if self.linker.publisher:
+                self.linker.publisher.retire(self._published)
         self._published.clear()
         self._pending.clear()
+        self._metadata.clear()
         self._attaches.clear()
         # The gather may still reference value tensors and pinned CPU buffers.
         # Reset is cold; finish it before releasing those allocations.

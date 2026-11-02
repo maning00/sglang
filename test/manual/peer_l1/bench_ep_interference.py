@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
@@ -87,6 +88,8 @@ def build_copy(rank, world, pages, device, inflight):
         indices=destination,
         directory=remote,
         reserved_rows=source_rows,
+        cleanup=0,
+        cleanup_queue=None,
     )
     return memory, directory, remote, plan, gens
 

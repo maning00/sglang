@@ -9420,3 +9420,24 @@ fn a_zero_length_match_anchors_at_the_root() {
     assert!(tc.arena.resolve(anchor).is_ok());
     tc.sanity_check(&[], &[]);
 }
+
+#[test]
+fn l1_parent_snapshot_survives_a_split_before_publication() {
+    let params = CacheInitParams {
+        page_size: 2,
+        ..Default::default()
+    };
+    let mut core: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL]);
+    core.set_enable_external_cache_linker(true).unwrap();
+    core.enable_l1_events = true;
+    core.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
+    core.insert(&insert_params(&vec![1, 2, 7, 8], &[10, 11, 17, 18]));
+    let expected = crate::node::get_hash_str::<Vec<i64>>(&vec![1, 2, 3, 4], None, 2);
+    assert_eq!(core.l1_events[0].keys, expected);
+    assert_eq!(
+        core.l1_events[0].parents,
+        vec![None, Some(expected[0].clone())]
+    );
+    assert!(core.l1_events[0].eligible);
+    assert_eq!(core.l1_events[1].parents, vec![Some(expected[0].clone())]);
+}

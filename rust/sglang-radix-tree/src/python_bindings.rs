@@ -2174,8 +2174,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn take_l1_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let events = py.detach(|| std::mem::take(&mut self.core().l1_events));
         let list = PyList::empty(py);
-        for (keys, value) in events {
-            list.append((keys, value.map(PyTensor)))?;
+        for event in events {
+            list.append((
+                event.keys,
+                event.value.map(PyTensor),
+                event.parents,
+                event.eligible,
+            ))?;
         }
         Ok(list.unbind())
     }
@@ -2293,14 +2298,21 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<Option<Vec<Py<PyAny>>>> {
-        let transfers = py
-            .detach(|| self.core().build_external_linker_offload_transfers(node_id))
+        let (transfers, parents, eligible) = py
+            .detach(|| {
+                let core = self.core();
+                let transfers = core.build_external_linker_offload_transfers(node_id)?;
+                let (parents, eligible) = core.l1_metadata_(core.arena.resolve(node_id)?);
+                Ok::<_, NodeAccessError>((transfers, parents, eligible))
+            })
             .map_err(node_access_error)?;
         transfers
             .map(|transfers| {
                 transfers
                     .into_iter()
-                    .map(|transfer| transfer_to_py(py, transfer))
+                    .map(|transfer| {
+                        (transfer_to_py(py, transfer)?, parents.clone(), eligible).into_py_any(py)
+                    })
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()

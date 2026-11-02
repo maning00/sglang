@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import socket
 import time
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 from .allocator import LendablePagedAllocator
 from .pool import LendPool
@@ -46,8 +48,20 @@ def install_decode_lend(scheduler):
     outer.full_attn_allocator = LendablePagedAllocator.install(
         inner, pool, forward_stream=scheduler.forward_stream
     )
+    from ..indexer import IndexerConfig, PlacementPublisher
+
+    raw = get_memory().hicache_storage_backend_extra_config
+    config = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    indexer = IndexerConfig(**config.get("peer_l1", config).get("indexer", {}))
+    worker_id = ""
+    if indexer.stage:
+        worker_id = f"{indexer.deployment}/lend/{socket.gethostname()}/dp{get_parallel().attn_dp_rank}"
+        pool.publisher = PlacementPublisher(config=indexer, worker_id=worker_id)
     scheduler.decode_lend_service = LendService(
-        pool, manager.local_ip, layout=list(manager.kv_args.kv_item_lens)
+        pool,
+        manager.local_ip,
+        layout=list(manager.kv_args.kv_item_lens),
+        worker_id=worker_id,
     )
     manager.lend_port = scheduler.decode_lend_service.port
     manager.lend_dp_rank = get_parallel().attn_dp_rank

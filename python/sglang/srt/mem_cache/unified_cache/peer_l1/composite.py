@@ -169,7 +169,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         if not self.persists:
             self.l1.owner.last_replica_writer = self._write_last_replicas
 
-    def _write_last_replicas(self, keys, rows):
+    def _write_last_replicas(self, keys, rows, *, parents=None, eligible=True):
         # A refused page is freed without an L2 copy: L2 coverage, not HBM, pays.
         if self._writes_stalled:
             self.l1.stats["last_replica_stalled_pages"] += len(rows)
@@ -184,7 +184,11 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
         # CPU indices: the L2 offload snapshots them without a device sync.
         indices = torch.from_numpy((rows[:, None] * page + np.arange(page)).reshape(-1))
         transfer = PoolTransfer(
-            name=PoolName.KV, device_indices=indices, keys=list(keys)
+            name=PoolName.KV,
+            device_indices=indices,
+            keys=list(keys),
+            parent_keys=parents,
+            indexer_eligible=eligible,
         )
         if not self.l2.offload([transfer]):
             return False
@@ -257,6 +261,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
             # A continuation is useless without its peer prefix.
             if start or num_pages > b:
                 self.l1.stats["reserve_fallback_to_recompute"] += 1
+                self.l1.stats["reserve_recompute_tokens"] += num_pages * self.page_size
                 return False
             l1_pages = 0
             if num_pages <= a:
@@ -267,6 +272,7 @@ class PeerL1PlusL2Linker(UnifiedCacheLinker):
     def release_reservation(self, rid):
         self._lookups.pop(rid, None)
         self.l1.release_reservation(rid)
+        self.l2.release_reservation(rid)
         state = self._requests.get(rid)
         if state is not None and not state.queued:
             del self._requests[rid]
