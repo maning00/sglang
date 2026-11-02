@@ -6,10 +6,60 @@ import logging
 import threading
 import time
 import zlib
+from collections import OrderedDict
 
 import msgspec
+import numpy as np
+
+from .control import full_keys
 
 logger = logging.getLogger(__name__)
+
+# upstream sgl-kv-indexer/src/service.rs batch/query limits.
+MAX_HASHES = 16384
+MAX_ACTIONS = 256
+# Bounded hints for waiting requests; authority is checked at ACQUIRE.
+PLACEMENT_CAPACITY = 128
+PLACEMENT_TTL_S = 0.1
+
+
+class Placement(msgspec.Struct):
+    keys: tuple[str, ...]
+    full: np.ndarray
+    hashes: np.ndarray
+    by_key: dict[str, int]
+    matches: dict | None = None
+    expires: float = 0.0
+    eligible: bool = False
+
+
+class Placements:
+    def __init__(self, client):
+        self.client = client
+        self.entries = OrderedDict()
+
+    def get(self, rid, keys, *, eligible=True):
+        item = self.entries.pop(rid, None)
+        if item is None or item.keys != tuple(keys):
+            full = full_keys(keys)
+            hashes = full.view(">i8").reshape(-1)[::4]
+            item = Placement(tuple(keys), full, hashes, dict(zip(keys, hashes)))
+        if item.eligible != eligible:
+            item.expires = 0.0
+            item.eligible = eligible
+        if time.monotonic() >= item.expires:
+            item.matches = self.client.lookup(item.hashes) if eligible else None
+            item.expires = time.monotonic() + PLACEMENT_TTL_S
+        self.entries[rid] = item
+        if len(self.entries) > PLACEMENT_CAPACITY:
+            self.entries.popitem(last=False)
+        return item
+
+    def pop(self, rid):
+        self.entries.pop(rid, None)
+
+    def clear(self):
+        self.entries.clear()
 
 
 class IndexerConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -35,19 +85,19 @@ def block_hash(key):
 
 
 def report_batches(records):
-    from sglang.srt.grpc.kv_indexer_pb2 import ExternalKvAction
+    from sglang.srt.grpc.kv_indexer_pb2 import ACTION_REPORT, TIER_HBM, ExternalKvAction
 
     actions, count = [], 0
     for key, parent in records:
         value = block_hash(key)
         parent = block_hash(parent) if parent is not None else None
-        if count == 16384 or len(actions) == 256:
+        if count == MAX_HASHES or len(actions) == MAX_ACTIONS:
             yield actions
             actions, count = [], 0
         if actions and actions[-1].hashes[-1] == parent:
             actions[-1].hashes.append(value)
         else:
-            action = ExternalKvAction(type=1, tier=1, hashes=[value])
+            action = ExternalKvAction(type=ACTION_REPORT, tier=TIER_HBM, hashes=[value])
             if parent is not None:
                 action.parent_block_hash = parent
             actions.append(action)
@@ -75,18 +125,20 @@ class IndexerClient:
             response_deserializer=pb.MatchExternalKvResponse.FromString,
         )
         self._retry_after = 0.0
+        self.rpc_count = 0
 
-    def lookup(self, keys):
+    def lookup(self, hashes):
         import grpc
 
         if time.monotonic() < self._retry_after:
             return None
         result = {}
         try:
-            for start in range(0, len(keys), 16384):
+            for start in range(0, len(hashes), MAX_HASHES):
+                self.rpc_count += 1
                 reply = self.match(
                     self.pb.MatchExternalKvRequest(
-                        hashes=[block_hash(k) for k in keys[start : start + 16384]],
+                        hashes=hashes[start : start + MAX_HASHES],
                         count_as_hit=False,
                     ),
                     timeout=self.config.timeout_s,
@@ -94,7 +146,7 @@ class IndexerClient:
                 for match in reply.matches:
                     held = result.setdefault(match.worker_id, set())
                     for tier in match.hashes_by_tier:
-                        if tier.tier == 1:
+                        if tier.tier == self.pb.TIER_HBM:
                             held.update(tier.hashes)
         except grpc.RpcError:
             self._retry_after = time.monotonic() + self.config.cooldown_s
@@ -109,6 +161,7 @@ class IndexerClient:
                 callback()
 
         self.channel.subscribe(changed)
+        return changed
 
     def close(self):
         self.channel.close()
@@ -117,6 +170,7 @@ class IndexerClient:
 class PlacementPublisher:
     def __init__(self, *, config, worker_id, client=None):
         self.config, self.worker_id = config, worker_id
+        self._owns_client = client is None
         self.client = client if client is not None else IndexerClient(config)
         self._records = {}
         self._pending = {}
@@ -126,7 +180,7 @@ class PlacementPublisher:
         self._generation = 0
         self._completed_generation = -1
         self._seq = 0
-        self.client.on_reconnect(self.recover)
+        self._subscription = self.client.on_reconnect(self.recover)
         self._thread = threading.Thread(
             target=self._run, name="kv-placement", daemon=True
         )
@@ -170,16 +224,23 @@ class PlacementPublisher:
             records = list(self._records.items()) if recover else None
             pending, self._pending = self._pending, {}
         if recover:
-            self._send([self.client.pb.ExternalKvAction(type=3, tier=1)])
+            self._send(
+                [
+                    self.client.pb.ExternalKvAction(
+                        type=self.client.pb.ACTION_CLEAR_ALL_AT_TIER,
+                        tier=self.client.pb.TIER_HBM,
+                    )
+                ]
+            )
         else:
             removed = [block_hash(k) for k, (live, _) in pending.items() if not live]
-            for start in range(0, len(removed), 16384):
+            for start in range(0, len(removed), MAX_HASHES):
                 self._send(
                     [
                         self.client.pb.ExternalKvAction(
-                            type=2,
-                            tier=1,
-                            hashes=removed[start : start + 16384],
+                            type=self.client.pb.ACTION_REVOKE,
+                            tier=self.client.pb.TIER_HBM,
+                            hashes=removed[start : start + MAX_HASHES],
                         )
                     ]
                 )
@@ -212,4 +273,6 @@ class PlacementPublisher:
         self._stop.set()
         self._wake.set()
         self._thread.join()
-        self.client.close()
+        self.client.channel.unsubscribe(self._subscription)
+        if self._owns_client:
+            self.client.close()

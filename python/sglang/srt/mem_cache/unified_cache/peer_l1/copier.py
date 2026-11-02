@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import glob
 import os
 import socket
@@ -12,6 +13,8 @@ import numpy as np
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+
+from .control import native
 
 
 @cache_once
@@ -255,6 +258,9 @@ class L1Copier:
         self.module = copy_module()
         # The kernel engine copies on CUs; sdma moves rows on the DMA engines and
         # keeps the kernel only for byte verification.
+        self.cleanup_callback = ctypes.cast(
+            native().l1_cleanup_enqueue, ctypes.c_void_p
+        ).value
         self.sdma = (
             SdmaEngine(memory, peer_devices, sdma_channels)
             if engine == "sdma"
@@ -295,15 +301,14 @@ class L1Copier:
             sources[offset : offset + count, 1].copy_(torch.from_numpy(plan.rows))
             offset += count
             if plan.cleanup:
-                cleanups.append((plan.cleanup_queue.callback, plan.cleanup))
+                cleanups.append(plan.cleanup)
             else:
                 unpins.extend(
                     (plan.directory.address, int(row)) for row in plan.reserved_rows
                 )
         unpins = torch.tensor(unpins, dtype=torch.int64, device="cpu").reshape(-1, 2)
-        cleanups = torch.tensor(cleanups, dtype=torch.int64, device="cpu").reshape(
-            -1, 2
-        )
+        if cleanups:
+            cleanups = torch.tensor(cleanups, dtype=torch.int64, device="cpu")
         with torch.cuda.stream(self.stream):
             destinations = (
                 torch.cat([plan.indices.reshape(-1, 256)[:, 0] for plan in plans])
@@ -350,7 +355,9 @@ class L1Copier:
                 )
                 error_cpu.copy_(error, non_blocking=True)
             if len(cleanups):
-                self.module.cleanup(cleanups, self.stream.cuda_stream)
+                self.module.cleanup(
+                    cleanups, self.cleanup_callback, self.stream.cuda_stream
+                )
             else:
                 self.module.unpin(unpins, self.stream.cuda_stream)
             finish.record(self.stream)

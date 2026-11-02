@@ -88,8 +88,6 @@ class LendService:
                                 data = self.pool.acquire(writer, request.seq, args)
                             elif op == "CANCEL_ACQUIRE":
                                 self.pool.cancel_acquire(writer, args[0])
-                            elif op == "RELEASE":
-                                self.pool.unpin(writer, args[0])
                             elif op == "PIN":
                                 data = [self.pool.pin(writer, args)]
                             elif op == "UNPIN":

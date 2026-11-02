@@ -102,16 +102,28 @@ inline void enqueue_unpin(tvm::ffi::TensorView entries, int64_t stream) {
   batch.release();
 }
 
-/// Enqueue preallocated cleanup nodes only after every source read has completed.
-inline void enqueue_cleanup(tvm::ffi::TensorView entries, int64_t stream) {
-  if (entries.ndim() != 2 || entries.size(1) != 2 || entries.device().device_type != kDLCPU)
-    throw std::invalid_argument("peer L1 cleanup entries must be a CPU [N,2] tensor");
+struct CleanupBatch {
+  hipHostFn_t enqueue;
+  std::vector<int64_t> items;
+};
+
+/// One callback enqueues all grants after every source read has completed.
+inline void enqueue_cleanup(tvm::ffi::TensorView entries, int64_t callback, int64_t stream) {
+  if (entries.ndim() != 1 || entries.device().device_type != kDLCPU)
+    throw std::invalid_argument("peer L1 cleanup entries must be a CPU [N] tensor");
   const auto* data = static_cast<const int64_t*>(entries.data_ptr());
-  for (int64_t i = 0; i < entries.numel(); i += 2)
-    check_hip(hipLaunchHostFunc(
-        reinterpret_cast<hipStream_t>(stream),
-        reinterpret_cast<hipHostFn_t>(data[i]),
-        reinterpret_cast<void*>(data[i + 1])));
+  auto batch = std::make_unique<CleanupBatch>();
+  batch->enqueue = reinterpret_cast<hipHostFn_t>(callback);
+  batch->items.assign(data, data + entries.numel());
+  check_hip(hipLaunchHostFunc(
+      reinterpret_cast<hipStream_t>(stream),
+      [](void* context) {
+        std::unique_ptr<CleanupBatch> batch(static_cast<CleanupBatch*>(context));
+        for (auto item : batch->items)
+          batch->enqueue(reinterpret_cast<void*>(item));
+      },
+      batch.get()));
+  batch.release();
 }
 
 }  // namespace sglang::peer_l1

@@ -6,11 +6,23 @@ import ctypes
 import math
 import time
 import uuid
+from enum import IntEnum
 from functools import lru_cache
 
 import numpy as np
 
 from .directory import _native
+
+
+# Keep aligned with native/owner.h::Operation.
+class Operation(IntEnum):
+    LOOKUP = 1
+    ACQUIRE = 2
+    RELEASE = 3
+    CANCEL = 4
+    CONTAINS = 5
+    CLEANUPS = 6
+    ACQUIRE_EXACT = 7
 
 
 @lru_cache(maxsize=1)
@@ -46,7 +58,7 @@ def checked(result):
 
 
 def full_keys(keys):
-    value = b"".join(bytes.fromhex(key) for key in keys)
+    value = bytes.fromhex("".join(keys))
     if len(value) != len(keys) * 32:
         raise ValueError("Peer L1 ownership requires complete SHA-256 keys")
     return np.frombuffer(value, dtype="<u8").reshape(-1, 4)
@@ -96,14 +108,13 @@ class OwnerService:
 class CleanupQueue:
     def __init__(self, *, timeout_s):
         self.address = checked(native().l1_cleanup_start(math.ceil(timeout_s * 1000)))
-        self.callback = ctypes.cast(native().l1_cleanup_enqueue, ctypes.c_void_p).value
 
     def prepare(self, peer, seq, *, cancel=False):
         return checked(
             native().l1_cleanup_create(
                 self.address,
                 peer.endpoint,
-                4 if cancel else 3,
+                Operation.CANCEL if cancel else Operation.RELEASE,
                 peer.epoch,
                 peer.reader,
                 seq,
@@ -132,7 +143,6 @@ class OwnerPeer:
         self.retry_after = 0.0
 
     def request(self, op, keys, *, seq=0):
-        keys = full_keys(keys)
         rows = np.empty(len(keys), dtype=np.int64)
         n = native().l1_owner_rpc(
             self.endpoint,
@@ -147,25 +157,31 @@ class OwnerPeer:
         )
         return None if n < 0 else rows[:n]
 
+    def available(self):
+        return time.monotonic() >= self.retry_after
+
     def lookup(self, keys):
-        rows = self.request(1, keys[: self.pin_cap])
-        return 0 if rows is None else len(rows)
+        if not self.available():
+            return 0
+        rows = self.request(Operation.LOOKUP, keys[: self.pin_cap])
+        if rows is None:
+            self.retry_after = time.monotonic() + self.cooldown_s
+            return 0
+        return len(rows)
 
     def acquire(self, keys):
-        if time.monotonic() < self.retry_after:
+        if not self.available():
             return None
         self.seq += 1
-        rows = self.request(2, keys, seq=self.seq)
+        rows = self.request(Operation.ACQUIRE_EXACT, keys, seq=self.seq)
         if rows is None:
             self.cleanup.enqueue(self.cleanup.prepare(self, self.seq, cancel=True))
             self.retry_after = time.monotonic() + self.cooldown_s
             return None
         if len(rows) != len(keys):
-            if len(rows):
-                self.cleanup.enqueue(self.cleanup.prepare(self, self.seq))
             return None
         return rows, self.cleanup.prepare(self, self.seq)
 
     def contains(self, keys):
-        found = self.request(5, keys)
+        found = self.request(Operation.CONTAINS, keys)
         return None if found is None else found.astype(bool)

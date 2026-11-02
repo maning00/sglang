@@ -66,6 +66,7 @@ class LendPool:
         self._acquires = {}
         self._lease_requests = {}
         self._completed = Counter()
+        self._revoked = []
 
     def _unavailable(self):
         return self.writing + self.pinned
@@ -137,7 +138,7 @@ class LendPool:
 
     def commit(self, writer, records):
         with self.lock:
-            result = []
+            result, published = [], []
             for record in records:
                 page, gen, key = record[:3]
                 if not self._matches(page, gen):
@@ -161,9 +162,11 @@ class LendPool:
                     p.state, p.key = "valid", key
                     self.keys[key] = page
                     self.lru[page] = None
-                    if self.publisher and len(record) == 4 and record[3][1]:
-                        self.publisher.publish([(key, record[3][0])])
+                    if self.publisher and len(record) == 4:
+                        published.append((key, record[3]))
                     result.append(True)
+            if published:
+                self.publisher.publish(published)
             return result
 
     def abort(self, writer, records):
@@ -183,7 +186,7 @@ class LendPool:
             if seq <= self._completed[reader]:
                 return [0, []]
             records = []
-            for key in keys[:64]:
+            for key in keys:
                 page = self.keys.get(key)
                 if page is None or self.pages[page].state not in ("valid", "demoting"):
                     break
@@ -232,7 +235,7 @@ class LendPool:
                 self.lru.move_to_end(page)
             return lease
 
-    def unpin(self, reader, lease):
+    def unpin(self, reader, lease, *, report=True):
         with self.lock:
             saved = self.leases.get(lease)
             if saved is None or saved[0] != reader:
@@ -251,6 +254,13 @@ class LendPool:
                     self.pinned -= 1
                 if p.state == "retired" and not p.pins:
                     self._discard(page)
+            if report:
+                self._report_revokes()
+
+    def _report_revokes(self):
+        if self._revoked:
+            self.publisher.retire(self._revoked)
+            self._revoked.clear()
 
     def _discard(self, page):
         p = self.pages[page]
@@ -260,7 +270,7 @@ class LendPool:
         self.demoting.pop(page, None)
         if p.key:
             if self.publisher:
-                self.publisher.retire([p.key])
+                self._revoked.append(p.key)
             if self.keys.get(p.key) == page:
                 del self.keys[p.key]
             self.events.append(("EVICTED", p.writer, [self._record(page)]))
@@ -278,17 +288,18 @@ class LendPool:
                         if p.pins:
                             p.state = "retired"
                             if self.publisher:
-                                self.publisher.retire([p.key])
+                                self._revoked.append(p.key)
                             self.lru.pop(page, None)
                         else:
                             self._discard(page)
+            self._report_revokes()
 
     def expire(self):
         with self.lock:
             now = self.clock()
             for lease, (reader, _, deadline) in list(self.leases.items()):
                 if now >= deadline:
-                    self.unpin(reader, lease)
+                    self.unpin(reader, lease, report=False)
             for page, deadline in list(self.demoting.items()):
                 if now < deadline:
                     break
@@ -298,10 +309,11 @@ class LendPool:
                     if p.pins:
                         p.state = "retired"
                         if self.publisher:
-                            self.publisher.retire([p.key])
+                            self._revoked.append(p.key)
                         self.lru.pop(page, None)
                     else:
                         self._discard(page)
+            self._report_revokes()
 
     def request_demotions(self, count):
         with self.lock:
@@ -340,4 +352,5 @@ class LendPool:
                 self.free.pop(page)
                 del self.pages[page]
                 result.append(page)
+            self._report_revokes()
             return result

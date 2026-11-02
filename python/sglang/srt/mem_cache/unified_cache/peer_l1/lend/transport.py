@@ -91,7 +91,7 @@ class LendTransport:
             return ok and time.monotonic() - started < peer.lease_s / 2
         finally:
             if self.acquire:
-                peer.cleanup("RELEASE", lease)
+                peer.cleanup("UNPIN", lease)
             else:
                 peer.call("UNPIN", [lease])
 

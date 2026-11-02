@@ -1,4 +1,5 @@
 #pragma once
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -24,7 +25,8 @@ enum Operation : uint64_t {
   Release,
   Cancel,
   Contains,
-  Cleanups
+  Cleanups,
+  AcquireExact
 };
 struct Request {
   uint64_t magic = 0x4c314f574e455231ULL;
@@ -44,7 +46,10 @@ inline bool transfer_bytes(int fd, void *data, size_t size, bool send,
     if (left <= 0)
       return false;
     pollfd descriptor{fd, static_cast<short>(send ? POLLOUT : POLLIN), 0};
-    if (poll(&descriptor, 1, left) <= 0)
+    int ready = poll(&descriptor, 1, left);
+    if (ready < 0 && errno == EINTR)
+      continue;
+    if (ready <= 0)
       return false;
     auto n = send ? ::send(fd, p, size, MSG_NOSIGNAL | MSG_DONTWAIT)
                   : recv(fd, p, size, MSG_DONTWAIT);
@@ -98,8 +103,7 @@ inline int64_t rpc(const char *endpoint, Request request, const Key *keys,
   return result;
 }
 
-/// The directory remains authoritative; the lock also orders local
-/// retire and CONTAINS.
+/// The authoritative directory lock also orders local retire and CONTAINS.
 class Owner {
 public:
   Owner(void *memory, const char *endpoint, uint64_t epoch, uint64_t cap,
@@ -182,15 +186,16 @@ private:
       finish(request.reader, request.seq);
       return {};
     }
-    if (request.op == Acquire) {
+    if (request.op == Acquire || request.op == AcquireExact) {
       if (saved != grants_.end())
         return saved->second.rows;
       if (request.seq <= completed_[request.reader])
         return {};
-      for (const auto &grant : grants_) {
-        if (grant.first.first == request.reader &&
-            Clock::now() - grant.second.created >
-                std::chrono::milliseconds(lease_ms_))
+      for (auto grant = grants_.lower_bound({request.reader, 0});
+           grant != grants_.end() && grant->first.first == request.reader;
+           ++grant) {
+        if (Clock::now() - grant->second.created >
+            std::chrono::milliseconds(lease_ms_))
           return {};
       }
     }
@@ -209,9 +214,13 @@ private:
         gens.push_back(gen);
       }
     }
-    if (request.op == Acquire) {
-      // Allocate bookkeeping before pinning; a lost reply must always be
-      // cancellable.
+    if (request.op == Acquire || request.op == AcquireExact) {
+      if (request.op == AcquireExact && rows.size() != keys.size()) {
+        completed_[request.reader] =
+            std::max(completed_[request.reader], request.seq);
+        return {};
+      }
+      // Allocate before pinning so a lost reply remains cancellable.
       grants_.emplace(id, Grant{rows, Clock::now()});
       if (rows.empty() ||
           !directory_.pin(rows.data(), gens.data(), rows.size())) {
@@ -228,7 +237,7 @@ private:
     auto deadline = Clock::now() + std::chrono::milliseconds(100);
     if (!transfer_bytes(fd, &request, sizeof(request), false, deadline) ||
         request.magic != Request{}.magic || request.n > (1 << 20) ||
-        request.op < Lookup || request.op > Cleanups)
+        request.op < Lookup || request.op > AcquireExact)
       return;
     std::vector<Key> keys(request.n);
     if (!transfer_bytes(fd, keys.data(), keys.size() * sizeof(Key), false,
@@ -283,10 +292,16 @@ struct Cleanup {
 class CleanupQueue {
 public:
   explicit CleanupQueue(int timeout_ms)
-      : timeout_ms_(timeout_ms), thread_([this] { run(); }) {}
+      : timeout_ms_(timeout_ms), wake_(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
+    if (wake_ < 0)
+      throw std::runtime_error("peer L1 eventfd failed");
+    thread_ = std::thread([this] { run(); });
+  }
   ~CleanupQueue() {
     stop_.store(true);
+    wake();
     thread_.join();
+    close(wake_);
     auto *node = head_.exchange(nullptr);
     while (node) {
       auto *next = node->next;
@@ -301,10 +316,16 @@ public:
       node->next = head;
     } while (!head_.compare_exchange_weak(head, node, std::memory_order_release,
                                           std::memory_order_relaxed));
+    wake();
   }
   uint64_t pending() const { return pending_.load(); }
 
 private:
+  void wake() noexcept {
+    uint64_t one = 1;
+    while (write(wake_, &one, sizeof(one)) < 0 && errno == EINTR) {
+    }
+  }
   void run() noexcept {
     std::vector<Cleanup *> pending;
     while (!stop_.load()) {
@@ -349,12 +370,25 @@ private:
       }
       pending.erase(std::remove(pending.begin(), pending.end(), nullptr),
                     pending.end());
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      int timeout = -1;
+      for (auto *item : pending) {
+        auto left = std::max<int64_t>(
+            0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                   item->retry - Clock::now())
+                   .count());
+        timeout = timeout < 0 ? left : std::min<int64_t>(timeout, left);
+      }
+      pollfd descriptor{wake_, POLLIN, 0};
+      if (poll(&descriptor, 1, timeout) > 0) {
+        uint64_t count;
+        while (read(wake_, &count, sizeof(count)) < 0 && errno == EINTR) {
+        }
+      }
     }
     for (auto *node : pending)
       delete node;
   }
-  int timeout_ms_;
+  int timeout_ms_, wake_;
   std::atomic<bool> stop_{false};
   std::atomic<Cleanup *> head_{nullptr};
   std::atomic<uint64_t> pending_{0};

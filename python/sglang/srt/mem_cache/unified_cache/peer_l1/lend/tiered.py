@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.utils import get_device_module
 
-from ..indexer import block_hash
 from .directory import LendDirectory
 from .protocol import LendPeer
 from .transport import DemotionStaging, LendTransport
@@ -48,15 +47,13 @@ def select_pages(transfer, positions, page_size):
         transfer,
         keys=[transfer.keys[i] for i in positions],
         device_indices=indices,
-        parent_keys=[transfer.parent_keys[i] for i in positions]
-        if transfer.parent_keys is not None
-        else None,
+        first_parent=transfer.keys[positions[0] - 1]
+        if positions and positions[0]
+        else transfer.first_parent,
     )
 
 
 class TieredL2(UnifiedCacheLinker):
-    indexer_stage = 0
-
     def __init__(self, l1, lower):
         from ..composite import CompositeLayerCounter
 
@@ -64,7 +61,7 @@ class TieredL2(UnifiedCacheLinker):
         self.lower = lower
         self.indexer_stage = l1.indexer_config.stage
         self.l1 = l1
-        self._lookups = {}
+        l1.indexer_discovery = bool(self.indexer_stage)
         self.directory = self._open_directory(l1) if not self.indexer_stage else None
         rank = l1.rank
         self._load_counter = LayerWiseLoadCounter(self.num_layers)
@@ -203,8 +200,11 @@ class TieredL2(UnifiedCacheLinker):
     def discover(self, keys, *, rid=None):
         if not self.indexer_stage:
             return self.directory.query(keys)
-        query_rid, matches = self.l1.placement
-        if query_rid != rid or matches is None:
+        placement = self.l1.placements.entries.get(rid)
+        if placement is None:
+            placement = self.l1.placements.get(rid, keys)
+        matches = placement.matches
+        if matches is None:
             return [[-1, 0, 0]] * len(keys)
         candidates = [
             (rank, matches[peer.worker_id])
@@ -214,7 +214,12 @@ class TieredL2(UnifiedCacheLinker):
         return [
             [
                 next(
-                    (rank for rank, held in candidates if block_hash(key) in held), -1
+                    (
+                        rank
+                        for rank, held in candidates
+                        if placement.by_key[key] in held
+                    ),
+                    -1,
                 ),
                 0,
                 0,
@@ -224,7 +229,7 @@ class TieredL2(UnifiedCacheLinker):
 
     def release_reservation(self, rid):
         if self.indexer_stage:
-            self._lookups.pop(rid, None)
+            self.l1.placements.pop(rid)
 
     def lookup(self, rid, transfers):
         kv = next(t for t in transfers if t.name == PoolName.KV)
@@ -235,8 +240,6 @@ class TieredL2(UnifiedCacheLinker):
             if self.manager
             else [[-1, 0, 0]] * len(kv.keys)
         )
-        if self.indexer_stage:
-            self._lookups[rid] = dict(zip(kv.keys, values))
         present = [v[0] >= 0 and v[0] in self._peers for v in values]
         missing = [i for i, hit in enumerate(present) if not hit]
         if missing and self.lower:
@@ -253,13 +256,12 @@ class TieredL2(UnifiedCacheLinker):
         if rid in self._pending:
             raise RuntimeError(f"Decode lend load already queued: {rid}")
         kv = next(t for t in transfers if t.name == PoolName.KV)
-        if self.indexer_stage:
-            saved = self._lookups.pop(rid, {})
-            values = [saved.get(key, [-1, 0, 0]) for key in kv.keys]
-        else:
-            values = (
-                self.discover(kv.keys) if self.manager else [[-1, 0, 0]] * len(kv.keys)
-            )
+        values = (
+            self.discover(kv.keys, rid=rid)
+            if self.manager
+            else [[-1, 0, 0]] * len(kv.keys)
+        )
+        self.release_reservation(rid)
         lower = []
         grouped = defaultdict(list)
         for i, (rank, page, gen) in enumerate(values):
@@ -523,7 +525,7 @@ class TieredL2(UnifiedCacheLinker):
             kv.device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         ).tolist()
         remaining = list(range(len(pages)))
-        if self.indexer_stage and (not kv.indexer_eligible or kv.parent_keys is None):
+        if self.indexer_stage and not kv.indexer_eligible:
             peers = []
         else:
             peers = list(self._peers.items())
@@ -554,7 +556,7 @@ class TieredL2(UnifiedCacheLinker):
                 ):
                     commits = (
                         [
-                            r + [[kv.parent_keys[i], kv.indexer_eligible]]
+                            r + [kv.keys[i - 1] if i else kv.first_parent]
                             for r, i in zip(records, selected)
                         ]
                         if self.indexer_stage
@@ -614,7 +616,8 @@ class TieredL2(UnifiedCacheLinker):
         self._tasks.join()
         self._loads.join()
         self._pending.clear()
-        self._lookups.clear()
+        if self.indexer_stage:
+            self.l1.placements.clear()
         if self.lower:
             self.lower.reset()
         self._load_counter.reset()
