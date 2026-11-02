@@ -109,7 +109,12 @@ class L1Owner:
         copies at once at least one sees no other copy (both may write; L2 dedups).
         """
         index = np.flatnonzero(aligned >= 0)
+        started = time.monotonic()
         elsewhere = self.linker.contains_peers([keys[i] for i in index])
+        self.linker.stats["f3_contains_calls"] += 1
+        self.linker.stats["f3_contains_pages"] += len(index)
+        self.linker.stats["f3_contains_elsewhere_pages"] += int(elsewhere.sum())
+        self.linker.stats["f3_contains_ms_total"] += (time.monotonic() - started) * 1000
         last = index[~elsewhere]
         if not len(last):
             return

@@ -307,6 +307,7 @@ def composite():
 @pytest.mark.parametrize("eligible", [True, False])
 def test_l1_reserve_failure_reuses_l2_placement_and_eligibility(peer_linker, eligible):
     """Falling back to L2 must not repeat discovery or query excluded namespaces."""
+    from collections import Counter
     from types import SimpleNamespace
 
     from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -336,6 +337,7 @@ def test_l1_reserve_failure_reuses_l2_placement_and_eligibility(peer_linker, eli
     l2.layer_done_counter = _Source().layer_done_counter
     l2._peers = {0: SimpleNamespace(worker_id="lend")}
     l2._pending = {}
+    l2.stats = Counter()
     l2.lower = SimpleNamespace(page_exists=lambda _: [True, True], load=lambda *_: True)
     combined = PeerL1PlusL2Linker(l1, l2)
     transfer = PoolTransfer(

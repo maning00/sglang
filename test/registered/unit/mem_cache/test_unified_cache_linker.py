@@ -266,6 +266,7 @@ def test_match_to_load_preserves_lend_discovery(
     l2.manager, l2.page_size = object(), cache.page_size
     l2.layer_done_counter = LayerWiseLoadCounter(1)
     l2._peers, l2._pending = {0: SimpleNamespace(worker_id="lend")}, {}
+    l2.stats = Counter()
     l2.directory = SimpleNamespace(
         query=lambda keys: [[0, i, 1] for i in range(len(keys))]
     )

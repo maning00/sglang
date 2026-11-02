@@ -243,6 +243,16 @@ class TieredL2(UnifiedCacheLinker):
             else [[-1, 0, 0]] * len(kv.keys)
         )
         present = [v[0] >= 0 and v[0] in self._peers for v in values]
+        # Count discovery only at lookup, before DRAM fills the misses. Repeated
+        # matches count again; these are offered pages, not completed reads.
+        self.stats["lookup_calls"] += 1
+        self.stats["lookup_pages"] += len(kv.keys)
+        self.stats["lookup_lend_pages"] += sum(present)
+        if self.indexer_stage and self.manager and kv.indexer_eligible:
+            placement = self.l1.placements.entries.get(rid)
+            if placement is not None and placement.matches is None:
+                self.stats["lookup_discovery_unavailable_calls"] += 1
+                self.stats["lookup_discovery_unavailable_pages"] += len(kv.keys)
         missing = [i for i, hit in enumerate(present) if not hit]
         if missing and self.lower:
             # Existence probes need keys only; no device indices at lookup.
@@ -252,6 +262,7 @@ class TieredL2(UnifiedCacheLinker):
             for i, hit in zip(missing, coverage):
                 present[i] = hit
         count = next((i for i, hit in enumerate(present) if not hit), len(present))
+        self.stats["lookup_restorable_pages"] += count
         return list(range(1, count + 1))
 
     def load(self, rid, transfers):

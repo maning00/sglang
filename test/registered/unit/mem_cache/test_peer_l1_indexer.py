@@ -388,6 +388,128 @@ def test_publisher_recovers_missing_revoke_restart_and_concurrent_retire():
         server.stop(0).wait()
 
 
+def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import grpc
+
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
+
+    client = indexer.IndexerClient(indexer.IndexerConfig())
+    now = [100.0]
+    monkeypatch.setattr(indexer, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(indexer, "MAX_HASHES", 2)
+    # Also exercise the latency ring: the interval max must survive truncation.
+    from collections import deque
+
+    client._latencies_ms = deque(maxlen=3)
+    outcomes = iter(
+        [
+            (1, None),
+            (11, grpc.StatusCode.DEADLINE_EXCEEDED),
+            (5, grpc.StatusCode.UNAVAILABLE),
+            (3, None),
+            (9, None),
+        ]
+    )
+
+    class Failure(grpc.RpcError):
+        def __init__(self, status):
+            self.status = status
+
+        def code(self):
+            return self.status
+
+    def match(request, timeout):
+        assert len(request.hashes) <= 2 and timeout == 0.01
+        elapsed, status = next(outcomes)
+        now[0] += elapsed / 1000
+        if status:
+            raise Failure(status)
+        return client.pb.MatchExternalKvResponse()
+
+    client.match = match
+    try:
+        assert client.lookup([1, 2, 3]) is None  # Partial result is discarded.
+        assert client.lookup([1, 2, 3]) is None  # Cooldown makes no RPC.
+        now[0] += 1.001
+        assert client.lookup([1, 2, 3]) is None
+        now[0] += 1.001
+        assert client.lookup([1, 2, 3]) == {}
+        stats = client.stats_snapshot()
+        for status in ("ok", "timeout", "error", "cooldown_skip"):
+            assert stats[f"indexer_query_{status}"] == 1
+        assert stats["indexer_query_calls"] == 4
+        assert stats["indexer_query_hashes"] == 12
+        assert stats["indexer_query_unavailable_hashes"] == 9
+        assert stats["indexer_lookup_rpcs"] == stats["indexer_rpc_latency_count"] == 5
+        assert stats["indexer_rpc_latency_samples"] == 3
+        assert stats["indexer_rpc_ms_p50"] == pytest.approx(5)
+        assert stats["indexer_rpc_ms_p99"] == pytest.approx(9)
+        assert stats["indexer_rpc_ms_max"] == pytest.approx(11)
+        assert stats["indexer_rpc_ms_total"] == pytest.approx(29)
+        empty = client.stats_snapshot()
+        assert empty["indexer_rpc_latency_count"] == 0
+        assert empty["indexer_rpc_ms_max"] == 0
+        assert empty["indexer_query_timeout"] == 1  # Counters are cumulative.
+    finally:
+        client.close()
+
+
+def test_publisher_stats_include_failed_recovery_and_retry_gap(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.grpc import kv_indexer_pb2 as pb
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
+
+    now, fail = [100.0], [False]
+    monkeypatch.setattr(indexer, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(indexer.PlacementPublisher, "_run", lambda self: None)
+
+    def apply(request, timeout):
+        now[0] += 0.2
+        if fail[0] and request.actions[0].type == pb.ACTION_REPORT:
+            fail[0] = False
+            raise RuntimeError("lost snapshot")
+
+    client = SimpleNamespace(
+        pb=pb,
+        apply=apply,
+        on_reconnect=lambda callback: callback,
+        channel=SimpleNamespace(unsubscribe=lambda callback: None),
+    )
+    publisher = indexer.PlacementPublisher(
+        config=indexer.IndexerConfig(), worker_id="test/lend/dp0", client=client
+    )
+    try:
+        publisher.publish([(key(1), None)])
+        publisher._flush()
+        publisher._subscription()  # READY callback requests recovery.
+        fail[0] = True
+        with pytest.raises(RuntimeError, match="lost snapshot"):
+            publisher._flush()
+        now[0] += 1.0  # Retry cooldown remains part of the visibility gap.
+        assert publisher.stats_snapshot()["recovery_active_ms"] == pytest.approx(1400)
+        publisher.recover("error")
+        publisher._flush()
+        stats = publisher.stats_snapshot()
+        assert stats["recovery_started"] == 3
+        assert stats["recovery_ok"] == 2 and stats["recovery_failed"] == 1
+        assert stats["recovery_requested_reconnect"] == 1
+        assert stats["recovery_requested_error"] == 1
+        assert stats["recovery_ms_total"] == pytest.approx(1200)
+        assert stats["recovery_ms_max"] == pytest.approx(400)
+        assert stats["recovery_gap_ms_total"] == pytest.approx(2200)
+        assert stats["recovery_gap_ms_max"] == pytest.approx(1800)
+        assert stats["recovery_active_ms"] == 0
+        assert stats["report_rpcs"] == 6
+        assert stats["live_records"] == 1 and stats["pending_records"] == 0
+    finally:
+        publisher.close()
+
+
 def test_old_epoch_cleanup_does_not_touch_current_grant(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
@@ -513,6 +635,18 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
     _, grouped = l2._pending["r"]
     assert len(grouped[0]) == len(grouped[1]) == 65
     assert {record[2] for _, record in grouped[0]} == set(keys[::2])
+    assert l2.stats["lookup_calls"] == 1
+    assert l2.stats["lookup_lend_pages"] == l2.stats["lookup_pages"] == 130
+    # Reusing an unavailable placement must count every affected lookup,
+    # although only the first one asks the client (or hits its cooldown).
+    calls = []
+    l1.placements.client.lookup = lambda hashes: calls.append(hashes)
+    assert l2.lookup("unavailable", [transfer]) == []
+    assert l2.lookup("unavailable", [transfer]) == []
+    assert len(calls) == 1
+    assert l2.stats["lookup_discovery_unavailable_calls"] == 2
+    assert l2.stats["lookup_discovery_unavailable_pages"] == 260
+    assert l2.stats["lookup_lend_pages"] == 130
 
 
 def test_lend_reads_more_than_owner_pin_limit_in_chunks():
@@ -594,7 +728,10 @@ def test_cancel_keeps_submitted_grant_until_completion(owner, submitted):
     eventually(lambda: directory.pinned_refs == 0 and queue.pending == 0)
 
 
-def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
+@pytest.mark.parametrize("elsewhere", [False, True])
+def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(
+    owner, elsewhere
+):
     from collections import Counter
     from types import SimpleNamespace
 
@@ -622,7 +759,7 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
     def contains(keys):
         assert not peer.contains(full_keys([key(1), key(2)])).any()
         queries.append(keys)
-        return np.zeros(len(keys), dtype=bool)
+        return np.array([elsewhere, False], dtype=bool)
 
     cache_owner.linker = SimpleNamespace(
         publisher=None,
@@ -638,8 +775,11 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
     )
     cache_owner.consume_events()
     assert queries == [[key(1), key(2)]]
-    assert writes == [([key(1)], [3], key(0), True), ([key(2)], [4], key(1), False)]
-    assert cache_owner._writing == cache_owner._hold == {3, 4}
+    expected = [([key(1)], [3], key(0), True), ([key(2)], [4], key(1), False)]
+    assert writes == (expected[1:] if elsewhere else expected)
+    assert cache_owner._writing == cache_owner._hold == ({4} if elsewhere else {3, 4})
+    assert cache_owner.linker.stats["f3_contains_pages"] == 2
+    assert cache_owner.linker.stats["f3_contains_elsewhere_pages"] == int(elsewhere)
     assert cache_owner._metadata == {}
 
 

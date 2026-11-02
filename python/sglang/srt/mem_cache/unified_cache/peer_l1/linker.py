@@ -500,6 +500,10 @@ class PeerL1Linker(UnifiedCacheLinker):
             self._log_stats()
 
     def _log_stats(self):
+        if self.indexer:
+            # These counters are cumulative snapshots, not increments.
+            for key, value in self.indexer.stats_snapshot().items():
+                self.stats[key] = value
         logger.info(
             "peer_l1 rank=%d stats: %s deferred_tokens=%d own_pinned_refs=%d",
             self.rank,

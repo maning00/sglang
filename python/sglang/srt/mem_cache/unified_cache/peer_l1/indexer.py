@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import zlib
-from collections import OrderedDict
+from collections import Counter, OrderedDict, deque
 
 import msgspec
 import numpy as np
@@ -21,6 +21,8 @@ MAX_ACTIONS = 256
 # Bounded hints for waiting requests; authority is checked at ACQUIRE.
 PLACEMENT_CAPACITY = 128
 PLACEMENT_TTL_S = 0.1
+_STATS_LOG_SECONDS = 60.0
+_LATENCY_SAMPLES = 4096
 
 
 class Placement(msgspec.Struct):
@@ -129,32 +131,78 @@ class IndexerClient:
         )
         self._retry_after = 0.0
         self.rpc_count = 0
+        self.stats = Counter(
+            query_ok=0, query_timeout=0, query_error=0, query_cooldown_skip=0
+        )
+        # Percentiles cover the most recent samples since the last stats log;
+        # retain the whole interval's count and max even if the ring fills.
+        self._latencies_ms = deque(maxlen=_LATENCY_SAMPLES)
+        self._latency_count = 0
+        self._latency_max_ms = 0.0
 
     def lookup(self, hashes):
         import grpc
 
+        self.stats["query_calls"] += 1
+        self.stats["query_hashes"] += len(hashes)
         if time.monotonic() < self._retry_after:
+            self.stats["query_cooldown_skip"] += 1
+            self.stats["query_unavailable_hashes"] += len(hashes)
             return None
         result = {}
         try:
             for start in range(0, len(hashes), MAX_HASHES):
                 self.rpc_count += 1
-                reply = self.match(
-                    self.pb.MatchExternalKvRequest(
-                        hashes=hashes[start : start + MAX_HASHES],
-                        count_as_hit=False,
-                    ),
-                    timeout=self.config.timeout_s,
-                )
+                started = time.monotonic()
+                try:
+                    reply = self.match(
+                        self.pb.MatchExternalKvRequest(
+                            hashes=hashes[start : start + MAX_HASHES],
+                            count_as_hit=False,
+                        ),
+                        timeout=self.config.timeout_s,
+                    )
+                finally:
+                    elapsed_ms = (time.monotonic() - started) * 1000
+                    self._latencies_ms.append(elapsed_ms)
+                    self._latency_count += 1
+                    self._latency_max_ms = max(self._latency_max_ms, elapsed_ms)
+                    self.stats["rpc_ms_total"] += elapsed_ms
                 for match in reply.matches:
                     held = result.setdefault(match.worker_id, set())
                     for tier in match.hashes_by_tier:
                         if tier.tier == self.pb.TIER_HBM:
                             held.update(tier.hashes)
-        except grpc.RpcError:
+        except grpc.RpcError as exc:
+            status = (
+                "timeout"
+                if exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+                else "error"
+            )
+            self.stats[f"query_{status}"] += 1
+            self.stats["query_unavailable_hashes"] += len(hashes)
             self._retry_after = time.monotonic() + self.config.cooldown_s
             return None
+        self.stats["query_ok"] += 1
         return result
+
+    def stats_snapshot(self):
+        """Cumulative counters; bounded RPC latency window reset by the caller."""
+        values = sorted(self._latencies_ms)
+        count = len(values)
+        result = dict(self.stats)
+        result.update(
+            lookup_rpcs=self.rpc_count,
+            rpc_latency_count=self._latency_count,
+            rpc_latency_samples=count,
+            rpc_ms_p50=values[(count - 1) // 2] if count else 0.0,
+            rpc_ms_p99=values[(99 * count + 99) // 100 - 1] if count else 0.0,
+            rpc_ms_max=self._latency_max_ms,
+        )
+        self._latencies_ms.clear()
+        self._latency_count = 0
+        self._latency_max_ms = 0.0
+        return {f"indexer_{key}": value for key, value in result.items()}
 
     def on_reconnect(self, callback):
         import grpc
@@ -183,15 +231,19 @@ class PlacementPublisher:
         self._generation = 0
         self._completed_generation = -1
         self._seq = 0
-        self._subscription = self.client.on_reconnect(self.recover)
+        self.stats = Counter(recovery_started=0, recovery_ok=0, recovery_failed=0)
+        self._recovery_since = None
+        self._next_stats_log = time.monotonic() + _STATS_LOG_SECONDS
+        self._subscription = self.client.on_reconnect(lambda: self.recover("reconnect"))
         self._thread = threading.Thread(
             target=self._run, name="kv-placement", daemon=True
         )
         self._thread.start()
 
-    def recover(self):
+    def recover(self, reason="manual"):
         with self._lock:
             self._generation += 1
+            self.stats[f"recovery_requested_{reason}"] += 1
         self._wake.set()
 
     def publish(self, records):
@@ -210,15 +262,25 @@ class PlacementPublisher:
 
     def _send(self, actions):
         self._seq += 1
-        self.client.apply(
-            self.client.pb.ApplyExternalKvBatchRequest(
-                worker_id=self.worker_id,
-                seq=self._seq,
-                worker_address="",
-                actions=actions,
-            ),
-            timeout=max(1.0, self.config.timeout_s),
-        )
+        started = time.monotonic()
+        try:
+            self.client.apply(
+                self.client.pb.ApplyExternalKvBatchRequest(
+                    worker_id=self.worker_id,
+                    seq=self._seq,
+                    worker_address="",
+                    actions=actions,
+                ),
+                timeout=max(1.0, self.config.timeout_s),
+            )
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            with self._lock:
+                self.stats["report_rpcs"] += 1
+                self.stats["report_ms_total"] += elapsed_ms
+                self.stats["report_ms_max"] = max(
+                    self.stats["report_ms_max"], elapsed_ms
+                )
 
     def _flush(self):
         with self._lock:
@@ -227,14 +289,43 @@ class PlacementPublisher:
             records = list(self._records.items()) if recover else None
             pending, self._pending = self._pending, {}
         if recover:
-            self._send(
-                [
-                    self.client.pb.ExternalKvAction(
-                        type=self.client.pb.ACTION_CLEAR_ALL_AT_TIER,
-                        tier=self.client.pb.TIER_HBM,
+            started = time.monotonic()
+            with self._lock:
+                self.stats["recovery_started"] += 1
+                self.stats["recovery_records"] += len(records)
+                if self._recovery_since is None:
+                    self._recovery_since = started
+            succeeded = False
+            try:
+                self._send(
+                    [
+                        self.client.pb.ExternalKvAction(
+                            type=self.client.pb.ACTION_CLEAR_ALL_AT_TIER,
+                            tier=self.client.pb.TIER_HBM,
+                        )
+                    ]
+                )
+                for batch in report_batches(records):
+                    self._send(batch)
+                succeeded = True
+            finally:
+                now = time.monotonic()
+                elapsed_ms = (now - started) * 1000
+                with self._lock:
+                    self.stats["recovery_ok" if succeeded else "recovery_failed"] += 1
+                    self.stats["recovery_ms_total"] += elapsed_ms
+                    self.stats["recovery_ms_max"] = max(
+                        self.stats["recovery_ms_max"], elapsed_ms
                     )
-                ]
-            )
+                    if succeeded:
+                        # Upper bound on the CLEAR/snapshot visibility gap,
+                        # including failed attempts and their retry cooldown.
+                        gap_ms = (now - self._recovery_since) * 1000
+                        self.stats["recovery_gap_ms_total"] += gap_ms
+                        self.stats["recovery_gap_ms_max"] = max(
+                            self.stats["recovery_gap_ms_max"], gap_ms
+                        )
+                        self._recovery_since = None
         else:
             removed = [block_hash(k) for k, (live, _) in pending.items() if not live]
             for start in range(0, len(removed), MAX_HASHES):
@@ -248,9 +339,21 @@ class PlacementPublisher:
                     ]
                 )
             records = [(k, parent) for k, (live, parent) in pending.items() if live]
-        for batch in report_batches(records):
-            self._send(batch)
+            for batch in report_batches(records):
+                self._send(batch)
         self._completed_generation = generation
+
+    def stats_snapshot(self):
+        with self._lock:
+            result = dict(self.stats)
+            result.update(
+                live_records=len(self._records),
+                pending_records=len(self._pending),
+                recovery_active_ms=(time.monotonic() - self._recovery_since) * 1000
+                if self._recovery_since is not None
+                else 0.0,
+            )
+        return result
 
     def _run(self):
         phase = zlib.crc32(self.worker_id.encode()) / (1 << 32)
@@ -259,7 +362,7 @@ class PlacementPublisher:
             self._wake.clear()
             now = time.monotonic()
             if now >= next_recovery:
-                self.recover()
+                self.recover("periodic")
                 next_recovery = now + self.config.recovery_s
             try:
                 self._flush()
@@ -267,9 +370,18 @@ class PlacementPublisher:
                 logger.warning(
                     "KV placement report failed; resnapshotting", exc_info=True
                 )
-                self.recover()
+                self.recover("error")
                 self._stop.wait(self.config.cooldown_s)
                 continue
+            finally:
+                now = time.monotonic()
+                if now >= self._next_stats_log:
+                    self._next_stats_log = now + _STATS_LOG_SECONDS
+                    logger.info(
+                        "KV placement publisher worker=%s stats: %s",
+                        self.worker_id,
+                        self.stats_snapshot(),
+                    )
             self._wake.wait(min(1.0, max(0, next_recovery - time.monotonic())))
 
     def close(self):

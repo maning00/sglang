@@ -167,6 +167,32 @@ stage 3 onwards; lending falls back to DRAM. Namespaced requests skip Indexer,
 using local discovery and the DRAM tier. Partial peer L1 grants are released and
 remain misses; they do not introduce a different L2 stitching boundary.
 
+The 60-second stats include discovery diagnostics. Counters are cumulative;
+take per-rank window deltas before summing them:
+
+- `peer_l1`: `indexer_query_{ok,timeout,error,cooldown_skip}` count logical
+  queries; `indexer_lookup_rpcs` counts actual RPC chunks, including failures.
+  Cached placements make no query. `indexer_rpc_ms_p50/p99/max` cover RPCs
+  since the previous log, including failures. Percentiles use the most recent
+  4,096 samples; `indexer_rpc_latency_samples/count` show truncation. Max covers
+  the full interval; `indexer_rpc_ms_total` is cumulative. Do not difference
+  percentiles or average them across ranks.
+- `decode lend L2`: `lookup_lend_pages` counts pages found on connected lenders
+  before DRAM probing. `lookup_pages` and `lookup_restorable_pages` provide its
+  denominator and the eventual contiguous prefix. Repeated lookups count again.
+  `lookup_discovery_unavailable_calls/pages` include cached failed discovery.
+- `KV placement publisher worker=...`: emitted for both prefill and decode
+  owners. `recovery_started/ok/failed`, `recovery_requested_*`, and
+  `recovery_ms_total/max` describe attempts and triggers. `recovery_gap_ms_total/max`
+  bounds CLEAR-to-snapshot gaps, including failed attempts and retry cooldown;
+  `recovery_active_ms` shows an unfinished gap. These are time bounds, not lost
+  page counts. `live_records/pending_records` are gauges; `report_rpcs` and
+  `report_ms_total/max` measure publication RPCs.
+- `peer_l1`: `f3_contains_pages/elsewhere_pages` count retired pages examined
+  and pages for which F3 skips writing because another owner holds a copy.
+  `f3_contains_ms_total` measures the query cost. A failed CONTAINS still writes
+  conservatively and increments the existing `contains_failures` counter.
+
 Peer L1 never releases source pins on a control disconnect or a timer. Old
 outstanding grants stop new grants to that reader after 30 seconds, but stay
 pinned until RELEASE or whole-engine teardown. CANCEL and RELEASE are retried
