@@ -67,6 +67,27 @@ def test_pin_rollback_and_generation(tmp_path):
         directory.close()
 
 
+def test_unlinked_name_keeps_mappings_shared(tmp_path):
+    """The owner drops the name after peers map it; both mappings must stay one
+    shared table, and close must tolerate the missing name."""
+    path = tmp_path / "directory"
+    directory = L1Directory(str(path), 16, 4, create=True)
+    peer = L1Directory(str(path), 16, 4, create=False)
+    try:
+        directory.unlink()
+        assert not path.exists()
+        directory.publish([_key(1)], [3])
+        rows, gens = peer.probe(hash_words([_key(1)]))
+        assert rows.tolist() == [3]
+        assert peer.pin(rows, gens)
+        assert directory.states([3])[0].tolist() == [1]
+        peer.unpin(rows)
+        assert directory.pinned_refs == 0
+    finally:
+        peer.close()
+        directory.close()
+
+
 def test_reader_survives_retirement(tmp_path):
     path = str(tmp_path / "directory")
     directory = L1Directory(path, 16, 4, create=True)

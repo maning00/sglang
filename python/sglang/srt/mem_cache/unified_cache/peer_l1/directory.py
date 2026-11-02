@@ -179,10 +179,14 @@ class L1Directory:
     def thaw(self):
         self._native.l1_thaw(self.address)
 
+    def unlink(self):
+        """Drop the name once every peer has mapped it; mappings stay valid."""
+        if self._owner:
+            Path(self.path).unlink(missing_ok=True)
+
     def close(self):
         if self._mapping is None:
             return
         self._mapping.close()
         self._mapping = None
-        if self._owner:
-            Path(self.path).unlink(missing_ok=True)
+        self.unlink()

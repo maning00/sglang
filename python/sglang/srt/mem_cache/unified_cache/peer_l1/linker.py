@@ -157,6 +157,10 @@ class PeerL1Linker(UnifiedCacheLinker):
                 for peer, info in enumerate(self.memory.directory_infos)
                 if peer != self.rank
             }
+            # Every rank has mapped every peer directory, so a crash after this
+            # point leaves no named segment behind in /dev/shm.
+            torch.distributed.barrier(group=self.cpu_group)
+            self.directory.unlink()
             self.copier = L1Copier(
                 self.memory,
                 layers=self.pool_group.num_layers,

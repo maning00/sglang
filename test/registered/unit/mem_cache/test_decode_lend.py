@@ -122,6 +122,22 @@ def test_native_directory_conditional_removal_and_shared_mapping(tmp_path):
         first.close()
 
 
+def test_native_directory_unlinked_name_keeps_mapping_shared(tmp_path):
+    """Rank 0 drops the name after every rank maps it; puts through one mapping
+    must stay visible through the other, and close must tolerate the missing name."""
+    path = tmp_path / "lend"
+    first = LendDirectory(str(path), 17, create=True)
+    second = LendDirectory(str(path), 17)
+    try:
+        first.unlink()
+        assert not path.exists()
+        second.put(3, [[7, 1, key(1)]])
+        assert first.query([key(1)]) == [[3, 7, 1]]
+    finally:
+        second.close()
+        first.close()
+
+
 def test_native_directory_churn_preserves_colliding_and_wrapped_entries(tmp_path):
     directory = LendDirectory(str(tmp_path / "lend"), 17, create=True)
     rng = random.Random(7)

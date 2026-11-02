@@ -87,6 +87,12 @@ class TieredL2(UnifiedCacheLinker):
             torch.distributed.barrier(group=group)
         if rank != 0:
             self.directory = LendDirectory(path[0], capacity)
+        # Every rank has mapped the directory, so a crash after this point leaves
+        # no named segment behind in /dev/shm.
+        if distributed:
+            torch.distributed.barrier(group=group)
+        if rank == 0:
+            self.directory.unlink()
         self._load_counter = LayerWiseLoadCounter(self.num_layers)
         self.layer_done_counter = (
             CompositeLayerCounter(

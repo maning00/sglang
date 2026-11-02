@@ -114,8 +114,12 @@ class LendDirectory:
             self.ptr, raw.ctypes.data, values.ctypes.data, len(records)
         )
 
+    def unlink(self):
+        """Drop the name once every rank has mapped it; mappings stay valid."""
+        if self.owner:
+            self.path.unlink(missing_ok=True)
+
     def close(self):
         del self.buffer
         self.memory.close()
-        if self.owner:
-            self.path.unlink(missing_ok=True)
+        self.unlink()
