@@ -38,6 +38,9 @@ The extra-config object accepts:
 | `l2_write_timeout_s` | 60 | `last_replica` only: once a write is in flight this long, new writes are refused until it lands; the late write keeps its rows |
 | `l2_stitch` | true | `last_replica` only: UMBP continues a peer prefix (the peer's pages, then UMBP's from where they end), since UMBP lacks the pages still in some HBM |
 
+SDMA requires MoRI Anvil's `nodeForHipDevice()` and KFD-node-based `connect()`
+API, available at MoRI `794d3e17a10e0dcdc6ddb477d2b26569c607b53d`.
+
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;
 a reservation race returns a cache miss through the existing load-back flow.
@@ -143,9 +146,10 @@ The deprecated multi-peer stitching diagnostic is disabled at stages 3 and 4,
 where remote shm probes are no longer permitted.
 
 Run `kv-indexer-server` separately, using the wire protocol from SGLang upstream
-commit `2c362af4cc`. The vendored protobuf is under `sglang/srt/grpc/`; regenerate
-it with `python -m grpc_tools.protoc -I python --python_out=python
-python/sglang/srt/grpc/kv_indexer.proto`. Clients report directly by gRPC, without
+commit `2c362af4cc`. The protobuf source is `experimental/sgl-router/sgl-kv-indexer/proto/kv_indexer.proto`;
+regenerate the Python binding with `python -m grpc_tools.protoc
+-I experimental/sgl-router/sgl-kv-indexer/proto --python_out=python/sglang/srt/grpc
+experimental/sgl-router/sgl-kv-indexer/proto/kv_indexer.proto`. Clients report directly by gRPC, without
 a bridge. Worker addresses are empty so these entries do not become Router
 prefix destinations. A deployment must have a unique name and consistent hash,
 page size, model, and KV layout. Discovery returns known peers only and never
@@ -175,3 +179,7 @@ peer and lending tests. They do not establish HIP callback ordering, RDMA byte
 correctness, or end-to-end performance. Validate both copy engines, flush and
 cancellation, owner disconnect during copying, and the approved throughput,
 TTFT, hit-rate and reserve-failure budgets on matching hardware before rollout.
+
+An owner that stays dead leaves cleanup retrying until collective engine shutdown;
+individual-owner recovery remains outside this PoC. Placement hints are shared
+by peer and lending lookup, bounded to 128 request IDs and refreshed after 100 ms.

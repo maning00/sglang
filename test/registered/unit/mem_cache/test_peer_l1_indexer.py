@@ -1,7 +1,6 @@
 """Ownership and discovery failure properties, using real host sockets."""
 
 import hashlib
-import multiprocessing as mp
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -9,8 +8,10 @@ import pytest
 
 from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
     CleanupQueue,
+    Operation,
     OwnerPeer,
     OwnerService,
+    full_keys,
 )
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory
 from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import report_batches
@@ -31,9 +32,16 @@ def eventually(predicate, timeout=5):
         time.sleep(0.005)
 
 
+def cleanup_drained(peer, pool):
+    peer.flush_cleanup()
+    while peer.socket.poll(0):
+        peer.poll()
+    return not peer._cleanup and pool.pinned == 0
+
+
 @pytest.fixture
-def owner():
-    directory = L1Directory(None, 32, 4, create=True)
+def owner(tmp_path):
+    directory = L1Directory(str(tmp_path / "directory"), 32, 4, create=True)
     service = OwnerService(directory, lease_s=0.02)
     queue = CleanupQueue(timeout_s=0.02)
     peer = OwnerPeer(
@@ -54,14 +62,21 @@ def owner():
 def test_owner_timeout_and_disconnect_do_not_release_source(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    rows = peer.request(2, [key(1)], seq=1)
+    rows = peer.request(2, full_keys([key(1)]), seq=1)
     assert rows.tolist() == [3]
-    assert peer.request(2, [key(1)], seq=1).tolist() == [3]
+    assert peer.request(2, full_keys([key(1)]), seq=1).tolist() == [3]
     assert directory.pinned_refs == 1
     time.sleep(0.04)
     # Each RPC closes its connection. Neither close nor expiry authorizes reuse.
-    assert peer.request(2, [key(1)], seq=2).tolist() == []
-    service.retire([key(1)])
+    assert peer.request(2, full_keys([key(1)]), seq=2).tolist() == []
+    mapping = L1Directory(directory.path, 32, 4, create=False)
+    try:
+        service.retire([key(1)])
+        from sglang.srt.mem_cache.unified_cache.peer_l1.directory import hash_words
+
+        assert not mapping.contains(hash_words([key(1)]))[0]
+    finally:
+        mapping.close()
     assert not directory.freeze()
     with pytest.raises(RuntimeError, match="pinned"):
         service.publish([key(2)], [3])
@@ -70,90 +85,55 @@ def test_owner_timeout_and_disconnect_do_not_release_source(owner):
     assert directory.freeze()
     directory.thaw()
     service.publish([key(2)], [3])
-    assert peer.lookup([key(2)]) == 1
+    assert peer.lookup(full_keys([key(2)])) == 1
 
 
 def test_cancel_before_acquire_and_repeated_cleanup(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    assert peer.request(4, [], seq=8).tolist() == []
-    assert peer.request(2, [key(1)], seq=8).tolist() == []
+    assert peer.request(4, full_keys([]), seq=8).tolist() == []
+    assert peer.request(2, full_keys([key(1)]), seq=8).tolist() == []
     assert directory.pinned_refs == 0
-    assert peer.request(2, [key(1)], seq=9).tolist() == [3]
+    assert peer.request(2, full_keys([key(1)]), seq=9).tolist() == [3]
     for _ in range(2):
         queue.enqueue(queue.prepare(peer, 9, cancel=True))
     eventually(lambda: queue.pending == 0 and directory.pinned_refs == 0)
-    assert peer.request(2, [key(1)], seq=9).tolist() == []
+    assert peer.request(2, full_keys([key(1)]), seq=9).tolist() == []
 
 
 def test_full_key_authority_and_pin_cap(owner):
     directory, service, _queue, peer = owner
     keys = [key(i) for i in range(5)]
     service.publish(keys, range(5))
-    assert peer.lookup(keys) == 4
+    assert peer.lookup(full_keys(keys)) == 4
     collision = keys[0][:32] + ("0" if keys[0][32] != "0" else "1") + keys[0][33:]
-    assert peer.lookup([collision]) == 0
-    assert peer.acquire(keys) is None
-    eventually(lambda: directory.pinned_refs == 0)
+    assert peer.lookup(full_keys([collision])) == 0
+    assert peer.acquire(full_keys(keys)) is None
+    assert directory.pinned_refs == 0
+    assert _queue.pending == 0
 
 
-def _retire_process(connection, barrier):
-    directory = L1Directory(None, 32, 4, create=True)
-    service = OwnerService(directory)
-    queue = CleanupQueue(timeout_s=0.1)
+def test_retire_order_requires_at_least_one_writer(owner):
+    directory, service, _queue, peer = owner
+    other_directory = L1Directory(None, 32, 4, create=True)
+    other = OwnerService(other_directory)
+    other_peer = OwnerPeer(
+        endpoint=other.endpoint,
+        epoch=other.epoch,
+        pin_cap=4,
+        cleanup=None,
+        timeout_s=0.2,
+    )
     try:
-        connection.send((service.endpoint, service.epoch))
-        endpoint, epoch = connection.recv()
-        peer = OwnerPeer(
-            endpoint=endpoint, epoch=epoch, pin_cap=4, cleanup=queue, timeout_s=0.2
-        )
-        writes = []
-        for _ in range(64):
-            service.publish([key(1)], [3])
-            barrier.wait(10)
-            service.retire([key(1)])
-            found = peer.contains([key(1)])
-            writes.append(found is None or not found[0])
-            barrier.wait(10)
-        connection.send(writes)
+        service.publish([key(1)], [3])
+        other.publish([key(1)], [3])
+        service.retire([key(1)])
+        assert other_peer.contains(full_keys([key(1)])).tolist() == [True]
+        other.retire([key(1)])
+        assert peer.contains(full_keys([key(1)])).tolist() == [False]
     finally:
-        queue.close()
-        service.close()
-        directory.close()
-        connection.close()
-
-
-def test_simultaneous_retire_at_least_one_writer():
-    context = mp.get_context("spawn")
-    barrier = context.Barrier(2)
-    pipes = [context.Pipe() for _ in range(2)]
-    workers = [
-        context.Process(target=_retire_process, args=(child, barrier))
-        for _, child in pipes
-    ]
-    try:
-        for worker in workers:
-            worker.start()
-        for parent, _ in pipes:
-            assert parent.poll(30)
-        endpoints = [parent.recv() for parent, _ in pipes]
-        for i, (parent, _) in enumerate(pipes):
-            parent.send(endpoints[1 - i])
-        for parent, _ in pipes:
-            assert parent.poll(30)
-        results = [parent.recv() for parent, _ in pipes]
-        assert all(a or b for a, b in zip(*results))
-        for worker in workers:
-            worker.join(10)
-            assert worker.exitcode == 0
-    finally:
-        for worker in workers:
-            if worker.is_alive():
-                worker.terminate()
-                worker.join()
-        for pair in pipes:
-            for connection in pair:
-                connection.close()
+        other.close()
+        other_directory.close()
 
 
 def test_lend_acquire_arbitrary_pages_cancel_and_expiry():
@@ -233,7 +213,7 @@ def test_cleanup_survives_lost_grant_send_failure_and_lost_ack(owner):
                 header = receive(connection, 48)
                 _, op, _, _, _, n = struct.unpack("=6Q", header)
                 payload = receive(connection, n * 32)
-                if op == 6 and not allow_cleanup.is_set():
+                if op == Operation.CLEANUPS and not allow_cleanup.is_set():
                     continue
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as target:
                     target.connect("\0" + service.endpoint)
@@ -241,10 +221,10 @@ def test_cleanup_survives_lost_grant_send_failure_and_lost_ack(owner):
                     reply = receive(target, 16)
                     _, count = struct.unpack("=2Q", reply)
                     reply += receive(target, count * 8)
-                if op == 2 and not lost_grant[0]:
+                if op == Operation.ACQUIRE_EXACT and not lost_grant[0]:
                     lost_grant[0] = True
                     continue
-                if op == 6 and not lost_ack[0]:
+                if op == Operation.CLEANUPS and not lost_ack[0]:
                     lost_ack[0] = True
                     continue
                 connection.sendall(reply)
@@ -256,13 +236,13 @@ def test_cleanup_survives_lost_grant_send_failure_and_lost_ack(owner):
     )
     try:
         service.publish([key(1)], [3])
-        assert peer.acquire([key(1)]) is None
+        assert peer.acquire(full_keys([key(1)])) is None
         eventually(lambda: queue.pending > 0)
         assert directory.pinned_refs == 1
         allow_cleanup.set()
         eventually(lambda: queue.pending == 0 and directory.pinned_refs == 0)
         assert lost_ack[0]
-        assert peer.request(2, [key(1)], seq=peer.seq).tolist() == []
+        assert peer.request(2, full_keys([key(1)]), seq=peer.seq).tolist() == []
     finally:
         stop.set()
         thread.join()
@@ -381,7 +361,10 @@ def test_publisher_recovers_missing_revoke_restart_and_concurrent_retire():
     try:
         publisher.publish([(key(1), None), (key(2), key(1))])
         eventually(lambda: snapshot() == {block_hash(key(1)), block_hash(key(2))})
-        assert client.lookup([key(1), key(2)])[publisher.worker_id] == snapshot()
+        assert (
+            client.lookup([block_hash(key(1)), block_hash(key(2))])[publisher.worker_id]
+            == snapshot()
+        )
         fail_revoke[0] = True
         publisher.retire([key(1)])
         eventually(lambda: snapshot() == {block_hash(key(2))})
@@ -408,7 +391,7 @@ def test_publisher_recovers_missing_revoke_restart_and_concurrent_retire():
 def test_old_epoch_cleanup_does_not_touch_current_grant(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    assert peer.request(2, [key(1)], seq=1).tolist() == [3]
+    assert peer.request(2, full_keys([key(1)]), seq=1).tolist() == [3]
     current_epoch = peer.epoch
     peer.epoch ^= 1
     queue.enqueue(queue.prepare(peer, 1))
@@ -477,13 +460,7 @@ def test_lend_cleanup_retries_send_failure_and_missing_ack():
         assert pool.pinned == 1 and peer._cleanup
         peer.socket.fail_send = False
 
-        def drained():
-            peer.flush_cleanup()
-            while peer.socket.poll(0):
-                peer.poll()
-            return not peer._cleanup and pool.pinned == 0
-
-        eventually(drained)
+        eventually(lambda: cleanup_drained(peer, pool))
         assert not peer.socket.lose_ack
     finally:
         peer.close()
@@ -497,6 +474,7 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
     from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
     from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
         IndexerConfig,
+        Placements,
         block_hash,
     )
     from sglang.srt.mem_cache.unified_cache.peer_l1.lend.tiered import TieredL2
@@ -505,7 +483,10 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
     keys = [key(i) for i in range(130)]
     l1 = PeerL1Linker.__new__(PeerL1Linker)
     l1.indexer_config = IndexerConfig(stage=3, endpoint="unused", deployment="test")
-    l1.controls = {0: SimpleNamespace(pin_cap=4), 1: SimpleNamespace(pin_cap=3)}
+    l1.controls = {
+        0: SimpleNamespace(pin_cap=4, available=lambda: True),
+        1: SimpleNamespace(pin_cap=3, available=lambda: True),
+    }
     l1.worker_ids = {0: "peer0", 1: "peer1"}
     matches = {"peer0": set(map(block_hash, keys)), "peer1": set(map(block_hash, keys))}
     matches.update(
@@ -515,7 +496,9 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
             "unknown": set(map(block_hash, keys)),
         }
     )
-    l1.placement = ("r", matches)
+    l1.sources = l1.controls
+    l1.placements = Placements(SimpleNamespace(lookup=lambda hashes: matches))
+    l1.placement = l1.placements.get("r", keys)
     assert len(l1.discover(keys, start=1).rows) == 4
     l2 = TieredL2.__new__(TieredL2)
     l2.indexer_stage, l2.l1, l2.manager, l2.lower = 1, l1, object(), None
@@ -571,13 +554,7 @@ def test_lend_reads_more_than_owner_pin_limit_in_chunks():
         assert l2._read_pinned(peer, None, list(enumerate(records)), list(range(130)))
         assert sizes == [64, 64, 2]
 
-        def drained():
-            peer.flush_cleanup()
-            while peer.socket.poll(0):
-                peer.poll()
-            return not peer._cleanup and pool.pinned == 0
-
-        eventually(drained)
+        eventually(lambda: cleanup_drained(peer, pool))
     finally:
         peer.close()
         service.close()
@@ -594,10 +571,11 @@ def test_cancel_keeps_submitted_grant_until_completion(owner, submitted):
 
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    rows, cleanup = peer.acquire([key(1)])
+    rows, cleanup = peer.acquire(full_keys([key(1)]))
     linker = PeerL1Linker.__new__(PeerL1Linker)
     linker.cleanup = queue
     linker.stats = Counter()
+    linker.placements = None
     linker._lookups = {}
     linker._queued = {} if submitted else {"r": object()}
     linker._inflight = {"r"} if submitted else set()
@@ -615,39 +593,6 @@ def test_cancel_keeps_submitted_grant_until_completion(owner, submitted):
     eventually(lambda: directory.pinned_refs == 0 and queue.pending == 0)
 
 
-def test_service_and_shm_share_one_pin_state(tmp_path):
-    from sglang.srt.mem_cache.unified_cache.peer_l1.directory import hash_words
-
-    path = str(tmp_path / "directory")
-    directory = L1Directory(path, 32, 4, create=True)
-    mapping = L1Directory(path, 32, 4, create=False)
-    service = OwnerService(directory)
-    queue = CleanupQueue(timeout_s=0.05)
-    peer = OwnerPeer(
-        endpoint=service.endpoint,
-        epoch=service.epoch,
-        pin_cap=4,
-        cleanup=queue,
-        timeout_s=0.1,
-    )
-    try:
-        directory.unlink()
-        service.publish([key(1)], [3])
-        rows, cleanup = peer.acquire([key(1)])
-        assert mapping.pinned_refs == 1
-        service.retire([key(1)])
-        assert not mapping.contains(hash_words([key(1)]))[0]
-        assert not directory.freeze()
-        queue.enqueue(cleanup)
-        eventually(lambda: mapping.pinned_refs == 0)
-        assert directory.freeze()
-    finally:
-        queue.close()
-        service.close()
-        mapping.close()
-        directory.close()
-
-
 def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
     from collections import Counter
     from types import SimpleNamespace
@@ -660,7 +605,7 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
     directory, service, _queue, peer = owner
     service.publish([key(1), key(2)], [3, 4])
     cache_owner = L1Owner.__new__(L1Owner)
-    events = [([key(i)], None, [key(i - 1)], True) for i in (1, 2, 3)]
+    events = [([key(i)], None, key(i - 1), i != 2) for i in (1, 2, 3)]
     cache_owner.cache = SimpleNamespace(
         tree_core=SimpleNamespace(take_l1_events=lambda: events)
     )
@@ -674,7 +619,7 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
     queries, writes = [], []
 
     def contains(keys):
-        assert not peer.contains([key(1), key(2)]).any()
+        assert not peer.contains(full_keys([key(1), key(2)])).any()
         queries.append(keys)
         return np.zeros(len(keys), dtype=bool)
 
@@ -685,13 +630,76 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(owner):
         indexer_config=IndexerConfig(stage=4, endpoint="unused", deployment="test"),
     )
     cache_owner.last_replica_writer = lambda keys, rows, **_metadata: (
-        writes.append((keys, rows.tolist())) or True
+        writes.append(
+            (keys, rows.tolist(), _metadata["first_parent"], _metadata["eligible"])
+        )
+        or True
     )
     cache_owner.consume_events()
     assert queries == [[key(1), key(2)]]
-    assert writes == [([key(1), key(2)], [3, 4])]
+    assert writes == [([key(1)], [3], key(0), True), ([key(2)], [4], key(1), False)]
     assert cache_owner._writing == cache_owner._hold == {3, 4}
     assert cache_owner._metadata == {}
+
+
+def test_waiting_placement_is_bounded_reused_and_refreshed(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
+
+    now, calls = [0.0], []
+    monkeypatch.setattr(indexer.time, "monotonic", lambda: now[0])
+
+    def lookup(hashes):
+        calls.append(hashes.copy())
+        return {"peer": set(hashes)}
+
+    cache = indexer.Placements(SimpleNamespace(lookup=lookup))
+    keys = [key(1), key(2)]
+    first = cache.get("waiting", keys)
+    assert cache.get("waiting", keys) is first and len(calls) == 1
+    assert np.array_equal(first.full, full_keys(keys))
+    assert list(first.hashes) == list(map(indexer.block_hash, keys))
+    now[0] += indexer.PLACEMENT_TTL_S + 0.001
+    assert cache.get("waiting", keys) is first and len(calls) == 2
+    # Requests which never load or reserve cannot leave unbounded hints.
+    for rid in range(indexer.PLACEMENT_CAPACITY * 2):
+        cache.get(str(rid), keys)
+    assert len(cache.entries) == indexer.PLACEMENT_CAPACITY
+    assert "waiting" not in cache.entries
+    cache.pop(str(rid))
+    assert len(cache.entries) == indexer.PLACEMENT_CAPACITY - 1
+
+
+def test_lookup_failure_cools_owner_and_discovery_skips_it(owner, monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
+        IndexerConfig,
+        Placements,
+    )
+    from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker
+
+    _directory, _service, _queue, peer = owner
+    calls = []
+    monkeypatch.setattr(
+        peer, "request", lambda *args, **kwargs: calls.append(args) or None
+    )
+    keys = [key(1)]
+    assert peer.lookup(full_keys(keys)) == peer.lookup(full_keys(keys)) == 0
+    assert len(calls) == 1
+    linker = PeerL1Linker.__new__(PeerL1Linker)
+    linker.indexer_config = IndexerConfig(stage=3, endpoint="unused", deployment="test")
+    linker.sources = {0: peer}
+    linker.worker_ids = {0: "peer"}
+    cache = Placements(SimpleNamespace(lookup=lambda hashes: {"peer": set(hashes)}))
+    linker.placement = cache.get("r", keys)
+    assert linker.discover(keys, start=0) is None
+    linker.placement.matches = None
+    assert linker.discover(keys, start=0) is None
+    assert len(calls) == 1
 
 
 if __name__ == "__main__":

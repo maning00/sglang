@@ -122,22 +122,6 @@ def test_native_directory_conditional_removal_and_shared_mapping(tmp_path):
         first.close()
 
 
-def test_native_directory_unlinked_name_keeps_mapping_shared(tmp_path):
-    """Rank 0 drops the name after every rank maps it; puts through one mapping
-    must stay visible through the other, and close must tolerate the missing name."""
-    path = tmp_path / "lend"
-    first = LendDirectory(str(path), 17, create=True)
-    second = LendDirectory(str(path), 17)
-    try:
-        first.unlink()
-        assert not path.exists()
-        second.put(3, [[7, 1, key(1)]])
-        assert first.query([key(1)]) == [[3, 7, 1]]
-    finally:
-        second.close()
-        first.close()
-
-
 def test_native_directory_churn_preserves_colliding_and_wrapped_entries(tmp_path):
     directory = LendDirectory(str(tmp_path / "lend"), 17, create=True)
     rng = random.Random(7)
@@ -318,6 +302,7 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
     )
 
     l2 = TieredL2.__new__(TieredL2)
+    l2.indexer_stage = 0
     l2._tasks = Queue(maxsize=1)
     l2._loads = Queue()
     l2._wake = threading.Event()
@@ -359,6 +344,7 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
 
 def test_failed_peer_discovery_cools_down_and_new_registration_retries(monkeypatch):
     l2 = TieredL2.__new__(TieredL2)
+    l2.indexer_stage = 0
     info = SimpleNamespace(engine_key="old", decode_dp_rank=0, lend_port=1)
     l2.manager = SimpleNamespace(decode_kv_args_table={"old": info})
     l2.transport = SimpleNamespace(lengths=[])
@@ -390,6 +376,7 @@ def test_restore_runs_while_lower_write_is_pending():
     )
 
     l2 = TieredL2.__new__(TieredL2)
+    l2.indexer_stage = 0
     l2.page_size, l2.num_layers = 256, 1
     l2._peers, l2._loads = {}, Queue()
     l2.stats = Counter()

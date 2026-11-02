@@ -5,6 +5,7 @@ import multiprocessing as mp
 import pytest
 import torch
 import torch.distributed as dist
+
 from sglang.srt.mem_cache.unified_cache.peer_l1.debug import CollectiveGuard
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -145,7 +146,14 @@ def peer_linker(tmp_path):
     directory = L1Directory(str(tmp_path / "source"), 16, 4, create=True)
     directory.publish([_key(1), _key(2)], [3, 4])
     peer = PeerL1Linker.__new__(PeerL1Linker)
+    from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import IndexerConfig
+
+    peer.indexer_config = IndexerConfig()
+    peer.placements = None
+    peer.indexer_discovery = False
+    peer.indexer = None
     peer.peers = {1: directory}
+    peer.sources = peer.peers
     peer.stats = Counter()
     peer.min_pages = 1
     peer.pin_cap = 4
@@ -357,11 +365,12 @@ def test_composite_cleans_a_load_that_never_started(composite, source, cancel):
 def test_composite_finishes_both_sources_before_batch_verdict(composite, failed_source):
     from types import SimpleNamespace
 
+    from test_unified_cache_linker import _cache_for_wrapper
+
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
         UnifiedCacheLinkerWrapper,
     )
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from test_unified_cache_linker import _cache_for_wrapper
 
     transfers = _transfers()
     for rid, hits in (("a", 2), ("b", 0)):
@@ -476,6 +485,7 @@ def test_last_replica_completions_release_rows_in_submission_order():
     from types import SimpleNamespace
 
     import numpy as np
+
     from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
 
@@ -511,6 +521,7 @@ def test_last_replica_writes_are_bounded_while_in_flight(monkeypatch):
     from types import SimpleNamespace
 
     import numpy as np
+
     from sglang.srt.mem_cache.unified_cache.peer_l1 import composite as composite_module
 
     clock = [0.0]
@@ -545,3 +556,28 @@ def test_last_replica_writes_are_bounded_while_in_flight(monkeypatch):
     linker.num_completed_offloads()
     assert [rows.tolist() for rows in released] == [[3, 5], [7, 8]]
     assert write(["e"], np.array([9]))
+
+
+def test_stage_one_without_lending_keeps_local_discovery(peer_linker):
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+    from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
+        IndexerConfig,
+        Placements,
+    )
+
+    peer, _directory = peer_linker
+    peer.indexer_config = IndexerConfig(stage=1, endpoint="unused", deployment="test")
+    # There is deliberately no lookup method: stage 1 alone must not call it.
+    peer.indexer = SimpleNamespace(rpc_count=0)
+    peer.placements = Placements(peer.indexer)
+    assert peer.lookup(
+        "r",
+        [
+            PoolTransfer(
+                name=PoolName.KV, keys=[_key(1), _key(2)], indexer_eligible=True
+            )
+        ],
+    ) == [1, 2]
+    assert not peer.placements.entries

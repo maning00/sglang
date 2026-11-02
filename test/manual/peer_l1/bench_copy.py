@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
     CleanupQueue,
     OwnerPeer,
     OwnerService,
+    full_keys,
 )
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import L1Copier, PeerMemoryMap
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
@@ -144,9 +145,16 @@ def worker(rank, args, port):
     timings = []
     for iteration in range(args.iterations + 1):
         if control:
-            grant = control.acquire(remote_keys)
-            assert grant is not None
-            source_rows, item = grant
+            identities = full_keys(remote_keys)
+            split = max(1, count // 2)
+            grants = [
+                control.acquire(part)
+                for part in (identities[:split], identities[split:])
+                if len(part)
+            ]
+            assert all(grant is not None for grant in grants)
+            source_rows = np.concatenate([grant[0] for grant in grants])
+            item = grants[0][1]
             dist.barrier()
             # RPC connections have closed, and the lease has elapsed before any
             # device read. Neither event may release the source rows.
@@ -166,7 +174,6 @@ def worker(rank, args, port):
             directory=remote,
             reserved_rows=source_rows,
             cleanup=item,
-            cleanup_queue=cleanup,
         )
         if args.skip_copy:
             jobs = torch.stack(
@@ -192,7 +199,8 @@ def worker(rank, args, port):
             )
             failed = bool(error.item())
             if control:
-                cleanup.enqueue(item)
+                for _, item in grants:
+                    cleanup.enqueue(item)
             else:
                 remote.unpin(source_rows)
             dist.barrier()
@@ -216,7 +224,26 @@ def worker(rank, args, port):
         copier.verify = iteration == 0
         forward.synchronize()
         start.record(copier.stream)
-        batch = copier.submit([plan], forward)
+        plans = [plan]
+        if control:
+            plans, offset = [], 0
+            for grant_rows, grant_cleanup in grants:
+                stop = offset + len(grant_rows)
+                plans.append(
+                    SimpleNamespace(
+                        **{
+                            **vars(plan),
+                            "rid": f"{iteration}:{offset}",
+                            "keys": remote_keys[offset:stop],
+                            "rows": grant_rows,
+                            "reserved_rows": grant_rows,
+                            "indices": destination[offset * 256 : stop * 256],
+                            "cleanup": grant_cleanup,
+                        }
+                    )
+                )
+                offset = stop
+        batch = copier.submit(plans, forward)
         end.record(copier.stream)
         end.synchronize()
         if batch.error_cpu is not None:

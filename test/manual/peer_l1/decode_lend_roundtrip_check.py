@@ -45,6 +45,8 @@ from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
     IndexerClient,
     IndexerConfig,
     PlacementPublisher,
+    Placements,
+    block_hash,
 )
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.allocator import (
     LendablePagedAllocator,
@@ -109,7 +111,8 @@ def transfer(keys, pages):
     return PoolTransfer(
         name=PoolName.KV,
         keys=keys,
-        parent_keys=[None, *keys[:-1]],
+        first_parent=None,
+        indexer_eligible=True,
         device_indices=torch.tensor([p * PAGE + i for p in pages for i in range(PAGE)]),
     )
 
@@ -124,7 +127,7 @@ def wait_write(l2):
 
 def restore(l2, keys, pages):
     if l2.indexer_stage:
-        l2.l1.placement = ("restore", l2.l1.indexer.lookup(keys))
+        l2.l1.placements.get("restore", keys)
     assert l2.lookup("restore", [PoolTransfer(name=PoolName.KV, keys=keys)])[-1] == len(
         keys
     )
@@ -439,6 +442,7 @@ def main():
         indexer=IndexerClient(config) if args.indexer else None,
         placement=(None, None),
     )
+    l1.placements = Placements(l1.indexer) if args.indexer else None
     # 16 writes admitted; first eight pages in HBM, next eight in DRAM.
     pool = LendPool(PAGES, limit=0.25)
     pool.add_free(range(1, 9))
@@ -483,7 +487,14 @@ def main():
         assert l2.stats["write_pages"] == 8
         if args.indexer:
             deadline = time.monotonic() + 10
-            while len((l1.indexer.lookup(keys) or {}).get(worker_id, set())) != 8:
+            while (
+                len(
+                    (l1.indexer.lookup([block_hash(k) for k in keys]) or {}).get(
+                        worker_id, set()
+                    )
+                )
+                != 8
+            ):
                 assert time.monotonic() < deadline, "lending publication missing"
                 time.sleep(0.01)
         fill(original_spans, rng)  # original source slots have now been reused
@@ -501,7 +512,9 @@ def main():
             time.sleep(0.01)
         if args.indexer:
             deadline = time.monotonic() + 10
-            while (l1.indexer.lookup(keys) or {}).get(worker_id):
+            while (l1.indexer.lookup([block_hash(k) for k in keys]) or {}).get(
+                worker_id
+            ):
                 assert time.monotonic() < deadline, "demoted placement still published"
                 time.sleep(0.01)
         else:

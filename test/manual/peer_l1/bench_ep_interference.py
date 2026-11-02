@@ -89,7 +89,6 @@ def build_copy(rank, world, pages, device, inflight):
         directory=remote,
         reserved_rows=source_rows,
         cleanup=0,
-        cleanup_queue=None,
     )
     return memory, directory, remote, plan, gens
 
