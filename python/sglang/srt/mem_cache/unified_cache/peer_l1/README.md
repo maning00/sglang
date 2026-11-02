@@ -38,8 +38,9 @@ The extra-config object accepts:
 | `l2_write_timeout_s` | 60 | `last_replica` only: once a write is in flight this long, new writes are refused until it lands; the late write keeps its rows |
 | `l2_stitch` | true | `last_replica` only: UMBP continues a peer prefix (the peer's pages, then UMBP's from where they end), since UMBP lacks the pages still in some HBM |
 
-SDMA requires MoRI Anvil's `nodeForHipDevice()` and KFD-node-based `connect()`
-API, available at MoRI `794d3e17a10e0dcdc6ddb477d2b26569c607b53d`.
+SDMA detects MoRI Anvil's `nodeForHipDevice()` at compile time: MoRI #623
+(`7cba7e1975b6c77e7093b726e5b9e93cbd3c347b`) uses KFD node IDs; older
+versions keep their HIP-ordinal `connect()` / `getSdmaQueue()` API.
 
 Both verification options add work and should be disabled for performance
 measurements. A hard cap truncates the advertised prefix before admission;
@@ -183,3 +184,7 @@ TTFT, hit-rate and reserve-failure budgets on matching hardware before rollout.
 An owner that stays dead leaves cleanup retrying until collective engine shutdown;
 individual-owner recovery remains outside this PoC. Placement hints are shared
 by peer and lending lookup, bounded to 128 request IDs and refreshed after 100 ms.
+With more than 128 waiting request IDs, eviction can reduce reuse to one RPC per
+match. Stage 4 F3 splits writes by chain; the additional offloads can fill
+TieredL2's 256-task queue and count toward `write_refused_pages`. This retains
+the per-node granularity of stages 0–3; tune only after measurement.
