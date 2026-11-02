@@ -2,7 +2,7 @@ import sys
 import threading
 import unittest
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -206,6 +206,95 @@ def test_allocation_failure_releases_peer_reservation_once():
     wrapper.hit_markers["r"] = ExternalCacheHitMarker(["page"], 0)
     assert wrapper.load_back(SimpleNamespace(rid="r", last_node=0)) == (0, 0)
     linker.release_reservation.assert_called_once_with("r")
+
+
+@pytest.mark.parametrize("stage", range(5))
+@pytest.mark.parametrize(
+    "peer_pages,drop_placement,namespace",
+    [
+        pytest.param(0, False, None, id="lend-only"),
+        pytest.param(1, False, None, id="stitched"),
+        pytest.param(1, True, None, id="placement-evicted"),
+        pytest.param(0, True, "extra_key", id="lora"),
+        pytest.param(1, True, "cache_salt", id="salted"),
+    ],
+)
+def test_match_to_load_preserves_lend_discovery(
+    stage, peer_pages, drop_placement, namespace
+):
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
+    from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import Placements
+    from sglang.srt.mem_cache.unified_cache.peer_l1.lend.tiered import TieredL2
+
+    # Use the engine wrapper and real FULL transfer builder: LOOKUP and LOAD
+    # construct different transfers, unlike a direct TieredL2 round trip.
+    full = FullComponent.__new__(FullComponent)
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        page_size=2,
+        is_swa_enabled=False,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            available_size=lambda: 128, alloc=lambda count: torch.arange(count)
+        ),
+        _all_reduce_attn_groups=lambda value, op: None,
+    )
+    full.cache = cache
+    l1, lower = _FakeLinker(), _FakeLinker()
+    l1.owner = SimpleNamespace()
+    l1.stats = Counter()
+    l1.layer_done_counter = lower.layer_done_counter = LayerWiseLoadCounter(1)
+    indexer = SimpleNamespace(
+        lookup=MagicMock(side_effect=lambda hashes: {"lend": set(hashes)})
+    )
+    l1.placements = Placements(indexer)
+
+    def lookup_peer(rid, transfers):
+        (kv,) = transfers
+        if stage:
+            l1.placements.get(rid, kv.keys, eligible=kv.indexer_eligible)
+        return list(range(1, peer_pages + 1))
+
+    l1.lookup = lookup_peer
+    l1.release_reservation = lambda rid, **kwargs: None
+    lower.page_exists = lambda transfers: (
+        [namespace is not None] * len(transfers[0].keys)
+    )
+    l2 = TieredL2.__new__(TieredL2)
+    l2.indexer_stage, l2.l1, l2.lower = stage, l1, lower
+    l2.manager, l2.page_size = object(), cache.page_size
+    l2.layer_done_counter = LayerWiseLoadCounter(1)
+    l2._peers, l2._pending = {0: SimpleNamespace(worker_id="lend")}, {}
+    l2.directory = SimpleNamespace(
+        query=lambda keys: [[0, i, 1] for i in range(len(keys))]
+    )
+    backend = PeerL1PlusL2Linker(l1, l2, l2_write="last_replica")
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    req = SimpleNamespace(
+        rid="r", skip_external_cache=False, last_node=0, swa_branching_seqlen=None
+    )
+    key = RadixKey(array("q", range(6)), **({namespace: "ns"} if namespace else {}))
+    result = MatchResult(
+        device_prefix_len=0, last_device_node=0, last_host_node=0, best_match_node=0
+    )
+    assert wrapper.match(key, req, result).host_hit_length == 6
+    keys = wrapper.hit_markers[req.rid].tail_hashes
+    if drop_placement:
+        l1.placements.clear()
+    assert wrapper.load_back(req) == (6, 0)
+
+    kv, grouped = l2._pending[req.rid]
+    assert kv.keys == keys[peer_pages:]
+    assert kv.device_indices.tolist() == list(range(peer_pages * 2, 6))
+    if not stage or namespace is None:
+        assert not lower.queued_loads, "lend-only keys were incorrectly routed to UMBP"
+        assert [record[2] for _, record in grouped[0]] == keys[peer_pages:]
+    else:
+        # Namespaced requests still use DRAM; never opt them into Indexer.
+        indexer.lookup.assert_not_called()
+        assert not grouped
+        assert lower.queued_loads[req.rid][0].keys == keys[peer_pages:]
 
 
 @pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])

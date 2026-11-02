@@ -208,6 +208,7 @@ class ExternalCacheHitMarker(NamedTuple):
 
     tail_hashes: list[str]
     device_hit_len: int
+    indexer_eligible: bool = False
 
 
 class _PendingOffload(NamedTuple):
@@ -283,6 +284,7 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
+        indexer_eligible = key.extra_key is None and key.cache_salt is None
         lookup_transfers = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
@@ -290,7 +292,7 @@ class UnifiedCacheLinkerWrapper:
             )
             if transfer is None:
                 return result
-            transfer.indexer_eligible = key.extra_key is None and key.cache_salt is None
+            transfer.indexer_eligible = indexer_eligible
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
@@ -316,6 +318,7 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
+            indexer_eligible=indexer_eligible,
         )
         return result._replace(
             last_host_node=result.best_match_node,
@@ -411,6 +414,9 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                 )
                 return 0, req.last_node
+            # LOAD creates a fresh transfer; preserve the request's namespace
+            # eligibility even if its placement hint was evicted after match.
+            transfer.indexer_eligible = hit.indexer_eligible
             component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
