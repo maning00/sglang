@@ -4,6 +4,7 @@ import ctypes
 import threading
 from array import array
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.peer_l1.control import OwnerPeer, OwnerService
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import distinct_stream
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
 from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import IndexerConfig
@@ -228,7 +230,10 @@ def test_split_preserves_publications_and_eviction_retires_them(backend):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache fixtures need CUDA")
-def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_path):
+@pytest.mark.parametrize("stage", [0, 4])
+def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(
+    tmp_path, stage
+):
     """With L2 written only for last copies, an evicted page that a peer still
     publishes is freed at once, and a page no peer holds is handed to L2 and
     stays allocated until that write lands (it is read asynchronously)."""
@@ -237,14 +242,33 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
     )
     cache.tree_core.enable_external_cache_linker = True
     cache.write_through_threshold = (1 << 63) - 1
-    directory = L1Directory(str(tmp_path / "own"), 17, 4, create=True)
-    peer = L1Directory(str(tmp_path / "peer"), 17, 4, create=True)
+    directory = L1Directory(
+        None if stage else str(tmp_path / "own"), 17, 4, create=True
+    )
+    peer = L1Directory(None if stage else str(tmp_path / "peer"), 17, 4, create=True)
+    control = OwnerService(directory) if stage else None
+    peer_control = OwnerService(peer) if stage else None
+    executor = ThreadPoolExecutor(max_workers=1) if stage else None
     linker = SimpleNamespace(
         directory=directory,
-        control=None,
+        control=control,
         publisher=None,
-        indexer_config=IndexerConfig(),
-        peers={1: peer},
+        indexer_config=IndexerConfig(
+            stage=stage, endpoint="unused", deployment="f3-check"
+        ),
+        peers={} if stage else {1: peer},
+        controls={
+            1: OwnerPeer(
+                endpoint=peer_control.endpoint,
+                epoch=peer_control.epoch,
+                pin_cap=4,
+                cleanup=None,
+                timeout_s=0.2,
+            )
+        }
+        if stage
+        else {},
+        _rpc_pool=executor,
         device=allocator.device,
         check_hooks=True,
         stats=Counter(),
@@ -255,7 +279,9 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
     owner = L1Owner(cache, linker)
     linker.owner = owner
     writes = []
-    owner.last_replica_writer = lambda keys, rows: writes.append((keys, rows)) or True
+    owner.last_replica_writer = lambda keys, rows, **_metadata: (
+        writes.append((keys, rows)) or True
+    )
     cache.peer_l1 = linker
     try:
         shared, last = allocator.alloc(8), allocator.alloc(8)
@@ -273,7 +299,7 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
             if int(directory.probe(hash_words([key]))[0][0]) in shared_rows
         ]
         assert len(shared_keys) == 2
-        peer.publish(shared_keys, [1, 2])
+        (peer_control or peer).publish(shared_keys, [1, 2])
 
         cache.evict(EvictParams(num_tokens=16))
         assert len(writes) == 1
@@ -288,5 +314,9 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(tmp_pat
         assert allocator.available_size() == 64 and owner.deferred_tokens == 0
     finally:
         owner.stream.synchronize()
+        if executor:
+            executor.shutdown()
+            control.close()
+            peer_control.close()
         peer.close()
         directory.close()

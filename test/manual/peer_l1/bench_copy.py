@@ -3,6 +3,8 @@
 PYTHONPATH=python python test/manual/peer_l1/bench_copy.py --ranks 2 --pages 256
 --skip-copy is the negative control: it must fail byte verification.
 --engine sdma copies through mori anvil SDMA queues instead of the copy kernel.
+--owner-stage 3/4 exercises native grants and callback cleanup with shared/private
+owner state, including a pause beyond the test lease before any device read.
 """
 
 import argparse
@@ -10,6 +12,7 @@ import hashlib
 import json
 import socket
 import tempfile
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +24,11 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
+)
+from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
+    CleanupQueue,
+    OwnerPeer,
+    OwnerService,
 )
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import L1Copier, PeerMemoryMap
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
@@ -73,15 +81,49 @@ def worker(rank, args, port):
             )
         )
     group = DevicePoolGroup(entries, 61, 256, rank_replicated=True)
-    path = tempfile.mktemp(prefix="sglang_peer_l1_", dir="/dev/shm")
+    path = (
+        tempfile.mktemp(prefix="sglang_peer_l1_", dir="/dev/shm")
+        if args.owner_stage < 4
+        else None
+    )
     directory = L1Directory(path, rows, count, create=True)
+    owner = OwnerService(directory, lease_s=0.02) if args.owner_stage else None
+    cleanup = CleanupQueue(timeout_s=0.2) if owner else None
     local_keys = keys(rank, count)
-    directory.publish(local_keys, np.arange(1, count + 1))
+    (owner or directory).publish(local_keys, np.arange(1, count + 1))
     memory = PeerMemoryMap(
-        group, rank, args.ranks, device, dist.group.WORLD, (path, rows, count)
+        group,
+        rank,
+        args.ranks,
+        device,
+        dist.group.WORLD,
+        (
+            path,
+            rows,
+            count,
+            owner.endpoint if owner else "",
+            owner.epoch if owner else 0,
+        ),
     )
     peer = (rank + 1) % args.ranks
-    remote = L1Directory(*memory.directory_infos[peer], create=False)
+    remote = (
+        L1Directory(*memory.directory_infos[peer][:3], create=False)
+        if args.owner_stage < 4
+        else None
+    )
+    control = (
+        OwnerPeer(
+            endpoint=memory.directory_infos[peer][3],
+            epoch=memory.directory_infos[peer][4],
+            pin_cap=count,
+            cleanup=cleanup,
+            timeout_s=0.2,
+        )
+        if owner
+        else None
+    )
+    dist.barrier()
+    directory.unlink()
     copier = L1Copier(
         memory,
         layers=61,
@@ -94,13 +136,27 @@ def worker(rank, args, port):
     )
     forward = torch.cuda.current_stream()
     remote_keys = keys(peer, count)
-    source_rows, gens = remote.probe(hash_words(remote_keys))
+    if not control:
+        source_rows, gens = remote.probe(hash_words(remote_keys))
     destination = torch.arange((count + 1) * 256, (2 * count + 1) * 256, device=device)
     torch.cuda.synchronize()
     dist.barrier()
     timings = []
     for iteration in range(args.iterations + 1):
-        assert remote.pin(source_rows, gens)
+        if control:
+            grant = control.acquire(remote_keys)
+            assert grant is not None
+            source_rows, item = grant
+            dist.barrier()
+            # RPC connections have closed, and the lease has elapsed before any
+            # device read. Neither event may release the source rows.
+            time.sleep(0.04)
+            assert directory.pinned_refs == count
+            assert not directory.freeze()
+            dist.barrier()
+        else:
+            assert remote.pin(source_rows, gens)
+            item = 0
         plan = SimpleNamespace(
             rid=str(iteration),
             peer=peer,
@@ -109,8 +165,8 @@ def worker(rank, args, port):
             indices=destination,
             directory=remote,
             reserved_rows=source_rows,
-            cleanup=0,
-            cleanup_queue=None,
+            cleanup=item,
+            cleanup_queue=cleanup,
         )
         if args.skip_copy:
             jobs = torch.stack(
@@ -135,11 +191,18 @@ def worker(rank, args, port):
                 forward.cuda_stream,
             )
             failed = bool(error.item())
-            remote.unpin(source_rows)
+            if control:
+                cleanup.enqueue(item)
+            else:
+                remote.unpin(source_rows)
             dist.barrier()
             memory.peer_storages.clear()
             dist.barrier()
-            remote.close()
+            if remote:
+                remote.close()
+            if owner:
+                cleanup.close()
+                owner.close()
             directory.close()
             dist.destroy_process_group()
             assert not failed, "negative control: skipped copy detected"
@@ -174,6 +237,12 @@ def worker(rank, args, port):
                 assert torch.equal(got, expected)
         if iteration:
             timings.append(start.elapsed_time(end))
+        if cleanup:
+            deadline = time.monotonic() + 5
+            while cleanup.pending:
+                assert time.monotonic() < deadline, "source cleanup did not drain"
+                time.sleep(0.001)
+            dist.barrier()
     dist.barrier()
     assert directory.pinned_refs == 0
     amount = count * sum(width * len(layers) for _, width, layers in layouts)
@@ -186,6 +255,7 @@ def worker(rank, args, port):
                 blocks=args.blocks,
                 layer_group=args.layer_group,
                 engine=args.engine,
+                owner_stage=args.owner_stage,
                 sdma_channels=args.sdma_channels,
                 ms=ms,
                 GBps=amount / ms / 1e6,
@@ -195,7 +265,11 @@ def worker(rank, args, port):
     )
     memory.peer_storages.clear()
     dist.barrier()
-    remote.close()
+    if remote:
+        remote.close()
+    if owner:
+        cleanup.close()
+        owner.close()
     directory.close()
     dist.destroy_process_group()
 
@@ -210,6 +284,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip-copy", action="store_true")
     parser.add_argument("--engine", default="kernel", choices=["kernel", "sdma"])
     parser.add_argument("--sdma-channels", type=int, default=2)
+    parser.add_argument("--owner-stage", type=int, default=0, choices=[0, 3, 4])
     args = parser.parse_args()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
