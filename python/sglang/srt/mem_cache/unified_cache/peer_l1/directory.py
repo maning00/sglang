@@ -21,8 +21,17 @@ import numpy as np
 @lru_cache(maxsize=1)
 def _native():
     source = Path(__file__).resolve().parents[4] / "kernels/jit/csrc/peer_l1"
+    owner = Path(__file__).resolve().parent / "native"
     key = hashlib.sha256(
-        (source / "directory.cpp").read_bytes() + (source / "directory.h").read_bytes()
+        b"".join(
+            path.read_bytes()
+            for path in (
+                source / "directory.cpp",
+                source / "directory.h",
+                owner / "owner.cpp",
+                owner / "owner.h",
+            )
+        )
     ).hexdigest()[:20]
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     build = cache / "sglang/peer_l1" / key
@@ -40,7 +49,11 @@ def _native():
                         "-O3",
                         "-shared",
                         "-fPIC",
+                        "-pthread",
+                        "-I",
+                        str(source),
                         str(source / "directory.cpp"),
+                        str(owner / "owner.cpp"),
                         "-o",
                         str(temporary),
                     ],
@@ -94,6 +107,15 @@ class L1Directory:
         self._owner = create
         self._retired = 0
         length = self._native.l1_bytes(rows)
+        if path is None:
+            if not create:
+                raise ValueError("Private peer L1 directories must be owned locally")
+            self._mapping = mmap.mmap(
+                -1, length, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+            )
+            self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
+            self._native.l1_init(self.address, rows, pin_cap)
+            return
         fd = os.open(path, os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0), 0o600)
         try:
             if create:
@@ -181,7 +203,7 @@ class L1Directory:
 
     def unlink(self):
         """Drop the name once every peer has mapped it; mappings stay valid."""
-        if self._owner:
+        if self._owner and self.path is not None:
             Path(self.path).unlink(missing_ok=True)
 
     def close(self):
