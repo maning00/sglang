@@ -1,5 +1,6 @@
 #pragma once
-#include "socket.h"
+#include "rpc.h"
+#include "tcp.h"
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 
@@ -17,85 +18,6 @@
 #include <vector>
 
 namespace sglang::peer_l1 {
-using Clock = std::chrono::steady_clock;
-using Key = std::array<uint64_t, 4>;
-enum Operation : uint64_t {
-  Lookup = 1,
-  Release = 3,
-  Cancel,
-  Contains,
-  Cleanups,
-  AcquireExact
-};
-struct Request {
-  uint64_t magic = 0x4c314f574e455231ULL;
-  uint64_t op, epoch, reader, seq, n;
-};
-struct Reply {
-  uint64_t epoch, n;
-};
-
-inline bool transfer_bytes(int fd, void *data, size_t size, bool send,
-                           Clock::time_point deadline) {
-  auto *p = static_cast<char *>(data);
-  while (size) {
-    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline - Clock::now())
-                    .count();
-    if (left <= 0)
-      return false;
-    pollfd descriptor{fd, static_cast<short>(send ? POLLOUT : POLLIN), 0};
-    int ready = poll(&descriptor, 1, left);
-    if (ready < 0 && errno == EINTR)
-      continue;
-    if (ready <= 0)
-      return false;
-    auto n = send ? ::send(fd, p, size, MSG_NOSIGNAL | MSG_DONTWAIT)
-                  : recv(fd, p, size, MSG_DONTWAIT);
-    if (n < 0 && (errno == EINTR || errno == EAGAIN))
-      continue;
-    if (n <= 0)
-      return false;
-    p += n;
-    size -= n;
-  }
-  return true;
-}
-
-/// A bounded owner RPC. -1 is unknown, -2 is a different owner incarnation.
-inline int64_t rpc(const char *endpoint, Request request, const Key *keys,
-                   int64_t *out, int timeout_ms) {
-  SocketAddress addr;
-  try {
-    addr = address(endpoint);
-  } catch (const std::exception &) {
-    return -1;
-  }
-  int fd = socket(addr.storage.ss_family,
-                  SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-  if (fd < 0)
-    return -1;
-  auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-  int64_t result = -1;
-  if (no_delay(fd, addr.storage.ss_family) &&
-      (connect(fd, addr.data(), addr.length) == 0 || errno == EINPROGRESS)) {
-    Reply reply{};
-    if (transfer_bytes(fd, &request, sizeof(request), true, deadline) &&
-        transfer_bytes(fd, const_cast<Key *>(keys), request.n * sizeof(Key),
-                       true, deadline) &&
-        transfer_bytes(fd, &reply, sizeof(reply), false, deadline)) {
-      if (reply.epoch != request.epoch)
-        result = -2;
-      else if (reply.n <= request.n &&
-               transfer_bytes(fd, out, reply.n * sizeof(int64_t), false,
-                              deadline))
-        result = reply.n;
-    }
-  }
-  close(fd);
-  return result;
-}
-
 /// The authoritative directory lock also orders local retire and CONTAINS.
 class Owner {
 public:
@@ -106,6 +28,11 @@ public:
         full_keys_(row_count_) {
     auto addr = address(endpoint);
     family_ = addr.storage.ss_family;
+    if (family_ != AF_UNIX) {
+      listen_tcp(endpoint);
+      endpoint_ = tcp_->endpoint();
+      return;
+    }
     fd_ = socket(family_, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd_ < 0)
       throw std::runtime_error("peer L1 socket failed");
@@ -125,10 +52,24 @@ public:
     }
   }
   const std::string &endpoint() const { return endpoint_; }
+  const std::string &listen_tcp(const char *endpoint) {
+    if (tcp_)
+      throw std::runtime_error("peer L1 TCP listener already started");
+    tcp_ = std::make_unique<TcpServer>(
+        endpoint, epoch_,
+        [this](const Request &request, const std::vector<Key> &keys) {
+          return dispatch(request, keys);
+        });
+    return tcp_->endpoint();
+  }
+  const std::string &tcp_endpoint() const { return tcp_->endpoint(); }
   ~Owner() {
+    tcp_.reset();
     stop_.store(true);
-    thread_.join();
-    close(fd_);
+    if (thread_.joinable())
+      thread_.join();
+    if (fd_ >= 0)
+      close(fd_);
     // Only engine teardown may destroy outstanding pins without RELEASE.
   }
   void publish(const Key *keys, const int64_t *rows, size_t n) {
@@ -273,7 +214,8 @@ private:
   }
   Directory directory_;
   uint64_t epoch_, cap_, row_count_, retired_ = 0;
-  int lease_ms_, fd_, family_;
+  int lease_ms_, fd_ = -1, family_;
+  std::unique_ptr<TcpServer> tcp_;
   std::string endpoint_;
   std::atomic<bool> stop_{false};
   std::thread thread_;

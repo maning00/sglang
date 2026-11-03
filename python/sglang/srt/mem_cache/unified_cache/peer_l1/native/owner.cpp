@@ -28,6 +28,15 @@ int64_t l1_owner_start(void *memory, const char *endpoint, uint64_t epoch,
 const char *l1_owner_endpoint(void *owner) {
   return static_cast<sglang::peer_l1::Owner *>(owner)->endpoint().c_str();
 }
+int64_t l1_owner_listen_tcp(void *owner, const char *endpoint) {
+  return checked([&] {
+    static_cast<sglang::peer_l1::Owner *>(owner)->listen_tcp(endpoint);
+    return int64_t(0);
+  });
+}
+const char *l1_owner_tcp_endpoint(void *owner) {
+  return static_cast<sglang::peer_l1::Owner *>(owner)->tcp_endpoint().c_str();
+}
 int64_t l1_owner_stop(void *owner) {
   delete static_cast<sglang::peer_l1::Owner *>(owner);
   return 0;

@@ -14,7 +14,7 @@ import numpy as np
 from .directory import _native
 
 
-# Keep aligned with native/owner.h::Operation.
+# Keep aligned with native/wire.h::Operation.
 class Operation(IntEnum):
     LOOKUP = 1
     RELEASE = 3
@@ -32,6 +32,7 @@ def native():
     signatures = {
         "owner_start": [ptr, string, u64, u64, integer],
         "owner_stop": [ptr],
+        "owner_listen_tcp": [ptr, string],
         "owner_publish": [ptr, ptr, ptr, size],
         "owner_retire": [ptr, ptr, ptr, size],
         "owner_rpc": [string, u64, u64, u64, u64, ptr, ptr, size, integer],
@@ -47,6 +48,8 @@ def native():
         function.restype = ctypes.c_int64
     lib.l1_owner_endpoint.argtypes = [ptr]
     lib.l1_owner_endpoint.restype = ctypes.c_char_p
+    lib.l1_owner_tcp_endpoint.argtypes = [ptr]
+    lib.l1_owner_tcp_endpoint.restype = ctypes.c_char_p
     lib.l1_owner_error.restype = ctypes.c_char_p
     lib.l1_cleanup_enqueue.restype = None
     return lib
@@ -81,6 +84,10 @@ class OwnerService:
         )
 
         self.endpoint = native().l1_owner_endpoint(self.address).decode()
+
+    def listen_tcp(self, endpoint):
+        checked(native().l1_owner_listen_tcp(self.address, endpoint.encode()))
+        return native().l1_owner_tcp_endpoint(self.address).decode()
 
     def publish(self, keys, rows):
         keys, rows = full_keys(keys), np.ascontiguousarray(rows, dtype=np.int64)

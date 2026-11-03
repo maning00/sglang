@@ -84,6 +84,9 @@ def worker(rank, args, port):
     group = DevicePoolGroup(entries, 61, 256, rank_replicated=True)
     directory = L1Directory(rows, count)
     owner = OwnerService(directory, lease_s=0.02)
+    control_endpoint = (
+        owner.listen_tcp("tcp://127.0.0.1:0") if args.tcp else owner.endpoint
+    )
     cleanup = CleanupQueue(timeout_s=0.2)
     local_keys = keys(rank, count)
     owner.publish(local_keys, np.arange(1, count + 1))
@@ -93,7 +96,7 @@ def worker(rank, args, port):
         args.ranks,
         device,
         dist.group.WORLD,
-        (owner.endpoint, owner.epoch),
+        (control_endpoint, owner.epoch),
     )
     peer = (rank + 1) % args.ranks
     control = OwnerPeer(
@@ -264,6 +267,11 @@ def worker(rank, args, port):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--tcp",
+        action="store_true",
+        help="Test TCP control with the same IPC data path",
+    )
     parser.add_argument("--ranks", type=int, default=2)
     parser.add_argument("--pages", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=32)

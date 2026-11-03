@@ -256,7 +256,11 @@ Native owners accept abstract Unix endpoints (bare names or `unix:name`) and
 `tcp://IP:port` (`tcp://[IPv6]:port` for IPv6). A zero TCP port binds an ephemeral
 port, returned by `OwnerService.endpoint`. Endpoints use numeric IPs so DNS cannot
 block a bounded owner RPC. TCP uses the same frames and acknowledged cleanup as
-Unix, with TCP_NODELAY on both ends. Each RPC still opens one connection.
+Unix, with TCP_NODELAY on both ends. TCP reuses one connection per reader thread and endpoint, discarding it on errors
+or an epoch mismatch. Unix retains one connection per RPC. TCP uses a separate
+nonblocking service loop with bounded per-connection work; an incomplete frame or
+blocked reply cannot hold up other sockets. Both listeners share the owner lock.
+`OwnerService.listen_tcp()` can add a TCP listener to an existing Unix owner.
 Production same-host sessions continue to use Unix; TCP forcing is test-only.
 
 ```bash
@@ -265,7 +269,7 @@ PYTHONPATH=python python test/manual/peer_l1/bench_owner_rpc.py --readers 1
 PYTHONPATH=python python test/manual/peer_l1/bench_owner_rpc.py --readers 7
 ```
 
-The benchmark reports round-trip latency including connection setup, and aggregate
+The benchmark reports round-trip latency (TCP setup is amortized), and aggregate
 RPC/s for repeated ACQUIRE_EXACT / RELEASE / LOOKUP / CONTAINS cycles. RELEASE
 is measured through its acknowledgement, not just cleanup-queue insertion. It is
 a loopback control-plane measurement, not an inference or RDMA throughput result.

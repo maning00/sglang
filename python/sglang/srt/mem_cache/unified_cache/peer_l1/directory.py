@@ -27,6 +27,9 @@ def _native():
                 owner / "owner.cpp",
                 owner / "owner.h",
                 owner / "socket.h",
+                owner / "wire.h",
+                owner / "rpc.h",
+                owner / "tcp.h",
             )
         )
     ).hexdigest()[:20]

@@ -1,4 +1,4 @@
-"""Owner RPC round trips, including connection setup, with separate reader processes."""
+"""Owner RPC round trips with separate readers; TCP reuses each reader connection."""
 
 import argparse
 import hashlib
