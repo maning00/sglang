@@ -169,7 +169,7 @@ def main():
         ready = [pipe.recv() for pipe in pipes]
         assert ready[0] == ready[1] and ready[2] == ready[3]
 
-        def connect(desc):
+        def connect(desc, previous=None):
             peer = OwnerPeer(
                 endpoint=desc.control_endpoints[0],
                 epoch=desc.epoch,

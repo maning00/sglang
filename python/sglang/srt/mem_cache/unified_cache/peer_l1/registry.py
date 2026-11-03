@@ -23,6 +23,7 @@ class DomainConfig(msgspec.Struct, frozen=True, kw_only=True):
     restart_group: str = ""
     l2_domain: str = ""
     min_gain_pages: int = 1
+    read_timeout_s: float = 1.0
 
     def __post_init__(self):
         if self.enabled and not (
@@ -35,6 +36,8 @@ class DomainConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("invalid peer domain configuration")
         if self.seeds and not self.enabled:
             raise ValueError("peer domain seeds require enabled=true")
+        if not 0 < self.read_timeout_s < float("inf"):
+            raise ValueError("peer RDMA read_timeout_s must be finite and positive")
 
 
 class Topology(msgspec.Struct, frozen=True):
@@ -149,6 +152,7 @@ class Resolver:
         self.snapshot = {}
         self._wake, self._stop = threading.Event(), threading.Event()
         self._invalid = set()
+        self._manifests = {}
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="peer-resolver", daemon=True
@@ -176,28 +180,7 @@ class Resolver:
     def _run(self):
         previous, delay = {}, 1.0
         while not self._stop.is_set():
-            candidates, conflicts, failed = {}, set(), False
-            for seed in self.seeds:
-                if self._stop.is_set():
-                    return
-                try:
-                    manifest = self._read(seed)
-                    if manifest.instance_id == self.instance_id:
-                        continue
-                    for owner in manifest.owners:
-                        if owner.kv_compatibility_id != self.compatibility_id:
-                            continue
-                        if (
-                            owner.worker_id in candidates
-                            and candidates[owner.worker_id] != owner
-                        ):
-                            conflicts.add(owner.worker_id)
-                        candidates[owner.worker_id] = owner
-                except Exception:
-                    failed = True
-                    logger.debug(
-                        "Peer manifest refresh failed for %s", seed, exc_info=True
-                    )
+            candidates, conflicts, failed = self._candidates()
             with self._lock:
                 invalid, self._invalid = self._invalid, set()
             resolved = {}
@@ -207,13 +190,12 @@ class Resolver:
                 if worker in conflicts:
                     continue
                 old = previous.get(worker)
+                prior = old[1] if old is not None and old[0] == descriptor else None
                 try:
                     value = (
-                        old[1]
-                        if old is not None
-                        and old[0] == descriptor
-                        and worker not in invalid
-                        else self.connect(descriptor)
+                        prior
+                        if prior is not None and worker not in invalid
+                        else self.connect(descriptor, prior)
                     )
                     if value is not None:
                         resolved[worker] = (descriptor, value)
@@ -235,6 +217,40 @@ class Resolver:
             while not self._stop.is_set() and time.monotonic() < deadline:
                 self._wake.wait(max(0, deadline - time.monotonic()))
                 self._wake.clear()
+
+    def _candidates(self):
+        current, failed_seeds = {}, []
+        for seed in self.seeds:
+            if self._stop.is_set():
+                break
+            try:
+                current[seed] = self._read(seed)
+                self._manifests[seed] = current[seed]
+            except Exception:
+                failed_seeds.append(seed)
+                logger.debug("Peer manifest refresh failed for %s", seed, exc_info=True)
+        authoritative = {m.instance_id for m in current.values()}
+        for seed in failed_seeds:
+            old = self._manifests.get(seed)
+            if old is not None:
+                if old.instance_id in authoritative:
+                    self._manifests.pop(seed)
+                else:
+                    current[seed] = old
+        candidates, conflicts = {}, set()
+        for manifest in current.values():
+            if manifest.instance_id == self.instance_id:
+                continue
+            for owner in manifest.owners:
+                if owner.kv_compatibility_id != self.compatibility_id:
+                    continue
+                if (
+                    owner.worker_id in candidates
+                    and candidates[owner.worker_id] != owner
+                ):
+                    conflicts.add(owner.worker_id)
+                candidates[owner.worker_id] = owner
+        return candidates, conflicts, bool(failed_seeds)
 
     def close(self):
         self._stop.set()

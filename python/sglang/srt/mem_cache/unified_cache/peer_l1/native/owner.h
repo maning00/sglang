@@ -278,6 +278,7 @@ struct Cleanup {
   Cleanup *next = nullptr;
   Clock::time_point retry{};
   int delay_ms = 1;
+  Clock::time_point expires = Clock::time_point::max();
 };
 
 /// Host callbacks only publish preallocated nodes; the sender owns retries and
@@ -330,6 +331,13 @@ private:
       }
       for (size_t i = 0; i < pending.size(); ++i) {
         auto *first = pending[i];
+        if (first && first->expires != Clock::time_point::max() &&
+            Clock::now() >= first->expires) {
+          delete first;
+          pending[i] = nullptr;
+          pending_.fetch_sub(1);
+          continue;
+        }
         if (!first || Clock::now() < first->retry)
           continue;
         std::vector<size_t> positions;
@@ -367,7 +375,7 @@ private:
       for (auto *item : pending) {
         auto left = std::max<int64_t>(
             0, std::chrono::duration_cast<std::chrono::milliseconds>(
-                   item->retry - Clock::now())
+                   std::min(item->retry, item->expires) - Clock::now())
                    .count());
         timeout = timeout < 0 ? left : std::min<int64_t>(timeout, left);
       }

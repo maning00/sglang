@@ -345,6 +345,29 @@ session cannot authorize or submit new reads, while an in-flight read keeps its
 original epoch and registration. Failed posted reads use the same quarantine as
 lending and fail only the affected requests after forward.
 
+An ACQUIRE miss does not invalidate a session. Transport/epoch errors request
+an owner HELLO recheck; an unchanged descriptor with a successful HELLO retains
+the session. A failed seed fetch retains its last manifest. A successful newer
+manifest, including removal, takes precedence over stale copies from other seeds.
+Retirement is not itself a transport failure and does not trigger another refresh.
+
+`domain.read_timeout_s` bounds each RDMA load batch's status-wait budget after
+GPU readiness (default 1 second), additionally limited by each grant's remaining
+half-lease, which still includes ACQUIRE and queue time.
+This failure guard avoids waiting 15 seconds for a stalled read; it is not a
+cross-machine performance tuning result. It cannot preempt a native submission
+call or a GPU readiness wait. Completed but late reads fail logically and do not
+quarantine memory. TCP cleanups use a separate sender from Unix; finite-lease
+cleanup entries stop retrying after one lease from creation, while Unix grants
+keep reliable unbounded cleanup. Dropping cleanup work does not reclaim a page:
+the owner independently enforces its grant's lease, including a late ACQUIRE.
+
+Owner TCP and MoRI addresses use the same local-IP detection as PD, with
+`domain.listen_host` as an explicit override. HELLO uses a 1-second timeout,
+separate from the request-path RPC timeout. The exact GET `/peer_l1/owners` is
+public even with API keys, like health discovery; it exposes only descriptors,
+not the private RDMA registration returned by the native owner handshake.
+
 Sources are ordered local, fabric, RDMA. A farther source must add at least
 `domain.min_gain_pages` (default 1) beyond an existing nearer hit; this is a
 functional default, not a cross-machine performance tuning result. F3 CONTAINS

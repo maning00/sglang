@@ -54,9 +54,12 @@ def test_resolver_checks_complete_manifest_against_authoritative_hello():
     manifest = OwnerManifest(deployment="test", instance_id="p", owners=(desc,))
     state = [None]
     calls = []
+    fetches = []
+    retired = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            fetches.append(state[0])
             self.send_response(503 if state[0] is None else 200)
             self.end_headers()
             if state[0] is not None:
@@ -69,7 +72,7 @@ def test_resolver_checks_complete_manifest_against_authoritative_hello():
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
 
-    def connect(d):
+    def connect(d, previous=None):
         calls.append(d)
         peer = OwnerPeer(
             endpoint=d.control_endpoints[0],
@@ -78,7 +81,8 @@ def test_resolver_checks_complete_manifest_against_authoritative_hello():
             cleanup=None,
             timeout_s=0.05,
         )
-        return peer.hello(d)
+        hello = peer.hello(d)
+        return previous if hello is not None and previous is not None else hello
 
     resolver = Resolver(
         seeds=[f"http://127.0.0.1:{server.server_port}"],
@@ -86,6 +90,7 @@ def test_resolver_checks_complete_manifest_against_authoritative_hello():
         instance_id="reader",
         compatibility_id="weights-v1",
         connect=connect,
+        retire=retired.append,
     )
     try:
         assert not resolver.snapshot
@@ -93,6 +98,16 @@ def test_resolver_checks_complete_manifest_against_authoritative_hello():
         resolver.refresh()
         eventually(lambda: desc.worker_id in resolver.snapshot)
         assert resolver.snapshot[desc.worker_id][1].data == b"private registration"
+        original = resolver.snapshot[desc.worker_id][1]
+        state[0] = None
+        count = len(fetches)
+        eventually(lambda: len(fetches) >= count + 2)
+        assert resolver.snapshot[desc.worker_id][1] is original and not retired
+        state[0] = msgspec.json.encode(manifest)
+        count = len(calls)
+        resolver.refresh(desc.worker_id)
+        eventually(lambda: len(calls) > count)
+        assert resolver.snapshot[desc.worker_id][1] is original and not retired
         # The HTTP record can be newer than the owner endpoint, or outright stale.
         bad = msgspec.structs.replace(desc, epoch=desc.epoch ^ 1)
         state[0] = msgspec.json.encode(msgspec.structs.replace(manifest, owners=(bad,)))
@@ -155,9 +170,14 @@ def test_frontend_snapshot_preserves_all_ranks_and_multi_tokenizer_payload(monke
             shm.unlink()
         app = FastAPI()
         app.include_router(router)
+        from sglang.srt.utils.auth import add_api_key_middleware
+
+        add_api_key_middleware(app, api_key="secret", admin_api_key="admin")
         app.dependency_overrides[owner_snapshot] = lambda: received["peer_l1_owners"]
         with TestClient(app) as client:
             assert client.get("/peer_l1/owners").content == blob
+            assert client.post("/peer_l1/owners").status_code == 401
+            assert client.get("/peer_l1/owners/private").status_code == 401
             received["peer_l1_owners"] = None
             assert client.get("/peer_l1/owners").status_code == 503
         with pytest.raises(ValueError):
@@ -171,6 +191,29 @@ def test_cross_instance_configuration_requires_explicit_identity():
     assert not DomainConfig().instance_id
     with pytest.raises(ValueError):
         DomainConfig(enabled=True, seeds=("http://peer",), kv_compatibility_id="w")
+
+
+def test_successful_removal_is_not_revived_by_a_failed_duplicate_seed():
+    from types import SimpleNamespace
+
+    desc = descriptor(SimpleNamespace(epoch=1, endpoint="tcp://127.0.0.1:1"))
+    manifest = OwnerManifest(deployment="test", instance_id="p", owners=(desc,))
+    responses = {"a": manifest, "b": manifest}
+
+    def read(seed):
+        if responses[seed] is None:
+            raise TimeoutError("seed unavailable")
+        return responses[seed]
+
+    resolver = Resolver.__new__(Resolver)
+    resolver.seeds, resolver.instance_id = ("a", "b"), "reader"
+    resolver.compatibility_id = "weights-v1"
+    resolver._manifests, resolver._stop, resolver._read = {}, threading.Event(), read
+    assert desc.worker_id in resolver._candidates()[0]
+    responses.update(a=msgspec.structs.replace(manifest, owners=()), b=None)
+    assert not resolver._candidates()[0]
+    responses["a"] = None
+    assert not resolver._candidates()[0]
 
 
 if __name__ == "__main__":

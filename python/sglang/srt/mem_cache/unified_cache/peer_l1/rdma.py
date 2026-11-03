@@ -49,11 +49,14 @@ class ReadBatch(msgspec.Struct):
 
 
 class RdmaReadMover:
-    def __init__(self, *, memory, host, quarantine, stats, on_failure=None):
+    def __init__(
+        self, *, memory, host, quarantine, stats, on_failure=None, read_timeout_s=1.0
+    ):
         from mori.io import BackendType, IOEngine, IOEngineConfig, MemoryLocationType
 
         self.memory, self.quarantine, self.stats = memory, quarantine, stats
         self.on_failure = on_failure
+        self.read_timeout_s = read_timeout_s
         self.engine = IOEngine(
             "peer-l1-" + uuid.uuid4().hex, IOEngineConfig(host=host, port=0)
         )
@@ -106,11 +109,15 @@ class RdmaReadMover:
             )
         return self.remotes[engine.key]
 
-    def read(self, *, remote, grant, targets):
-        deadline = (
+    def read(self, *, remote, grant, targets, deadline=None):
+        lease_deadline = (
             float("inf")
             if grant.lease_s is None
             else grant.acquired_before + grant.lease_s / 2
+        )
+        deadline = min(
+            lease_deadline,
+            time.monotonic() + self.read_timeout_s if deadline is None else deadline,
         )
         if time.monotonic() >= deadline:
             return False
@@ -124,15 +131,12 @@ class RdmaReadMover:
 
         def wait(statuses):
             for status in statuses:
-                if deadline == float("inf"):
-                    status.Wait()
-                else:
-                    status.WaitFor(max(0, int((deadline - time.monotonic()) * 1000)))
+                status.WaitFor(max(0, int((deadline - time.monotonic()) * 1000)))
                 if not status.Succeeded():
                     return False
-            return time.monotonic() < deadline
+            return True
 
-        return execute(
+        execute(
             submission,
             local_offsets=local_offsets,
             remote_offsets=remote_offsets,
@@ -140,6 +144,7 @@ class RdmaReadMover:
             write=False,
             wait=wait,
         )
+        return time.monotonic() < deadline
 
     def submit(self, plans, forward_stream):
         schedule = torch.cuda.current_stream()
@@ -164,6 +169,7 @@ class RdmaReadMover:
             with torch.cuda.stream(self.stream):
                 for event in ready:
                     event.synchronize()
+                deadline = time.monotonic() + self.read_timeout_s
                 for plan in plans:
                     try:
                         targets = (
@@ -181,6 +187,7 @@ class RdmaReadMover:
                                 remote=plan.session.mapping,
                                 grant=grant,
                                 targets=targets[begin:end],
+                                deadline=deadline,
                             ):
                                 batch.failed.add(plan.rid)
                                 break
@@ -195,6 +202,8 @@ class RdmaReadMover:
                             plan.rid,
                             added,
                         )
+                        if self.on_failure is not None:
+                            self.on_failure(plan.session)
                     except BaseException:
                         batch.failed.add(plan.rid)
                         logger.exception("Peer RDMA read failed before submission")
@@ -208,9 +217,6 @@ class RdmaReadMover:
             for plan in plans:
                 if plan.rid not in released:
                     plan.session.owner.release(plan.grant)
-            for plan in plans:
-                if plan.rid in batch.failed and self.on_failure is not None:
-                    self.on_failure(plan.session)
             self.stats["rdma_failed_requests"] += len(batch.failed)
             for layer in range(self.counter.num_layers):
                 self.counter.complete(batch.index, layer)

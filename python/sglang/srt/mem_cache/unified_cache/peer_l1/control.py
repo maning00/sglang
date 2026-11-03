@@ -42,7 +42,7 @@ def native():
         "cleanup_start": [integer],
         "cleanup_stop": [ptr],
         "cleanup_pending": [ptr],
-        "cleanup_create": [ptr, string, u64, u64, u64, u64],
+        "cleanup_create": [ptr, string, u64, u64, u64, u64, u64],
         "cleanup_enqueue": [ptr],
     }
     for name, args in signatures.items():
@@ -140,6 +140,7 @@ class CleanupQueue:
                 peer.epoch,
                 peer.reader,
                 seq,
+                0 if peer.lease_s is None else math.ceil(peer.lease_s * 1000),
             )
         )
 
@@ -165,18 +166,20 @@ class OwnerPeer:
         timeout_s,
         cooldown_s=1.0,
         lease_s=None,
+        on_failure=None,
     ):
         self.endpoint, self.epoch, self.pin_cap = endpoint.encode(), epoch, pin_cap
         self.cleanup = cleanup
         self.timeout_ms = math.ceil(timeout_s * 1000)
         self.cooldown_s = cooldown_s
         self.lease_s = lease_s
+        self.on_failure = on_failure
         self.reader = uuid.uuid4().int & ((1 << 64) - 1)
         self.seq = 0
         self.retry_after = 0.0
         self.retired = False
 
-    def request(self, op, keys, *, seq=0, reply_capacity=None):
+    def request(self, op, keys, *, seq=0, reply_capacity=None, timeout_s=None):
         count = len(keys) if reply_capacity is None else reply_capacity
         rows = np.empty(count, dtype=np.int64)
         n = native().l1_owner_rpc(
@@ -188,7 +191,7 @@ class OwnerPeer:
             keys.ctypes.data,
             rows.ctypes.data,
             count,
-            self.timeout_ms,
+            self.timeout_ms if timeout_s is None else math.ceil(timeout_s * 1000),
         )
         return None if n < 0 else rows[:n]
 
@@ -198,7 +201,10 @@ class OwnerPeer:
         from .registry import OwnerHello
 
         result = self.request(
-            Operation.HELLO, np.empty((0, 4), dtype=np.uint64), reply_capacity=131072
+            Operation.HELLO,
+            np.empty((0, 4), dtype=np.uint64),
+            reply_capacity=131072,
+            timeout_s=1.0,
         )
         if result is None or not len(result):
             return None
@@ -233,6 +239,8 @@ class OwnerPeer:
         if rows is None:
             self.cleanup.enqueue(self.cleanup.prepare(self, self.seq, cancel=True))
             self.retry_after = time.monotonic() + self.cooldown_s
+            if self.on_failure is not None:
+                self.on_failure()
             return None
         if len(rows) != len(keys):
             return None

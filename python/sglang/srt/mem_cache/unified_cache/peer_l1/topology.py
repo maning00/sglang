@@ -6,6 +6,8 @@ import socket
 import msgspec
 import torch
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
+
 
 class DeviceInfo(msgspec.Struct, frozen=True):
     host: str
@@ -14,7 +16,8 @@ class DeviceInfo(msgspec.Struct, frozen=True):
 
 
 def exchange_devices(group, device):
-    hip = ctypes.CDLL("libamdhip64.so")
+    torch.cuda.current_device()
+    hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
     hip.hipDeviceGetUuid.argtypes = [ctypes.c_void_p, ctypes.c_int]
     hip.hipDeviceGetUuid.restype = ctypes.c_int
     identities = []
@@ -22,6 +25,8 @@ def exchange_devices(group, device):
         uuid = ctypes.create_string_buffer(16)
         if hip.hipDeviceGetUuid(uuid, ordinal):
             raise RuntimeError("Unable to identify peer GPU")
+        if not any(uuid.raw):
+            raise RuntimeError("HIP returned an empty peer GPU UUID")
         identities.append(uuid.raw.hex())
     local = DeviceInfo(
         socket.gethostname(), identities[device.index], tuple(identities)

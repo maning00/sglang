@@ -97,6 +97,8 @@ def decide_request_auth(
     """
     if method == "OPTIONS":
         return AuthDecision(allowed=True)
+    if method == "GET" and path == "/peer_l1/owners":
+        return AuthDecision(allowed=True)
 
     if (
         path.startswith("/health")

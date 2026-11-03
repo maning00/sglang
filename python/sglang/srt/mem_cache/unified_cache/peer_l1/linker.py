@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.utils.network import get_local_ip_auto
 
 from .channels import NativeGrant, NativeOwnerChannel
 from .control import CleanupQueue, OwnerPeer, OwnerService, full_keys
@@ -116,7 +117,11 @@ class PeerL1Linker(UnifiedCacheLinker):
             params=params,
             components=components,
         )
-        self.quarantine = full_page_quarantine(params.token_to_kv_pool_allocator)
+        self.quarantine = full_page_quarantine(
+            params.token_to_kv_pool_allocator,
+            required=self.needs_rdma
+            or config.get("l2_backend") in ("decode_lend", "decode_lend+umbp"),
+        )
         self._open_owner(config, world)
         try:
             self._map_memory(world)
@@ -164,6 +169,12 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.needs_rdma = self.domain.enabled or any(
             len(peers) != world - 1 for peers in self.ipc_peers
         )
+        self.rdma_host = (
+            (self.domain.listen_host or get_local_ip_auto())
+            if self.needs_rdma
+            else None
+        )
+        self.remote_cleanup = None
         self.rdma = None
         self._remote_ids = {}
         self._next_peer = world
@@ -178,7 +189,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         self.control = OwnerService(self.directory)
         endpoints = [f"unix:{self.control.endpoint}"]
         if self.needs_rdma:
-            host = self.domain.listen_host or socket.gethostbyname(socket.gethostname())
+            host = self.rdma_host
             host = f"[{host}]" if ":" in host else host
             endpoints.append(self.control.listen_tcp(f"tcp://{host}:0"))
         self.descriptor = PeerDescriptor(
@@ -198,6 +209,8 @@ class PeerL1Linker(UnifiedCacheLinker):
         )
         self.control.describe(OwnerHello(descriptor=self.descriptor))
         self.cleanup = CleanupQueue(timeout_s=self.indexer_config.timeout_s)
+        if self.needs_rdma:
+            self.remote_cleanup = CleanupQueue(timeout_s=self.indexer_config.timeout_s)
         self._rpc_pool = ThreadPoolExecutor(
             max_workers=max(1, world - 1), thread_name_prefix="l1-query"
         )
@@ -230,11 +243,11 @@ class PeerL1Linker(UnifiedCacheLinker):
 
             self.rdma = RdmaReadMover(
                 memory=self.memory,
-                host=self.domain.listen_host
-                or socket.gethostbyname(socket.gethostname()),
+                host=self.rdma_host,
                 quarantine=self.quarantine,
                 stats=self.stats,
                 on_failure=self._rdma_failed,
+                read_timeout_s=self.domain.read_timeout_s,
             )
             self.control.describe(
                 OwnerHello(
@@ -257,7 +270,11 @@ class PeerL1Linker(UnifiedCacheLinker):
                 else info.descriptor.control_endpoints[-1],
                 epoch=info.epoch,
                 pin_cap=info.pin_cap,
-                cleanup=self.cleanup,
+                cleanup=(
+                    self.cleanup
+                    if peer in self.ipc_peers[self.rank]
+                    else self.remote_cleanup
+                ),
                 timeout_s=self.indexer_config.timeout_s,
                 cooldown_s=self.indexer_config.cooldown_s,
             )
@@ -341,11 +358,17 @@ class PeerL1Linker(UnifiedCacheLinker):
 
     def _rdma_failed(self, session):
         peer = session.owner.peer
+        if peer.retired:
+            return
         peer.retry_after = time.monotonic() + peer.cooldown_s
         if self.resolver is not None:
             self.resolver.refresh(session.owner.worker_id)
 
-    def _resolve_owner(self, descriptor):
+    def _resolve_owner(self, descriptor, previous=None):
+        if previous is not None:
+            return (
+                previous if previous.owner.peer.hello(descriptor) is not None else None
+            )
         endpoint = next(
             (e for e in descriptor.control_endpoints if e.startswith("tcp://")), None
         )
@@ -355,9 +378,10 @@ class PeerL1Linker(UnifiedCacheLinker):
             endpoint=endpoint,
             epoch=descriptor.epoch,
             pin_cap=descriptor.pin_cap,
-            cleanup=self.cleanup,
+            cleanup=self.remote_cleanup,
             timeout_s=self.indexer_config.timeout_s,
             cooldown_s=self.indexer_config.cooldown_s,
+            on_failure=lambda: self.resolver.refresh(descriptor.worker_id),
         )
         hello = peer.hello(descriptor)
         if hello is None or "rdma" not in descriptor.data_capabilities:
@@ -535,8 +559,6 @@ class PeerL1Linker(UnifiedCacheLinker):
             self.stats["reserve_attempts"] += 1
             granted = found.session.owner.acquire_exact(found.identities)
             if granted is None:
-                if self.resolver is not None and found.peer not in self._local_peers:
-                    self.resolver.refresh(found.session.owner.worker_id)
                 self.stats["reserve_failures"] += 1
                 self.stats["reserve_failed_pages"] += num_pages
                 return False
@@ -725,6 +747,8 @@ class PeerL1Linker(UnifiedCacheLinker):
             self._rpc_pool.shutdown()
         if self.cleanup:
             self.cleanup.close()
+        if self.remote_cleanup:
+            self.remote_cleanup.close()
         if self.control:
             self.control.close()
         self.directory.close()

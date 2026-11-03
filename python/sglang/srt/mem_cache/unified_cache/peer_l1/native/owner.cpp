@@ -87,7 +87,8 @@ int64_t l1_cleanup_pending(void *queue) {
   return static_cast<sglang::peer_l1::CleanupQueue *>(queue)->pending();
 }
 int64_t l1_cleanup_create(void *queue, const char *endpoint, uint64_t op,
-                          uint64_t epoch, uint64_t reader, uint64_t seq) {
+                          uint64_t epoch, uint64_t reader, uint64_t seq,
+                          uint64_t lease_ms) {
   return checked([&] {
     sglang::peer_l1::Request request;
     request.op = op;
@@ -95,9 +96,12 @@ int64_t l1_cleanup_create(void *queue, const char *endpoint, uint64_t op,
     request.reader = reader;
     request.seq = seq;
     request.n = 0;
-    return reinterpret_cast<int64_t>(new sglang::peer_l1::Cleanup{
-        static_cast<sglang::peer_l1::CleanupQueue *>(queue), endpoint,
-        request});
+    auto *item = new sglang::peer_l1::Cleanup{
+        static_cast<sglang::peer_l1::CleanupQueue *>(queue), endpoint, request};
+    if (lease_ms)
+      item->expires =
+          sglang::peer_l1::Clock::now() + std::chrono::milliseconds(lease_ms);
+    return reinterpret_cast<int64_t>(item);
   });
 }
 void l1_cleanup_enqueue(void *item) { sglang::peer_l1::completed_copy(item); }

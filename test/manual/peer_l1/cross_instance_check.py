@@ -121,8 +121,12 @@ def worker(
     link.forward_stream = torch.cuda.current_stream()
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[owner_snapshot] = lambda: msgspec.json.encode(
-        link.manifest
+    from sglang.srt.utils.auth import add_api_key_middleware
+
+    add_api_key_middleware(app, api_key="discovery-check", admin_api_key=None)
+    serving = [True]
+    app.dependency_overrides[owner_snapshot] = lambda: (
+        msgspec.json.encode(link.manifest) if serving[0] else None
     )
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="error")
@@ -141,11 +145,60 @@ def worker(
         link.publisher.publish(
             [(key, KEYS[i - 1] if i else None) for i, key in enumerate(KEYS)]
         )
-    pipe.send({"epoch": link.control.epoch, "regions": len(link.memory.buffers)})
+    pipe.send(
+        {
+            "epoch": link.control.epoch,
+            "regions": len(link.memory.buffers),
+            "gpus": [d.gpu for d in link.devices],
+        }
+    )
     sequence = 0
     queued = None
     try:
         while (command := pipe.recv()) != "stop":
+            if command in ("seed-down", "seed-up", "evict", "republish"):
+                if command.startswith("seed-"):
+                    serving[0] = command == "seed-up"
+                elif command == "evict":
+                    link.control.retire(KEYS)
+                else:
+                    link.control.publish(KEYS, list(range(1, len(KEYS) + 1)))
+                pipe.send({"command": command})
+                continue
+            if command == "miss":
+                probe = PoolTransfer(name=PoolName.KV, keys=KEYS, indexer_eligible=True)
+                assert len(link.lookup("miss", [probe])) == len(KEYS)
+                before = dict(link.resolver.snapshot)
+                assert not link.reserve("miss", len(KEYS))
+                assert not link.resolver._invalid
+                time.sleep(2.2)
+                assert all(
+                    link.resolver.snapshot[w][1] is s for w, (_, s) in before.items()
+                )
+                assert all(not s.owner.peer.retired for _, s in before.values())
+                pipe.send({"command": command, "sessions_preserved": True})
+                continue
+            if command == "seed-flap":
+                before = dict(link.resolver.snapshot)
+                failures = []
+                original = link.resolver._read
+
+                def observed_read(seed):
+                    try:
+                        return original(seed)
+                    except Exception:
+                        failures.append(seed)
+                        raise
+
+                link.resolver._read = observed_read
+                wait_for(lambda: len(failures) >= 2)
+                assert all(
+                    link.resolver.snapshot[w][1] is s for w, (_, s) in before.items()
+                )
+                assert all(not s.owner.peer.retired for _, s in before.values())
+                link.resolver._read = original
+                pipe.send({"command": command, "sessions_preserved": True})
+                continue
             if command == "reserve":
                 rid = f"read-{sequence}"
                 sequence += 1
@@ -155,7 +208,8 @@ def worker(
                 queued = (rid, alloc.alloc(len(KEYS) * PAGE))
                 pipe.send({"owner_epoch": link._reservations[rid].grant.epoch})
                 continue
-            if command in ("read", "timeout", "partial", "old-grant"):
+            if command in ("read", "timeout", "partial", "late-success", "old-grant"):
+                started = time.monotonic()
                 if queued is None:
                     rid = f"read-{sequence}"
                     sequence += 1
@@ -171,7 +225,8 @@ def worker(
                 real_engine = link.rdma.engine if link.rdma is not None else None
                 released = threading.Event()
                 late = None
-                if command in ("timeout", "partial"):
+                quarantined_before = len(link.quarantine.pages)
+                if command in ("timeout", "partial", "late-success"):
                     from mori import cpp
 
                     receipt = link._reservations[rid]
@@ -180,7 +235,16 @@ def worker(
                     )
 
                     def post(local, lo, remote, ro, sizes, statuses, ids):
-                        if command == "partial":
+                        if command == "late-success":
+                            real_engine._engine.BatchRead(
+                                local, lo, remote, ro, sizes, statuses, ids
+                            )
+                            if len(local) < 16:
+                                for status in statuses:
+                                    status.Wait()
+                                    assert status.Succeeded()
+                                time.sleep(0.3)
+                        elif command == "partial":
                             real_engine._engine.BatchRead(
                                 local[:1],
                                 lo[:1],
@@ -215,8 +279,9 @@ def worker(
                                     raw[page].fill_(7)
                             torch.cuda.synchronize()
 
-                    late = threading.Thread(target=delayed_write)
-                    late.start()
+                    if command != "late-success":
+                        late = threading.Thread(target=delayed_write)
+                        late.start()
                 link.load(
                     rid,
                     [
@@ -240,6 +305,9 @@ def worker(
                             assert torch.all(raw[page] == (region * 7 + i * 17) % 251)
                 else:
                     assert failures == {rid}
+                if command == "late-success":
+                    assert len(link.quarantine.pages) == quarantined_before
+                    assert not link.resolver._invalid
                 alloc.free(target)
                 if late is not None:
                     assert set(pages) <= link.quarantine.pages
@@ -264,6 +332,7 @@ def worker(
                         "command": command,
                         "failed": sorted(failures),
                         "quarantined_pages": len(link.quarantine.pages),
+                        "elapsed_ms": (time.monotonic() - started) * 1000,
                     }
                 )
     finally:
@@ -329,6 +398,22 @@ def main():
             workers.append(start(1))
         reader = workers[1][1]
         results = []
+        if not args.same_instance:
+            for endpoint, command in (
+                (reader, "read"),
+                (workers[0][1], "evict"),
+                (reader, "miss"),
+                (workers[0][1], "republish"),
+                (reader, "read"),
+                (workers[0][1], "seed-down"),
+                (reader, "seed-flap"),
+                (workers[0][1], "seed-up"),
+                (reader, "read"),
+                (reader, "late-success"),
+            ):
+                endpoint.send(command)
+                assert endpoint.poll(60), command
+                results.append(endpoint.recv())
         commands = (
             ("read",)
             if args.same_instance
@@ -355,6 +440,7 @@ def main():
                 {
                     "result": "PASS",
                     "regions": workers[0][2]["regions"],
+                    "gpu_uuids": [w[2]["gpus"] for w in workers],
                     "results": results,
                     "physical_nic_fault_injected": False,
                     "same_instance": args.same_instance,
