@@ -22,6 +22,7 @@ class Operation(IntEnum):
     CONTAINS = 5
     CLEANUPS = 6
     ACQUIRE_EXACT = 7
+    HELLO = 8
 
 
 @lru_cache(maxsize=1)
@@ -34,6 +35,7 @@ def native():
         "owner_stop": [ptr],
         "owner_listen_tcp": [ptr, string],
         "owner_publish": [ptr, ptr, ptr, size],
+        "owner_describe": [ptr, string, size],
         "owner_retire": [ptr, ptr, ptr, size],
         "owner_rpc": [string, u64, u64, u64, u64, ptr, ptr, size, integer],
         "cleanup_start": [integer],
@@ -88,6 +90,14 @@ class OwnerService:
     def listen_tcp(self, endpoint):
         checked(native().l1_owner_listen_tcp(self.address, endpoint.encode()))
         return native().l1_owner_tcp_endpoint(self.address).decode()
+
+    def describe(self, hello):
+        import msgspec
+
+        data = msgspec.json.encode(hello)
+        if len(data) + 8 > 256 * 1024:
+            raise ValueError("owner description exceeds 256 KiB")
+        checked(native().l1_owner_describe(self.address, data, len(data)))
 
     def publish(self, keys, rows):
         keys, rows = full_keys(keys), np.ascontiguousarray(rows, dtype=np.int64)
@@ -166,6 +176,20 @@ class OwnerPeer:
             self.timeout_ms,
         )
         return None if n < 0 else rows[:n]
+
+    def hello(self, expected):
+        import msgspec
+
+        from .registry import OwnerHello
+
+        result = self.request(Operation.HELLO, np.empty((32768, 4), dtype=np.uint64))
+        if result is None or not len(result):
+            return None
+        size = int(result[0])
+        if not 0 <= size <= (len(result) - 1) * 8:
+            return None
+        hello = msgspec.json.decode(result[1:].tobytes()[:size], type=OwnerHello)
+        return hello if hello.descriptor == expected else None
 
     def available(self):
         return time.monotonic() >= self.retry_after

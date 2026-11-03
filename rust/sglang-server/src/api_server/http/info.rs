@@ -29,6 +29,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
         .route("/server_info", get(server_info))
+        .route("/peer_l1/owners", get(peer_l1_owners))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
         .route("/get_model_info", get(model_info))
@@ -38,6 +39,13 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 
 /// Await the core's complete semantic server-info result. HTTP status and
 /// serialization stay here; scheduler control bytes stay behind the contract.
+async fn peer_l1_owners(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.peer_l1_owners() {
+        Some(snapshot) => ([("content-type", "application/json")], snapshot).into_response(),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
     match state.core.server_info().await {
         Ok(server_info) => Ok(server_info),
@@ -266,6 +274,43 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_snapshots_are_local_to_each_listener_and_do_not_query_schedulers() {
+        let snapshot = serde_json::json!({"schema_version":1,"deployment":"test","instance_id":"p","owners":[{"rank":0},{"rank":1}]});
+        for mode in [DisaggregationMode::Null, DisaggregationMode::Prefill] {
+            let (state, intake, _) = test_state(ServerArgs {
+                disaggregation_mode: mode,
+                ..Default::default()
+            });
+            let app = routes().with_state(state.clone());
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/peer_l1/owners")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            state
+                .core
+                .set_peer_l1_owners(Some(Bytes::from(serde_json::to_vec(&snapshot).unwrap())));
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/peer_l1/owners")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response_json(response).await, snapshot);
+            assert!(intake.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

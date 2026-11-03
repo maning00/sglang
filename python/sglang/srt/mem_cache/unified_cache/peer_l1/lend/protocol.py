@@ -25,11 +25,14 @@ decoder = msgspec.msgpack.Decoder(Message)
 
 
 class LendService:
-    def __init__(self, pool, address, *, layout=None, worker_id=""):
+    def __init__(
+        self, pool, address, *, layout=None, worker_id="", compatibility_id=""
+    ):
         self.pool = pool
         self.address = address
         self.layout = layout
         self.worker_id = worker_id
+        self.compatibility_id = compatibility_id
         self.port = None
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -73,6 +76,7 @@ class LendService:
                                 self.pool.lease_s,
                                 self.layout,
                                 self.worker_id,
+                                self.compatibility_id,
                             ]
                         elif identity in peers and request.epoch == self.pool.epoch:
                             op, args = request.op, request.data
@@ -130,7 +134,9 @@ class LendService:
 class LendPeer:
     """Owned and used exclusively by the prefill I/O thread."""
 
-    def __init__(self, info, on_event, *, timeout_s=2.0, layout=None):
+    def __init__(
+        self, info, on_event, *, timeout_s=2.0, layout=None, compatibility_id=""
+    ):
         self.info, self.on_event, self.timeout_s = info, on_event, timeout_s
         self.socket = zmq.Context.instance().socket(zmq.DEALER)
         self.socket.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("ascii"))
@@ -150,6 +156,11 @@ class LendPeer:
             self.epoch = reply.epoch
             self.lease_s = reply.data[1]
             self.worker_id = reply.data[3]
+            if compatibility_id and (
+                len(reply.data) < 5 or reply.data[4] != compatibility_id
+            ):
+                self.close()
+                raise ValueError("Decode lend peers have incompatible KV identities")
             if layout is not None and reply.data[2] != layout:
                 self.close()
                 raise ValueError("Decode lend peers have different KV region layouts")

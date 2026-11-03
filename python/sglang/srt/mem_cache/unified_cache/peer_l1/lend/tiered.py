@@ -75,6 +75,7 @@ class TieredL2(UnifiedCacheLinker):
         self.page_size, self.num_layers = l1.page_size, l1.pool_group.num_layers
         self.lower = lower
         self.l1 = l1
+        self.compatibility_id = l1.domain.kv_compatibility_id
         rank = l1.rank
         self._load_counter = LayerWiseLoadCounter(self.num_layers)
         self.layer_done_counter = (
@@ -357,7 +358,12 @@ class TieredL2(UnifiedCacheLinker):
                 previous.close()
                 del self._peers[info.decode_dp_rank]
             try:
-                peer = LendPeer(info, self._on_event, layout=self.transport.lengths)
+                peer = LendPeer(
+                    info,
+                    self._on_event,
+                    layout=self.transport.lengths,
+                    compatibility_id=self.compatibility_id,
+                )
             except ValueError:
                 self._incompatible_peers.add(info.engine_key)
                 logger.exception("Ignoring decode lend peer with a different KV layout")

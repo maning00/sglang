@@ -79,12 +79,14 @@ private:
     auto &r = c.request;
     if (r.magic != Request{}.magic || r.n > (1 << 20) ||
         (r.op != Lookup && r.op != Release && r.op != Cancel &&
-         r.op != Contains && r.op != Cleanups && r.op != AcquireExact))
+         r.op != Contains && r.op != Cleanups && r.op != AcquireExact &&
+         r.op != Hello))
       return false;
-    c.keys.resize(r.n);
-    if (!read_part(fd, c.keys.data(), r.n * sizeof(Key), c.body, budget))
+    size_t body_keys = r.op == Hello ? 0 : r.n;
+    c.keys.resize(body_keys);
+    if (!read_part(fd, c.keys.data(), body_keys * sizeof(Key), c.body, budget))
       return false;
-    if (c.body < r.n * sizeof(Key))
+    if (c.body < body_keys * sizeof(Key))
       return true;
     auto rows =
         r.epoch == epoch_ ? handler_(r, c.keys) : std::vector<int64_t>{};

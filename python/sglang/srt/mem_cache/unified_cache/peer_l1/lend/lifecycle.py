@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import socket
 import time
 
 from sglang.srt.environ import envs
@@ -19,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 def install_decode_lend(scheduler):
     from ..indexer import IndexerConfig, PlacementPublisher
+    from ..registry import DomainConfig, topology
 
     raw = get_memory().hicache_storage_backend_extra_config
     config = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
@@ -54,13 +54,15 @@ def install_decode_lend(scheduler):
     outer.full_attn_allocator = LendablePagedAllocator.install(
         inner, pool, forward_stream=scheduler.forward_stream
     )
-    worker_id = f"{indexer.deployment}/lend/{socket.gethostname()}/dp{get_parallel().attn_dp_rank}"
+    domain = DomainConfig(**config.get("peer_l1", config).get("domain", {}))
+    worker_id = f"{indexer.deployment}/{topology(domain).instance_id}/decode_lend/dp{get_parallel().attn_dp_rank}"
     pool.publisher = PlacementPublisher(config=indexer, worker_id=worker_id)
     scheduler.decode_lend_service = LendService(
         pool,
         manager.local_ip,
         layout=list(manager.kv_args.kv_item_lens),
         worker_id=worker_id,
+        compatibility_id=domain.kv_compatibility_id,
     )
     manager.lend_port = scheduler.decode_lend_service.port
     manager.lend_dp_rank = get_parallel().attn_dp_rank

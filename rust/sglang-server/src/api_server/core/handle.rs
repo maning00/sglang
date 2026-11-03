@@ -95,6 +95,7 @@ struct CoreInner {
     is_disaggregation: bool,
     mm_limits: BTreeMap<String, usize>,
     metadata: CoreMetadata,
+    peer_l1_owners: std::sync::RwLock<Option<bytes::Bytes>>,
 }
 
 impl CoreHandle {
@@ -113,8 +114,17 @@ impl CoreHandle {
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
                 metadata: config.metadata,
+                peer_l1_owners: std::sync::RwLock::new(None),
             }),
         }
+    }
+
+    pub(crate) fn set_peer_l1_owners(&self, value: Option<bytes::Bytes>) {
+        *self.inner.peer_l1_owners.write().unwrap() = value;
+    }
+
+    pub(crate) fn peer_l1_owners(&self) -> Option<bytes::Bytes> {
+        self.inner.peer_l1_owners.read().unwrap().clone()
     }
 
     pub(crate) fn is_ready(&self) -> bool {

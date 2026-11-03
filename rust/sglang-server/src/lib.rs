@@ -198,6 +198,17 @@ impl Server {
         )
     }
 
+    pub fn set_peer_l1_owners(&self, snapshot: Option<&[u8]>) -> PyResult<()> {
+        if let Some(data) = snapshot {
+            serde_json::from_slice::<serde_json::Value>(data)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        }
+        self.rt
+            .peer_owner_core
+            .set_peer_l1_owners(snapshot.map(bytes::Bytes::copy_from_slice));
+        Ok(())
+    }
+
     /// Non-blocking drain of the to_scheduler channel: one [`IngressRequest`]
     /// per request, its buffers moved out of Rust rather than copied (see the
     /// type docs for the layout).

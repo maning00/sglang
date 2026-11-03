@@ -233,6 +233,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.local_kv_event_sources = []
+        self.peer_l1_owners = None
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -810,6 +811,11 @@ class DataParallelController:
                 for source in info.get("kv_event_sources", [])
             )
 
+        from sglang.srt.mem_cache.unified_cache.peer_l1.registry import merge_manifests
+
+        manifest = merge_manifests(scheduler_info)
+        if manifest is not None:
+            self.peer_l1_owners = manifest
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
         self.startup_time = aggregate_scheduler_startup_times(
@@ -970,6 +976,7 @@ def run_data_parallel_controller_process(
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )
+        init_info["peer_l1_owners"] = controller.peer_l1_owners
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:

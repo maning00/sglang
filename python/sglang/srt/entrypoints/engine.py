@@ -999,6 +999,11 @@ class Engine(EngineScoreMixin, EngineBase):
                     ),
                     key=lambda source: source["dp_rank"],
                 )
+            from sglang.srt.mem_cache.unified_cache.peer_l1.registry import (
+                merge_manifests,
+            )
+
+            infos[0]["peer_l1_owners"] = merge_manifests(infos)
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
@@ -1565,7 +1570,13 @@ class Engine(EngineScoreMixin, EngineBase):
                 {
                     **self.tokenizer_manager.server_args.resolved_dict(),
                     "launch_command": self.tokenizer_manager.server_args.launch_command,
-                    **self._scheduler_init_result.scheduler_infos[0],
+                    **{
+                        k: v
+                        for k, v in self._scheduler_init_result.scheduler_infos[
+                            0
+                        ].items()
+                        if k != "peer_l1_owners"
+                    },
                     "startup_time": self.tokenizer_manager.startup_time,
                     "internal_states": internal_states,
                     "version": __version__,

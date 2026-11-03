@@ -115,6 +115,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.peer_l1 import router as peer_l1_router
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -505,6 +506,7 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 # route_class is per-router, so included routers need it set too.
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
+app.include_router(peer_l1_router)
 
 from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router

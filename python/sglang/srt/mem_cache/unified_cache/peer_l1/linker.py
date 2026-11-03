@@ -27,6 +27,14 @@ from .debug import CollectiveGuard
 from .directory import L1Directory
 from .indexer import IndexerClient, IndexerConfig, PlacementPublisher, Placements
 from .owner import L1Owner
+from .registry import (
+    DomainConfig,
+    OwnerHello,
+    OwnerManifest,
+    PeerDescriptor,
+    Resolver,
+    topology,
+)
 from .session import PeerSession
 
 logger = logging.getLogger(__name__)
@@ -41,6 +49,7 @@ class PeerInfo(msgspec.Struct, frozen=True):
     worker_id: str
     endpoint: str
     epoch: int
+    descriptor: PeerDescriptor
 
 
 class Reservation(msgspec.Struct):
@@ -102,6 +111,10 @@ class PeerL1Linker(UnifiedCacheLinker):
             raise ValueError(
                 "peer_l1 sizes must be positive and wait_timeout_ms nonnegative"
             )
+        self.domain = DomainConfig(**config.get("domain", {}))
+        self.topology = topology(self.domain)
+        self.instance_id = self.topology.instance_id
+        self.resolver = None
         self.indexer_config = IndexerConfig(**config.get("indexer", {}))
         self.indexer = IndexerClient(self.indexer_config)
         self.publisher = self.control = self.cleanup = self._rpc_pool = None
@@ -125,9 +138,30 @@ class PeerL1Linker(UnifiedCacheLinker):
             components=components,
         )
         rows = min(entry._row_count for entry in self.pool_group.entries)
-        self.worker_id = f"{self.indexer_config.deployment}/prefill/{socket.gethostname()}/dp{self.rank}"
+        self.worker_id = f"{self.indexer_config.deployment}/{self.instance_id}/prefill_l1/dp{self.rank}"
         self.directory = L1Directory(rows, self.pin_cap)
         self.control = OwnerService(self.directory)
+        endpoints = [f"unix:{self.control.endpoint}"]
+        if self.domain.enabled:
+            host = self.domain.listen_host or socket.gethostbyname(socket.gethostname())
+            host = f"[{host}]" if ":" in host else host
+            endpoints.append(self.control.listen_tcp(f"tcp://{host}:0"))
+        self.descriptor = PeerDescriptor(
+            worker_id=self.worker_id,
+            instance_id=self.instance_id,
+            rank=self.rank,
+            role="prefill_l1",
+            epoch=self.control.epoch,
+            kv_compatibility_id=self.domain.kv_compatibility_id,
+            restart_group=self.domain.restart_group
+            or f"{self.instance_id}/{socket.gethostname()}",
+            pin_cap=self.pin_cap,
+            control_endpoints=tuple(endpoints),
+            data_capabilities=("ipc",),
+            l2_domain=self.domain.l2_domain or socket.gethostname(),
+            preservation=f"{config.get('l2_backend', 'umbp')}/{config.get('l2_write', 'write_through')}",
+        )
+        self.control.describe(OwnerHello(descriptor=self.descriptor))
         self.cleanup = CleanupQueue(timeout_s=self.indexer_config.timeout_s)
         self._rpc_pool = ThreadPoolExecutor(
             max_workers=world - 1, thread_name_prefix="l1-query"
@@ -146,7 +180,13 @@ class PeerL1Linker(UnifiedCacheLinker):
                     self.worker_id,
                     self.control.endpoint,
                     self.control.epoch,
+                    self.descriptor,
                 ),
+            )
+            self.manifest = OwnerManifest(
+                deployment=self.indexer_config.deployment,
+                instance_id=self.instance_id,
+                owners=tuple(info.descriptor for info in self.memory.directory_infos),
             )
             device_ids = [info.device for info in self.memory.directory_infos]
             if len(set(device_ids)) != world:
@@ -203,6 +243,14 @@ class PeerL1Linker(UnifiedCacheLinker):
                 if peer != self.rank
             }
             self.layer_done_counter = self.copier.counter
+            if self.domain.enabled:
+                self.resolver = Resolver(
+                    seeds=self.domain.seeds,
+                    deployment=self.indexer_config.deployment,
+                    instance_id=self.instance_id,
+                    compatibility_id=self.domain.kv_compatibility_id,
+                    connect=self._resolve_owner,
+                )
         except BaseException:
             self._close_control()
             raise
@@ -214,6 +262,23 @@ class PeerL1Linker(UnifiedCacheLinker):
             world - 1,
             self.pin_cap,
         )
+
+    def _resolve_owner(self, descriptor):
+        endpoint = next(
+            (e for e in descriptor.control_endpoints if e.startswith("tcp://")), None
+        )
+        if endpoint is None:
+            return None
+        peer = OwnerPeer(
+            endpoint=endpoint,
+            epoch=descriptor.epoch,
+            pin_cap=descriptor.pin_cap,
+            cleanup=self.cleanup,
+            timeout_s=self.indexer_config.timeout_s,
+            cooldown_s=self.indexer_config.cooldown_s,
+        )
+        hello = peer.hello(descriptor)
+        return (peer, hello) if hello is not None else None
 
     def bind_cache(self, cache):
         self.owner = L1Owner(cache, self)
@@ -481,6 +546,8 @@ class PeerL1Linker(UnifiedCacheLinker):
         self._closed = True
 
     def _close_control(self):
+        if self.resolver is not None:
+            self.resolver.close()
         if self.publisher:
             self.publisher.close()
         if self._rpc_pool:

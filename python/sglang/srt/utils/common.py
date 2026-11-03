@@ -3666,7 +3666,7 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     """
     result = server_args.resolved_dict()
     result["launch_command"] = server_args.launch_command
-    result.update(scheduler_info)
+    result.update({k: v for k, v in scheduler_info.items() if k != "peer_l1_owners"})
     result["kv_events"] = describe_kv_events_publisher(server_args)
     return result
 

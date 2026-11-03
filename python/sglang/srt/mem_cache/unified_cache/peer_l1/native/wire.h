@@ -14,7 +14,8 @@ enum Operation : uint64_t {
   Cancel,
   Contains,
   Cleanups,
-  AcquireExact
+  AcquireExact,
+  Hello
 };
 struct Request {
   uint64_t magic = 0x4c314f574e455231ULL;

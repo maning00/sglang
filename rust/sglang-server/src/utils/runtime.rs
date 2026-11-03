@@ -40,6 +40,7 @@ pub trait Runnable: Send + 'static {
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads the `to_scheduler_rx` channel,
 /// and write to `from_scheduler_tx` channel. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
+    pub(crate) peer_owner_core: crate::api_server::core::CoreHandle,
     pub to_scheduler_rx: ToSchedulerRx,
     pub from_scheduler_tx: FromSchedulerTx,
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
@@ -316,6 +317,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         },
     );
 
+    let peer_owner_core = core.clone();
+
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     {
         let cfg = cfg.clone();
@@ -367,6 +370,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     }
 
     Ok(Runtime {
+        peer_owner_core,
         to_scheduler_rx,
         from_scheduler_tx,
         mm_wiring: crate::multi_modality::worker::MmWiring {
@@ -385,6 +389,49 @@ mod tests {
     use crate::message::response::{BatchHeader, frame_decode_batch_cols};
     use sglang_api_types::api::v1 as proto;
     use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
+
+    #[test]
+    fn owner_manifest_on_two_real_api_listeners() {
+        use std::io::{Read, Write};
+        let snapshot = bytes::Bytes::from_static(
+            br#"{"schema_version":1,"instance_id":"p","owners":[{"rank":0},{"rank":1}]}"#,
+        );
+        let (first, second) = free_loopback_addrs();
+        let addresses = [first, second];
+        let runtimes: Vec<_> = addresses
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let mut config = test_config(*addr, None);
+                if i == 1 {
+                    Arc::make_mut(&mut config.server_args).disaggregation_mode =
+                        crate::message::config::DisaggregationMode::Prefill;
+                }
+                start(config, None).unwrap()
+            })
+            .collect();
+        for runtime in &runtimes {
+            runtime
+                .peer_owner_core
+                .set_peer_l1_owners(Some(snapshot.clone()));
+        }
+        for (address, runtime) in addresses.iter().zip(&runtimes) {
+            let mut connection = std::net::TcpStream::connect(address).unwrap();
+            connection
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            connection
+                .write_all(
+                    b"GET /peer_l1/owners HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let mut response = String::new();
+            connection.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert!(response.ends_with(std::str::from_utf8(&snapshot).unwrap()));
+            assert!(runtime.to_scheduler_rx.drain(1).is_empty());
+        }
+    }
 
     fn free_loopback_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
         // Hold both probes at once so the OS cannot return the same ephemeral

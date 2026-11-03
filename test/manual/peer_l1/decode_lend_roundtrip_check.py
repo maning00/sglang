@@ -430,7 +430,10 @@ def main():
         components={ComponentType.FULL, ComponentType.SWA},
         extra_config={"dram_capacity_bytes": 1 << 30, "ssd_enabled": False},
     )
+    from sglang.srt.mem_cache.unified_cache.peer_l1.registry import DomainConfig
+
     l1 = SimpleNamespace(
+        domain=DomainConfig(),
         page_size=PAGE,
         pool_group=lower.pool_group,
         rank=0,

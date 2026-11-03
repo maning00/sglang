@@ -625,6 +625,8 @@ class Resources(_FlagGroupBase):
     semantics kept in the owning modules' accessors (which are thin shims
     over these slots)."""
 
+    peer_l1_topology: Any = None
+
     # CUDA graph memory pool shared across the prefill and decode graph
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None

@@ -183,6 +183,9 @@ class RustServer:
             port_offset=local_dp_rank,
         )
         instance = cls(server, http_port=listen_port)
+        from sglang.srt.mem_cache.unified_cache.peer_l1.registry import cache_manifest
+
+        server.set_peer_l1_owners(cache_manifest(scheduler.tree_cache))
 
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch

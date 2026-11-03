@@ -561,6 +561,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.maybe_init_peer_identity()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -1883,13 +1884,24 @@ class Scheduler(
             ]
         )
 
+    def maybe_init_peer_identity(self):
+        """Resolve the instance identity before cache and PD services are built."""
+        from sglang.srt.mem_cache.unified_cache.peer_l1.registry import (
+            initialize_identity,
+        )
+
+        initialize_identity()
+
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
         This method provides the initialization info needed by the tokenizer manager
         and other components to verify the scheduler is ready.
         """
+        from sglang.srt.mem_cache.unified_cache.peer_l1.registry import cache_manifest
+
         result_dict = {
+            "peer_l1_owners": cache_manifest(self.tree_cache),
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,

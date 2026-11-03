@@ -41,6 +41,12 @@ int64_t l1_owner_stop(void *owner) {
   delete static_cast<sglang::peer_l1::Owner *>(owner);
   return 0;
 }
+int64_t l1_owner_describe(void *owner, const char *data, size_t size) {
+  return checked([&] {
+    static_cast<sglang::peer_l1::Owner *>(owner)->describe(data, size);
+    return int64_t(0);
+  });
+}
 int64_t l1_owner_publish(void *owner, const sglang::peer_l1::Key *keys,
                          const int64_t *rows, size_t n) {
   return checked([&] {

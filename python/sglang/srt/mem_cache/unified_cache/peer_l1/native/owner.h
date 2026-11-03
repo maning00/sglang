@@ -72,6 +72,12 @@ public:
       close(fd_);
     // Only engine teardown may destroy outstanding pins without RELEASE.
   }
+  void describe(const char *data, size_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    description_.assign(1 + (size + 7) / 8, 0);
+    description_[0] = size;
+    memcpy(description_.data() + 1, data, size);
+  }
   void publish(const Key *keys, const int64_t *rows, size_t n) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < n; ++i) {
@@ -118,6 +124,9 @@ private:
   std::vector<int64_t> dispatch(const Request &request,
                                 const std::vector<Key> &keys) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (request.op == Hello)
+      return description_.size() <= request.n ? description_
+                                              : std::vector<int64_t>{};
     Identity id{request.reader, request.seq};
     auto saved = grants_.find(id);
     if (request.op == Cleanups) {
@@ -182,9 +191,10 @@ private:
         request.magic != Request{}.magic || request.n > (1 << 20) ||
         (request.op != Lookup && request.op != Release &&
          request.op != Cancel && request.op != Contains &&
-         request.op != Cleanups && request.op != AcquireExact))
+         request.op != Cleanups && request.op != AcquireExact &&
+         request.op != Hello))
       return;
-    std::vector<Key> keys(request.n);
+    std::vector<Key> keys(request.op == Hello ? 0 : request.n);
     if (!transfer_bytes(fd, keys.data(), keys.size() * sizeof(Key), false,
                         deadline))
       return;
@@ -221,6 +231,7 @@ private:
   std::thread thread_;
   std::mutex mutex_;
   std::vector<Key> full_keys_;
+  std::vector<int64_t> description_;
   std::map<Identity, Grant> grants_;
   std::map<uint64_t, uint64_t> completed_;
 };

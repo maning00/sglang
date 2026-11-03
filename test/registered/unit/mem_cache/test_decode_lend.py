@@ -361,6 +361,7 @@ def test_stale_lend_page_only_recomputes_its_request(monkeypatch):
 
 def test_failed_peer_discovery_cools_down_and_new_registration_retries(monkeypatch):
     l2 = TieredL2.__new__(TieredL2)
+    l2.compatibility_id = ""
     info = SimpleNamespace(engine_key="old", decode_dp_rank=0, lend_port=1)
     l2.manager = SimpleNamespace(decode_kv_args_table={"old": info})
     l2.transport = SimpleNamespace(lengths=[])

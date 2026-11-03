@@ -273,3 +273,29 @@ The benchmark reports round-trip latency (TCP setup is amortized), and aggregate
 RPC/s for repeated ACQUIRE_EXACT / RELEASE / LOOKUP / CONTAINS cycles. RELEASE
 is measured through its acknowledgement, not just cleanup-queue insertion. It is
 a loopback control-plane measurement, not an inference or RDMA throughput result.
+
+## Cross-instance discovery
+
+The instance API serves a cached, read-only `GET /peer_l1/owners` manifest.
+Python and Rust frontends use the same schema. The startup handshake carries the
+complete instance snapshot, including all ranks on other nodes; multi-tokenizer
+workers receive the same snapshot. Before publication the route returns 503.
+Background resolvers fetch configured instance URLs and validate each owner with
+HELLO. Identity, epoch and `kv_compatibility_id` must match before a session is
+usable. HTTP is never called from an inference request.
+
+The `peer_l1.domain` object accepts `enabled`, `instance_id`, `seeds` (instance API
+URLs) and `kv_compatibility_id`. When enabled all three identity/discovery fields
+are required. Otherwise the instance uses rank 0's hostname, gathered at startup;
+no new configuration is required. Two instances on one host must not reuse a
+deployment without explicit instance identities. Worker IDs are
+`deployment/instance_id/role/dpN`; they contain no addresses. A restarted logical
+instance keeps its ID; replacement with a new ID requires the deployment to CLEAR
+old worker records explicitly. Upgrading from the older worker-ID format also
+requires clearing the old records or using fresh Indexer state.
+
+Owner identity, KV compatibility, membership and capability changes require a
+restart in this version. This includes weight or adapter-generation changes
+that would change compatibility. Decoder lending keeps its existing PD
+registration; its HELLO validates a configured compatibility ID too. Set the same
+`domain.kv_compatibility_id` on the lending decoder when the prefill uses one.
