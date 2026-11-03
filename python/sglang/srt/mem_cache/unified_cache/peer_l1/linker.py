@@ -615,8 +615,11 @@ class PeerL1Linker(UnifiedCacheLinker):
             self._log_stats()
 
     def _log_stats(self):
-        self.stats["rdma_quarantined_pages"] = len(self.quarantine.pages)
-        self.stats["rdma_quarantined_retained_pages"] = len(self.quarantine.withheld)
+        if self.quarantine is not None:
+            self.stats["rdma_quarantined_pages"] = len(self.quarantine.pages)
+            self.stats["rdma_quarantined_retained_pages"] = len(
+                self.quarantine.withheld
+            )
         # These counters are cumulative snapshots, not increments.
         for key, value in self.indexer.stats_snapshot().items():
             self.stats[key] = value

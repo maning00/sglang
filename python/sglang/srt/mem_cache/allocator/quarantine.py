@@ -2,14 +2,22 @@
 
 import threading
 
+import msgspec
 import torch
+
+
+class DevicePages(msgspec.Struct):
+    ids: torch.Tensor
+    released: torch.Tensor
+    ready: object = None
 
 
 class QuarantinedPages:
     def __init__(self, *, page_size, owner):
         self.page_size, self.owner = page_size, owner
         self.pages = set()
-        self.withheld = set()
+        self._ordered = []
+        self._devices = {}
         self.keepalive = []
         self._lock = threading.Lock()
 
@@ -20,9 +28,25 @@ class QuarantinedPages:
             if not self.keepalive:
                 get_resources().rdma_quarantines.append(self)
             before = len(self.pages)
-            self.pages.update(map(int, pages))
+            added = set(map(int, pages)) - self.pages
+            self._ordered.extend(sorted(added))
+            self.pages.update(added)
             self.keepalive.append(keepalive)
             return len(self.pages) - before
+
+    @property
+    def withheld(self):
+        with self._lock:
+            result = set()
+            for state in self._devices.values():
+                if state.ready is not None:
+                    state.ready.synchronize()
+                result.update(
+                    p
+                    for p, released in zip(self._ordered, state.released.cpu().tolist())
+                    if released
+                )
+            return result
 
     @property
     def retained_tokens(self):
@@ -31,16 +55,28 @@ class QuarantinedPages:
     def filter_released(self, page_ids):
         if not self.pages:
             return page_ids
-        # Only the failure path pays for host filtering; marking happens before
-        # the load counter resolves, so request release sees the complete set.
-        values = page_ids.cpu().tolist()
         with self._lock:
-            self.withheld.update(p for p in values if p in self.pages)
-            healthy = [p for p in values if p not in self.pages]
-        return torch.tensor(healthy, dtype=page_ids.dtype, device=page_ids.device)
+            key = (page_ids.device, page_ids.dtype)
+            state = self._devices.get(key)
+            if state is not None and state.ready is not None:
+                torch.cuda.current_stream(page_ids.device).wait_event(state.ready)
+            if state is None or state.ids.numel() != len(self._ordered):
+                ids = page_ids.new_tensor(self._ordered)
+                released = torch.zeros_like(ids, dtype=torch.bool)
+                if state is not None:
+                    released[: state.ids.numel()].copy_(state.released)
+                state = self._devices[key] = DevicePages(ids, released)
+            state.released.logical_or_(torch.isin(state.ids, page_ids))
+            healthy = page_ids[~torch.isin(page_ids, state.ids)]
+            # Only stats/invariant observation copies the fixed-size membership
+            # mask to the host. Dynamic device compaction can still synchronize.
+            if page_ids.is_cuda:
+                state.ready = torch.cuda.Event()
+                state.ready.record(torch.cuda.current_stream(page_ids.device))
+            return healthy
 
 
-def full_page_quarantine(allocator):
+def full_page_quarantine(allocator, *, required=True):
     from .paged import PagedTokenToKVPoolAllocator
     from .swa import SWATokenToKVPoolAllocator
 
@@ -50,5 +86,7 @@ def full_page_quarantine(allocator):
         else allocator
     )
     if not isinstance(full, PagedTokenToKVPoolAllocator):
-        raise ValueError("RDMA quarantine requires a paged full allocator")
+        if required:
+            raise ValueError("RDMA quarantine requires a paged full allocator")
+        return None
     return full.quarantine

@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.quarantine import QuarantinedPages
+from sglang.srt.mem_cache.allocator.quarantine import (
+    QuarantinedPages,
+    full_page_quarantine,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.allocator import (
     LendablePagedAllocator,
@@ -38,6 +41,28 @@ def allocator(pages=8, need_sort=False):
     return PagedTokenToKVPoolAllocator(
         pages * 4, 4, torch.float32, "cpu", torch.zeros(pages + 1, 4), need_sort
     )
+
+
+def test_release_filters_on_device_and_observation_accounts_lazily(monkeypatch):
+    """A quarantined page must not force every later free to copy IDs to the host."""
+    quarantine = QuarantinedPages(page_size=4, owner=object())
+    quarantine.mark([2], object())
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            torch.Tensor, "cpu", lambda _: pytest.fail("release copied IDs to CPU")
+        )
+        assert quarantine.filter_released(torch.tensor([1, 2])).tolist() == [1]
+        quarantine.mark([3], object())
+        assert quarantine.filter_released(torch.tensor([3, 4])).tolist() == [4]
+    assert quarantine.withheld == {2, 3}
+    assert quarantine.retained_tokens == 8
+
+
+def test_ipc_only_does_not_require_a_quarantine_compatible_allocator():
+    wrapper = object()
+    assert full_page_quarantine(wrapper, required=False) is None
+    with pytest.raises(ValueError, match="paged full allocator"):
+        full_page_quarantine(wrapper)
 
 
 @pytest.mark.parametrize("need_sort", [False, True])

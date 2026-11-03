@@ -322,6 +322,12 @@ The 60-second lending stats report `quarantined_read_pages`,
 `rdma_quarantined_pages` and `rdma_quarantined_retained_pages`; the latter counts
 pages already removed from request ownership. Decode `lend pages` includes
 `quarantined`. Quarantine emits an error log and has no automatic release timer.
+Poisoned decode pages permanently consume the lending unreclaimable limit
+(2% of capacity by default). Once they exhaust that limit, new ALLOC and PIN /
+ACQUIRE operations are refused until the process restarts. Healthy reclaim
+cannot recover this capacity. Release filters quarantined IDs on the device;
+only stats/invariant observation copies their membership mask to the host.
+Dynamic device compaction may still synchronize after a quarantine.
 
 ## Cross-domain reads
 
