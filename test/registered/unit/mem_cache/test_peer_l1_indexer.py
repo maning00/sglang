@@ -42,10 +42,10 @@ def cleanup_drained(peer, pool):
     return not peer._cleanup and pool.pinned == 0
 
 
-@pytest.fixture
-def owner():
+@pytest.fixture(params=[None, "tcp://127.0.0.1:0", "tcp://[::1]:0"])
+def owner(request):
     directory = L1Directory(32, 4)
-    service = OwnerService(directory, lease_s=0.02)
+    service = OwnerService(directory, lease_s=0.02, endpoint=request.param)
     queue = CleanupQueue(timeout_s=0.02)
     peer = OwnerPeer(
         endpoint=service.endpoint,
@@ -207,6 +207,7 @@ def test_cleanup_survives_lost_grant_send_failure_and_lost_ack(owner):
     import struct
     import threading
     import uuid
+    from urllib.parse import urlsplit
 
     directory, service, queue, _peer = owner
     endpoint = "l1-fault-" + uuid.uuid4().hex
@@ -238,8 +239,21 @@ def test_cleanup_survives_lost_grant_send_failure_and_lost_ack(owner):
                 payload = receive(connection, n * 32)
                 if op == Operation.CLEANUPS and not allow_cleanup.is_set():
                     continue
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as target:
-                    target.connect("\0" + service.endpoint)
+                address = urlsplit(service.endpoint)
+                family = (
+                    socket.AF_INET6
+                    if address.hostname and ":" in address.hostname
+                    else socket.AF_INET
+                )
+                with socket.socket(
+                    family if address.scheme == "tcp" else socket.AF_UNIX,
+                    socket.SOCK_STREAM,
+                ) as target:
+                    target.connect(
+                        (address.hostname, address.port)
+                        if address.scheme == "tcp"
+                        else "\0" + service.endpoint
+                    )
                     target.sendall(header + payload)
                     reply = receive(target, 16)
                     _, count = struct.unpack("=2Q", reply)

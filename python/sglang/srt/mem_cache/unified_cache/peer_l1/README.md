@@ -240,3 +240,32 @@ by peer and lending lookup, bounded to 128 request IDs and refreshed after 100 m
 With more than 128 waiting request IDs, eviction can reduce reuse to one RPC per
 match. F3 splits writes by chain; these offloads can fill TieredL2's 256-task
 queue and count toward `write_refused_pages`.
+
+## Reader contracts and owner transport
+
+`PeerSession` binds an owner channel to its data mover and imported memory.
+`Grant` records the owner epoch, source rows and authorization start time;
+`lease_s=None` keeps native source pins until completion cleanup. Lend grants
+retain their finite lease and are acquired by the I/O thread in 64-page chunks.
+The two owner adapters preserve their existing cancellation and release queues.
+`CopyBatch` and `LendTransfer` expose resolved layers, failed requests and
+quiescence separately. Layer resolution still precedes the post-forward failure
+verdict; destination reuse requires completed device accesses.
+
+Native owners accept abstract Unix endpoints (bare names or `unix:name`) and
+`tcp://IP:port` (`tcp://[IPv6]:port` for IPv6). A zero TCP port binds an ephemeral
+port, returned by `OwnerService.endpoint`. Endpoints use numeric IPs so DNS cannot
+block a bounded owner RPC. TCP uses the same frames and acknowledged cleanup as
+Unix, with TCP_NODELAY on both ends. Each RPC still opens one connection.
+Production same-host sessions continue to use Unix; TCP forcing is test-only.
+
+```bash
+PYTHONPATH=python python test/manual/peer_l1/stress_owner.py --tcp
+PYTHONPATH=python python test/manual/peer_l1/bench_owner_rpc.py --readers 1
+PYTHONPATH=python python test/manual/peer_l1/bench_owner_rpc.py --readers 7
+```
+
+The benchmark reports round-trip latency including connection setup, and aggregate
+RPC/s for repeated ACQUIRE_EXACT / RELEASE / LOOKUP / CONTAINS cycles. RELEASE
+is measured through its acknowledgement, not just cleanup-queue insertion. It is
+a loopback control-plane measurement, not an inference or RDMA throughput result.

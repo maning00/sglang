@@ -25,6 +25,9 @@ int64_t l1_owner_start(void *memory, const char *endpoint, uint64_t epoch,
         new sglang::peer_l1::Owner(memory, endpoint, epoch, cap, lease_ms));
   });
 }
+const char *l1_owner_endpoint(void *owner) {
+  return static_cast<sglang::peer_l1::Owner *>(owner)->endpoint().c_str();
+}
 int64_t l1_owner_stop(void *owner) {
   delete static_cast<sglang::peer_l1::Owner *>(owner);
   return 0;

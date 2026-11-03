@@ -45,6 +45,8 @@ def native():
         function = getattr(lib, f"l1_{name}")
         function.argtypes = args
         function.restype = ctypes.c_int64
+    lib.l1_owner_endpoint.argtypes = [ptr]
+    lib.l1_owner_endpoint.restype = ctypes.c_char_p
     lib.l1_owner_error.restype = ctypes.c_char_p
     lib.l1_cleanup_enqueue.restype = None
     return lib
@@ -64,9 +66,9 @@ def full_keys(keys):
 
 
 class OwnerService:
-    def __init__(self, directory, *, lease_s=30.0):
+    def __init__(self, directory, *, lease_s=30.0, endpoint=None):
         self.directory = directory
-        self.endpoint = "sglang-l1-" + uuid.uuid4().hex
+        self.endpoint = endpoint or "sglang-l1-" + uuid.uuid4().hex
         self.epoch = uuid.uuid4().int & ((1 << 64) - 1)
         self.address = checked(
             native().l1_owner_start(
@@ -77,6 +79,8 @@ class OwnerService:
                 math.ceil(lease_s * 1000),
             )
         )
+
+        self.endpoint = native().l1_owner_endpoint(self.address).decode()
 
     def publish(self, keys, rows):
         keys, rows = full_keys(keys), np.ascontiguousarray(rows, dtype=np.int64)

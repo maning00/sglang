@@ -1,7 +1,7 @@
 #pragma once
+#include "socket.h"
 #include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 
 #include "directory.h"
 #include <algorithm>
@@ -62,29 +62,23 @@ inline bool transfer_bytes(int fd, void *data, size_t size, bool send,
   return true;
 }
 
-inline sockaddr_un address(const char *endpoint, socklen_t &length) {
-  sockaddr_un value{};
-  value.sun_family = AF_UNIX;
-  auto n = strlen(endpoint);
-  if (n + 1 >= sizeof(value.sun_path))
-    throw std::invalid_argument("peer L1 endpoint too long");
-  memcpy(value.sun_path + 1, endpoint, n);
-  length = offsetof(sockaddr_un, sun_path) + 1 + n;
-  return value;
-}
-
-/// A bounded local RPC. -1 is unknown, -2 is a different owner incarnation.
+/// A bounded owner RPC. -1 is unknown, -2 is a different owner incarnation.
 inline int64_t rpc(const char *endpoint, Request request, const Key *keys,
                    int64_t *out, int timeout_ms) {
-  socklen_t length;
-  auto addr = address(endpoint, length);
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  SocketAddress addr;
+  try {
+    addr = address(endpoint);
+  } catch (const std::exception &) {
+    return -1;
+  }
+  int fd = socket(addr.storage.ss_family,
+                  SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0)
     return -1;
   auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
   int64_t result = -1;
-  if (connect(fd, reinterpret_cast<sockaddr *>(&addr), length) == 0 ||
-      errno == EINPROGRESS) {
+  if (no_delay(fd, addr.storage.ss_family) &&
+      (connect(fd, addr.data(), addr.length) == 0 || errno == EINPROGRESS)) {
     Reply reply{};
     if (transfer_bytes(fd, &request, sizeof(request), true, deadline) &&
         transfer_bytes(fd, const_cast<Key *>(keys), request.n * sizeof(Key),
@@ -110,18 +104,27 @@ public:
       : directory_(memory), epoch_(epoch), cap_(cap),
         row_count_(static_cast<Header *>(memory)->rows), lease_ms_(lease_ms),
         full_keys_(row_count_) {
-    socklen_t length;
-    auto addr = address(endpoint, length);
-    fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    auto addr = address(endpoint);
+    family_ = addr.storage.ss_family;
+    fd_ = socket(family_, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd_ < 0)
       throw std::runtime_error("peer L1 socket failed");
-    if (bind(fd_, reinterpret_cast<sockaddr *>(&addr), length) ||
-        listen(fd_, 128)) {
+    int one = 1;
+    if ((family_ != AF_UNIX &&
+         setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) ||
+        bind(fd_, addr.data(), addr.length) || listen(fd_, 128)) {
       close(fd_);
       throw std::runtime_error("peer L1 bind failed");
     }
-    thread_ = std::thread([this] { run(); });
+    try {
+      endpoint_ = bound_endpoint(fd_, endpoint, addr);
+      thread_ = std::thread([this] { run(); });
+    } catch (...) {
+      close(fd_);
+      throw;
+    }
   }
+  const std::string &endpoint() const { return endpoint_; }
   ~Owner() {
     stop_.store(true);
     thread_.join();
@@ -261,7 +264,8 @@ private:
       if (fd < 0)
         continue;
       try {
-        serve(fd);
+        if (no_delay(fd, family_))
+          serve(fd);
       } catch (...) { /* Lost replies are resolved by reliable cancellation. */
       }
       close(fd);
@@ -269,7 +273,8 @@ private:
   }
   Directory directory_;
   uint64_t epoch_, cap_, row_count_, retired_ = 0;
-  int lease_ms_, fd_;
+  int lease_ms_, fd_, family_;
+  std::string endpoint_;
   std::atomic<bool> stop_{false};
   std::thread thread_;
   std::mutex mutex_;

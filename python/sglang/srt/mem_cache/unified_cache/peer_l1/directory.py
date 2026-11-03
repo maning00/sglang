@@ -26,6 +26,7 @@ def _native():
                 source / "directory.h",
                 owner / "owner.cpp",
                 owner / "owner.h",
+                owner / "socket.h",
             )
         )
     ).hexdigest()[:20]

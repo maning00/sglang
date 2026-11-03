@@ -1,5 +1,6 @@
 """Manual two-process last-replica stress; deterministic ordering lives in unit tests."""
 
+import argparse
 import hashlib
 import multiprocessing as mp
 
@@ -16,9 +17,9 @@ def key(i):
     return hashlib.sha256(str(i).encode()).hexdigest()
 
 
-def _retire_process(connection, barrier):
+def _retire_process(connection, barrier, endpoint):
     directory = L1Directory(32, 4)
-    service = OwnerService(directory)
+    service = OwnerService(directory, endpoint=endpoint)
     queue = CleanupQueue(timeout_s=0.1)
     try:
         connection.send((service.endpoint, service.epoch))
@@ -43,11 +44,17 @@ def _retire_process(connection, barrier):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tcp", action="store_true")
+    args = parser.parse_args()
     context = mp.get_context("spawn")
     barrier = context.Barrier(2)
     pipes = [context.Pipe() for _ in range(2)]
     workers = [
-        context.Process(target=_retire_process, args=(child, barrier))
+        context.Process(
+            target=_retire_process,
+            args=(child, barrier, "tcp://127.0.0.1:0" if args.tcp else None),
+        )
         for _, child in pipes
     ]
     try:
