@@ -1,4 +1,4 @@
-"""One-sided I/O on the PD engine. Memory is retained until every status drains."""
+"""One-sided I/O on the PD engine; uncertain transfers retain their targets."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 from sglang.srt.mem_cache.allocator.quarantine import QuarantinedPages
 
 from ..channels import LendOwnerChannel
-from ..rdma_io import Submission, UnsafeTransfer, submit_batches
+from ..rdma_io import Submission, UnsafeTransfer, execute
 from ..session import PeerSession
 
 logger = logging.getLogger(__name__)
@@ -60,25 +60,19 @@ class LendTransport:
             engine=self.engine, local=local, remote=remote, owner=self
         )
         try:
-            submit_batches(
+            return execute(
                 submission,
                 local_offsets=local_offsets,
                 remote_offsets=remote_offsets,
                 sizes=sizes,
                 write=write,
+                wait=lambda statuses: (
+                    self.manager._wait_transfer_completion(statuses) is None
+                ),
             )
-            ok = self.manager._wait_transfer_completion(submission.statuses) is None
-            if not ok or not all(status.Succeeded() for status in submission.statuses):
-                raise RuntimeError("RDMA status failed or did not complete")
-            return True
-        except BaseException as exc:
-            if not submission.submitted:
-                raise
-            from sglang.srt.runtime_context import get_resources
-
+        except UnsafeTransfer:
             self.failed_attempts.append(submission)
-            get_resources().rdma_quarantines.append(submission)
-            raise UnsafeTransfer(submission) from exc
+            raise
 
     def read(self, peer, records, local_pages, *, staging=False):
         if peer.session is None:

@@ -322,3 +322,41 @@ The 60-second lending stats report `quarantined_read_pages`,
 `rdma_quarantined_pages` and `rdma_quarantined_retained_pages`; the latter counts
 pages already removed from request ownership. Decode `lend pages` includes
 `quarantined`. Quarantine emits an error log and has no automatic release timer.
+
+## Cross-domain reads
+
+Peer identities are global; IPC kernels use at most eight backend-local slots.
+GPU UUIDs, host identity and mutual device visibility select IPC peers. Other
+intra-instance peers use TCP and RDMA, as do discovered cross-instance owners.
+The source pool is registered once with a dedicated MoRI engine, independent of
+PD; registrations and fixed allocations are retained until process exit because
+remote-access revocation cannot otherwise be established.
+
+RDMA sessions use finite native grants (30 seconds by default). Reserve still
+acquires the exact prefix; reads are submitted in 64-page chunks and each check
+includes time elapsed since ACQUIRE. Replay does not renew a grant. A retired
+session cannot authorize or submit new reads, while an in-flight read keeps its
+original epoch and registration. Failed posted reads use the same quarantine as
+lending and fail only the affected requests after forward.
+
+Sources are ordered local, fabric, RDMA. A farther source must add at least
+`domain.min_gain_pages` (default 1) beyond an existing nearer hit; this is a
+functional default, not a cross-machine performance tuning result. F3 CONTAINS
+is restricted to the same instance, effective `l2_domain` and preservation
+policy. The L2 domain defaults to hostname; an explicit domain must represent
+an actually shared backing keyspace. Foreign copies never suppress this
+instance's F3 writes. Indexer fallback remains within the instance restart group.
+
+Example for one of two instances (use a distinct ID and reciprocal seed on the
+other; hostnames here are examples):
+
+```json
+{"domain":{"enabled":true,"instance_id":"prefill-a","kv_compatibility_id":"weights-layout-v1","seeds":["http://prefill-b:6100"]}}
+```
+
+Merge `domain` into the existing peer L1 config; the Indexer config remains
+required. Cross-tray fabric mapping is not implemented; unsupported IPC pairs
+use RDMA. Run `test/manual/peer_l1/cross_instance_check.py --indexer HOST:PORT`
+for the model-free read/restart/quarantine check. `--same-instance` checks one
+instance and `--isolated-gpus` limits each child to its own GPU. Fault injection
+uses native statuses/submissions and gated GPU writes, without changing NICs.

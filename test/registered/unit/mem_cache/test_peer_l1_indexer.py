@@ -805,6 +805,8 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
         0: SimpleNamespace(pin_cap=4, available=lambda: True),
         1: SimpleNamespace(pin_cap=3, available=lambda: True),
     }
+    l1.domain = SimpleNamespace(min_gain_pages=1)
+    l1.sessions = {p: SimpleNamespace(cost="local") for p in l1.controls}
     l1.worker_ids = {0: "peer0", 1: "peer1"}
     matches = {"peer0": set(map(block_hash, keys)), "peer1": set(map(block_hash, keys))}
     matches.update(
@@ -922,7 +924,11 @@ def test_cancel_keeps_submitted_grant_until_completion(owner, submitted):
     linker._lookups = {}
     linker._queued = {} if submitted else {"r": object()}
     linker._inflight = {"r"} if submitted else set()
-    linker._reservations = {"r": Reservation(0, [key(1)], grant.rows, grant=grant)}
+    linker._reservations = {
+        "r": Reservation(
+            0, [key(1)], grant.rows, grant=grant, session=linker.sessions[0]
+        )
+    }
     linker._collective_guard = None
     linker.release_reservation("r")
     linker.release_reservation("r")
@@ -1037,6 +1043,9 @@ def test_lookup_failure_cools_owner_and_discovery_skips_it(owner, monkeypatch):
     assert peer.lookup(full_keys(keys)) == peer.lookup(full_keys(keys)) == 0
     assert len(calls) == 1
     linker = PeerL1Linker.__new__(PeerL1Linker)
+    linker._local_peers = frozenset([0])
+    linker.descriptor = SimpleNamespace(restart_group="local")
+    linker._descriptors = {0: linker.descriptor}
     linker.controls = {0: peer}
     linker.worker_ids = {0: "peer"}
     cache = Placements(SimpleNamespace(lookup=lambda hashes: {"peer": set(hashes)}))

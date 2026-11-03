@@ -38,16 +38,12 @@ def validate_ipc_backend(*, server_args, params, pool, world):
     if not isinstance(pool, DeepSeekV4TokenToKVPool) or not pool._unified_kv:
         raise ValueError("peer_l1 currently supports DeepSeek V4 unified KV only")
     if (
-        not 2 <= world <= 8
+        world < 1
         or params.pp_size != 1
         or params.attn_cp_size != 1
         or torch.distributed.get_world_size(group=params.tp_cache_group) != 1
     ):
-        raise ValueError(
-            "peer_l1 requires 2–8 local DP workers with attention TP=1, CP=1, PP=1"
-        )
-    if torch.cuda.device_count() < world:
-        raise ValueError("Every peer_l1 worker must see every participating GPU")
+        raise ValueError("peer_l1 requires attention TP=1, CP=1, PP=1")
 
 
 @cache_once
@@ -153,65 +149,91 @@ class LayerCounter:
         self.producer_index = self.consumer_index = -1
 
 
-class PeerMemoryMap:
-    def __init__(self, group, rank: int, world: int, device, cpu_group, directory_info):
-        self.device = device
-        self.storages = []
-        self.buffers = []
-        self.layer_offsets = [0]
-        storage_ids = {}
-        views = []
-        geometry = []
-        for layer in range(group.num_layers):
-            for entry in group.entries:
-                mapping = entry.layer_mapping.get(layer)
-                if mapping is None:
-                    continue
-                indices = [mapping] if isinstance(mapping, int) else mapping
-                for component in entry.components:
-                    for index in indices:
-                        buffer = component[index]
-                        row_bytes = buffer[0].numel() * buffer.element_size()
-                        if (
-                            not buffer.is_contiguous()
-                            or row_bytes % 16
-                            or buffer.data_ptr() % 16
-                            or entry._row_span != 1
-                            or entry._index_mapper is not None
-                        ):
-                            raise ValueError(
-                                "peer_l1 requires contiguous, 16-byte-aligned page rows"
-                            )
-                        storage = buffer.untyped_storage()
-                        identity = (storage.data_ptr(), storage.nbytes())
-                        if identity not in storage_ids:
-                            storage_ids[identity] = len(self.storages)
-                            self.storages.append(storage)
-                        views.append(
-                            (
-                                storage_ids[identity],
-                                buffer.data_ptr() - storage.data_ptr(),
-                            )
+def _pool_geometry(group):
+    storages = []
+    buffers = []
+    layer_offsets = [0]
+    storage_ids = {}
+    views = []
+    geometry = []
+    for layer in range(group.num_layers):
+        for entry in group.entries:
+            mapping = entry.layer_mapping.get(layer)
+            if mapping is None:
+                continue
+            indices = [mapping] if isinstance(mapping, int) else mapping
+            for component in entry.components:
+                for index in indices:
+                    buffer = component[index]
+                    row_bytes = buffer[0].numel() * buffer.element_size()
+                    if (
+                        not buffer.is_contiguous()
+                        or row_bytes % 16
+                        or buffer.data_ptr() % 16
+                        or entry._row_span != 1
+                        or entry._index_mapper is not None
+                    ):
+                        raise ValueError(
+                            "peer_l1 requires contiguous, 16-byte-aligned page rows"
                         )
-                        geometry.append(
-                            (
-                                str(entry.name),
-                                layer,
-                                tuple(buffer.shape),
-                                str(buffer.dtype),
-                                row_bytes,
-                            )
+                    storage = buffer.untyped_storage()
+                    identity = (storage.data_ptr(), storage.nbytes())
+                    if identity not in storage_ids:
+                        storage_ids[identity] = len(storages)
+                        storages.append(storage)
+                    views.append(
+                        (
+                            storage_ids[identity],
+                            buffer.data_ptr() - storage.data_ptr(),
                         )
-                        self.buffers.append(buffer)
-            self.layer_offsets.append(len(views))
+                    )
+                    geometry.append(
+                        (
+                            str(entry.name),
+                            layer,
+                            tuple(buffer.shape),
+                            str(buffer.dtype),
+                            row_bytes,
+                        )
+                    )
+                    buffers.append(buffer)
+        layer_offsets.append(len(views))
+    return storages, buffers, layer_offsets, views, geometry
 
+
+class PeerMemoryMap:
+    def __init__(
+        self,
+        group,
+        rank: int,
+        world: int,
+        device,
+        cpu_group,
+        directory_info,
+        *,
+        ipc_peers=None,
+    ):
+        self.device = device
+        self.storages, self.buffers, self.layer_offsets, views, geometry = (
+            _pool_geometry(group)
+        )
+        self.geometry = geometry
+        ipc_peers = (
+            [tuple(j for j in range(world) if j != i) for i in range(world)]
+            if ipc_peers is None
+            else ipc_peers
+        )
+        local = sorted((rank, *ipc_peers[rank]))
+        if len(local) > 8:
+            raise ValueError("IPC backend supports at most eight local slots")
+        self.slots = {peer: slot for slot, peer in enumerate(local)}
         # _share_cuda_ allocates a reference-counter entry for ONE receiver.
         # Export once per receiving process, while PyTorch reuses IPC mappings
         # for storages that belong to the same caching-allocator allocation.
         handles = [
             (
                 [storage._share_cuda_() for storage in self.storages]
-                if peer != rank
+                if rank in ipc_peers[peer]
                 else None
             )
             for peer in range(world)
@@ -225,6 +247,8 @@ class PeerMemoryMap:
         try:
             for peer, packet in enumerate(packets):
                 host, _, peer_geometry, peer_views, peer_handles = packet
+                if peer not in self.slots or peer == rank:
+                    continue
                 if host != socket.gethostname() or peer_geometry != geometry:
                     raise ValueError(
                         "peer_l1 requires identical device layouts on one node"
@@ -237,7 +261,9 @@ class PeerMemoryMap:
                 ]
                 self.peer_storages.extend(mapped)
                 for index, (storage, offset) in enumerate(peer_views):
-                    addresses[index][peer] = mapped[storage].data_ptr() + offset
+                    addresses[index][self.slots[peer]] = (
+                        mapped[storage].data_ptr() + offset
+                    )
             desc = [
                 [buffer.data_ptr(), geometry[i][-1], *addresses[i]]
                 for i, buffer in enumerate(self.buffers)
@@ -308,7 +334,7 @@ class L1Copier:
         ).value
         self.sdma = (
             SdmaEngine(memory, peer_devices, sdma_channels)
-            if engine == "sdma"
+            if engine == "sdma" and peer_devices
             else None
         )
         # Normal-priority streams share a few hardware queues (GPU_MAX_HW_QUEUES), so
@@ -342,7 +368,7 @@ class L1Copier:
         offset = 0
         for plan in plans:
             count = len(plan.keys)
-            sources[offset : offset + count, 0] = plan.peer
+            sources[offset : offset + count, 0] = self.memory.slots[plan.peer]
             sources[offset : offset + count, 1].copy_(torch.from_numpy(plan.rows))
             offset += count
             cleanups.append(plan.cleanup)

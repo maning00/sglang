@@ -22,6 +22,7 @@ class DomainConfig(msgspec.Struct, frozen=True, kw_only=True):
     listen_host: str = ""
     restart_group: str = ""
     l2_domain: str = ""
+    min_gain_pages: int = 1
 
     def __post_init__(self):
         if self.enabled and not (
@@ -30,7 +31,7 @@ class DomainConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(
                 "cross-instance sharing requires instance_id, kv_compatibility_id and seeds"
             )
-        if "/" in self.instance_id or len(self.seeds) > 128:
+        if "/" in self.instance_id or len(self.seeds) > 128 or self.min_gain_pages < 1:
             raise ValueError("invalid peer domain configuration")
         if self.seeds and not self.enabled:
             raise ValueError("peer domain seeds require enabled=true")
@@ -119,6 +120,7 @@ class OwnerManifest(msgspec.Struct, frozen=True, kw_only=True):
 class OwnerHello(msgspec.Struct, frozen=True, kw_only=True):
     descriptor: PeerDescriptor
     data: bytes = b""
+    lease_s: float = 30.0
 
 
 def cache_manifest(cache):
@@ -137,10 +139,13 @@ def merge_manifests(infos):
 
 
 class Resolver:
-    def __init__(self, *, seeds, deployment, instance_id, compatibility_id, connect):
+    def __init__(
+        self, *, seeds, deployment, instance_id, compatibility_id, connect, retire=None
+    ):
         self.seeds = tuple(dict.fromkeys(seeds))
         self.deployment, self.instance_id = deployment, instance_id
         self.compatibility_id, self.connect = compatibility_id, connect
+        self.retire = retire
         self.snapshot = {}
         self._wake, self._stop = threading.Event(), threading.Event()
         self._invalid = set()
@@ -217,6 +222,11 @@ class Resolver:
                 except Exception:
                     failed = True
                     logger.debug("Peer connection failed for %s", worker, exc_info=True)
+            if self.retire is not None:
+                for worker, (_, old) in previous.items():
+                    current = resolved.get(worker)
+                    if current is None or current[1] is not old:
+                        self.retire(old)
             previous = resolved
             self.snapshot = resolved
             delay = min(delay * 2, 10.0) if failed else 1.0

@@ -67,6 +67,11 @@ def peer_linker():
     from sglang.srt.mem_cache.unified_cache.peer_l1.channels import NativeOwnerChannel
     from sglang.srt.mem_cache.unified_cache.peer_l1.session import PeerSession
 
+    peer.domain = SimpleNamespace(min_gain_pages=1)
+    peer.resolver = None
+    peer.descriptor = SimpleNamespace(restart_group="local")
+    peer._descriptors = {1: peer.descriptor}
+    peer._local_peers = frozenset([1])
     peer.controls = {1: control}
     peer.sessions = {
         1: PeerSession(

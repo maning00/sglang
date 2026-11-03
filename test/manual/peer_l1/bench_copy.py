@@ -98,6 +98,7 @@ def worker(rank, args, port):
         dist.group.WORLD,
         (control_endpoint, owner.epoch),
     )
+    memory.slots = {p + args.peer_offset: slot for p, slot in memory.slots.items()}
     peer = (rank + 1) % args.ranks
     control = OwnerPeer(
         endpoint=memory.directory_infos[peer][0],
@@ -114,7 +115,7 @@ def worker(rank, args, port):
         blocks=args.blocks,
         verify=True,
         engine=args.engine,
-        peer_devices={p: p for p in range(args.ranks) if p != rank},
+        peer_devices={p + args.peer_offset: p for p in range(args.ranks) if p != rank},
         sdma_channels=args.sdma_channels,
     )
     channel = NativeOwnerChannel(peer=control, worker_id=f"owner-{peer}")
@@ -144,7 +145,7 @@ def worker(rank, args, port):
         dist.barrier()
         plan = SimpleNamespace(
             rid=str(iteration),
-            peer=peer,
+            peer=peer + args.peer_offset,
             keys=remote_keys,
             rows=source_rows,
             indices=destination,
@@ -272,6 +273,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Test TCP control with the same IPC data path",
     )
+    parser.add_argument("--peer-offset", type=int, default=0)
     parser.add_argument("--ranks", type=int, default=2)
     parser.add_argument("--pages", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=32)

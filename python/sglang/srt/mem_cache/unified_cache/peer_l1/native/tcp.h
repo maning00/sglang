@@ -11,8 +11,10 @@ class TcpServer {
 public:
   using Handler = std::function<std::vector<int64_t>(const Request &,
                                                      const std::vector<Key> &)>;
-  TcpServer(const char *endpoint, uint64_t epoch, Handler handler)
-      : epoch_(epoch), handler_(std::move(handler)) {
+  TcpServer(const char *endpoint, uint64_t epoch, Handler handler,
+            std::function<void()> maintenance = {})
+      : epoch_(epoch), handler_(std::move(handler)),
+        maintenance_(std::move(maintenance)) {
     auto addr = address(endpoint);
     if (addr.storage.ss_family == AF_UNIX)
       throw std::invalid_argument("TCP listener requires tcp://");
@@ -80,7 +82,7 @@ private:
     if (r.magic != Request{}.magic || r.n > (1 << 20) ||
         (r.op != Lookup && r.op != Release && r.op != Cancel &&
          r.op != Contains && r.op != Cleanups && r.op != AcquireExact &&
-         r.op != Hello))
+         r.op != Hello && r.op != AcquireLeased))
       return false;
     size_t body_keys = r.op == Hello ? 0 : r.n;
     c.keys.resize(body_keys);
@@ -134,6 +136,8 @@ private:
   }
   void run() noexcept {
     while (!stop_.load()) {
+      if (maintenance_)
+        maintenance_();
       std::vector<pollfd> ready{{fd_, POLLIN, 0}};
       for (auto &[fd, c] : clients_)
         ready.push_back(
@@ -165,6 +169,7 @@ private:
   int fd_, family_;
   uint64_t epoch_;
   Handler handler_;
+  std::function<void()> maintenance_;
   std::string endpoint_;
   std::atomic<bool> stop_{false};
   std::thread thread_;

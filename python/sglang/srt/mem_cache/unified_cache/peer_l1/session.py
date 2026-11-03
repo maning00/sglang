@@ -25,7 +25,7 @@ class OwnerChannel(Protocol):
 
 
 class Transfer(Protocol):
-    """Layer resolution permits forward; failure is judged after forward and drain."""
+    """Layer resolution permits forward; uncertain DMA targets remain quarantined."""
 
     def resolved_layers(self) -> Sequence[int]: ...
     def failed_requests(self) -> set[str]: ...

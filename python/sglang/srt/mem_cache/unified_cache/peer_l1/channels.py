@@ -35,7 +35,7 @@ class NativeOwnerChannel:
             grant_id=self.peer.seq,
             rows=rows,
             acquired_before=started,
-            lease_s=None,
+            lease_s=self.peer.lease_s,
             cleanup=cleanup,
         )
 

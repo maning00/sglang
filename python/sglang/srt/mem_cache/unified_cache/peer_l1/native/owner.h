@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <poll.h>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -59,11 +60,14 @@ public:
         endpoint, epoch_,
         [this](const Request &request, const std::vector<Key> &keys) {
           return dispatch(request, keys);
-        });
+        },
+        [this] { expire(); });
+    lease_service_.store(true);
     return tcp_->endpoint();
   }
   const std::string &tcp_endpoint() const { return tcp_->endpoint(); }
   ~Owner() {
+    lease_service_.store(false);
     tcp_.reset();
     stop_.store(true);
     if (thread_.joinable())
@@ -105,6 +109,7 @@ private:
   struct Grant {
     std::vector<int64_t> rows;
     Clock::time_point created;
+    bool leased;
   };
   using Identity = std::pair<uint64_t, uint64_t>;
   bool find(const Key &key, int64_t &row, int64_t &gen) {
@@ -115,11 +120,23 @@ private:
   void finish(uint64_t reader, uint64_t seq) {
     auto saved = grants_.find({reader, seq});
     if (saved != grants_.end()) {
+      if (saved->second.leased)
+        expirations_.erase(
+            {saved->second.created + std::chrono::milliseconds(lease_ms_),
+             saved->first});
       directory_.unpin(saved->second.rows.data(), saved->second.rows.size());
       grants_.erase(saved);
     }
     // A completion watermark also rejects cancelled requests arriving late.
     completed_[reader] = std::max(completed_[reader], seq);
+  }
+  void expire() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto now = Clock::now();
+    while (!expirations_.empty() && expirations_.begin()->first <= now) {
+      auto id = expirations_.begin()->second;
+      finish(id.first, id.second);
+    }
   }
   std::vector<int64_t> dispatch(const Request &request,
                                 const std::vector<Key> &keys) {
@@ -127,6 +144,8 @@ private:
     if (request.op == Hello)
       return description_.size() <= request.n ? description_
                                               : std::vector<int64_t>{};
+    if (request.op == AcquireLeased && !lease_service_.load())
+      return {};
     Identity id{request.reader, request.seq};
     auto saved = grants_.find(id);
     if (request.op == Cleanups) {
@@ -138,7 +157,7 @@ private:
       finish(request.reader, request.seq);
       return {};
     }
-    if (request.op == AcquireExact) {
+    if (request.op == AcquireExact || request.op == AcquireLeased) {
       if (saved != grants_.end())
         return saved->second.rows;
       if (request.seq <= completed_[request.reader])
@@ -166,16 +185,29 @@ private:
         gens.push_back(gen);
       }
     }
-    if (request.op == AcquireExact) {
+    if (request.op == AcquireExact || request.op == AcquireLeased) {
       if (rows.size() != keys.size()) {
         completed_[request.reader] =
             std::max(completed_[request.reader], request.seq);
         return {};
       }
       // Allocate before pinning so a lost reply remains cancellable.
-      grants_.emplace(id, Grant{rows, Clock::now()});
+      auto created = Clock::now();
+      auto leased = request.op == AcquireLeased;
+      grants_.emplace(id, Grant{rows, created, leased});
+      try {
+        if (leased)
+          expirations_.emplace(created + std::chrono::milliseconds(lease_ms_),
+                               id);
+      } catch (...) {
+        grants_.erase(id);
+        throw;
+      }
       if (rows.empty() ||
           !directory_.pin(rows.data(), gens.data(), rows.size())) {
+        if (leased)
+          expirations_.erase(
+              {created + std::chrono::milliseconds(lease_ms_), id});
         grants_.erase(id);
         completed_[request.reader] =
             std::max(completed_[request.reader], request.seq);
@@ -192,7 +224,7 @@ private:
         (request.op != Lookup && request.op != Release &&
          request.op != Cancel && request.op != Contains &&
          request.op != Cleanups && request.op != AcquireExact &&
-         request.op != Hello))
+         request.op != Hello && request.op != AcquireLeased))
       return;
     std::vector<Key> keys(request.op == Hello ? 0 : request.n);
     if (!transfer_bytes(fd, keys.data(), keys.size() * sizeof(Key), false,
@@ -227,12 +259,14 @@ private:
   int lease_ms_, fd_ = -1, family_;
   std::unique_ptr<TcpServer> tcp_;
   std::string endpoint_;
+  std::atomic<bool> lease_service_{false};
   std::atomic<bool> stop_{false};
   std::thread thread_;
   std::mutex mutex_;
   std::vector<Key> full_keys_;
   std::vector<int64_t> description_;
   std::map<Identity, Grant> grants_;
+  std::set<std::pair<Clock::time_point, Identity>> expirations_;
   std::map<uint64_t, uint64_t> completed_;
 };
 

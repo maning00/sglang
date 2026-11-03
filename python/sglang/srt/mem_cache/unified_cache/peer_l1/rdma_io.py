@@ -51,3 +51,26 @@ def submit_batches(submission, *, local_offsets, remote_offsets, sizes, write):
         submission.arguments.append(args)
         submission.submitted = True
         operation(*args)
+
+
+def execute(submission, *, local_offsets, remote_offsets, sizes, write, wait):
+    try:
+        submit_batches(
+            submission,
+            local_offsets=local_offsets,
+            remote_offsets=remote_offsets,
+            sizes=sizes,
+            write=write,
+        )
+        if not wait(submission.statuses) or not all(
+            s.Succeeded() for s in submission.statuses
+        ):
+            raise RuntimeError("RDMA status failed or did not complete")
+        return True
+    except BaseException as exc:
+        if not submission.submitted:
+            raise
+        from sglang.srt.runtime_context import get_resources
+
+        get_resources().rdma_quarantines.append(submission)
+        raise UnsafeTransfer(submission) from exc

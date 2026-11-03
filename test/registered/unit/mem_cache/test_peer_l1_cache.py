@@ -299,6 +299,10 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written():
         has_unstarted_reservations=False,
         wait_seconds=0,
     )
+    linker.descriptor = SimpleNamespace(
+        instance_id="local", l2_domain="dram", preservation="last"
+    )
+    linker._descriptors = {1: linker.descriptor}
     linker.contains_peers = lambda keys: PeerL1Linker.contains_peers(linker, keys)
     owner = L1Owner(cache, linker)
     linker.owner = owner

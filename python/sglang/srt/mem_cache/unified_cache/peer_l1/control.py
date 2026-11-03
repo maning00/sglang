@@ -23,6 +23,7 @@ class Operation(IntEnum):
     CLEANUPS = 6
     ACQUIRE_EXACT = 7
     HELLO = 8
+    ACQUIRE_LEASED = 9
 
 
 @lru_cache(maxsize=1)
@@ -73,6 +74,7 @@ def full_keys(keys):
 class OwnerService:
     def __init__(self, directory, *, lease_s=30.0, endpoint=None):
         self.directory = directory
+        self.lease_s = lease_s
         self.endpoint = endpoint or "sglang-l1-" + uuid.uuid4().hex
         self.epoch = uuid.uuid4().int & ((1 << 64) - 1)
         self.address = checked(
@@ -95,8 +97,8 @@ class OwnerService:
         import msgspec
 
         data = msgspec.json.encode(hello)
-        if len(data) + 8 > 256 * 1024:
-            raise ValueError("owner description exceeds 256 KiB")
+        if len(data) + 8 > 1024 * 1024:
+            raise ValueError("owner description exceeds 1 MiB")
         checked(native().l1_owner_describe(self.address, data, len(data)))
 
     def publish(self, keys, rows):
@@ -153,17 +155,30 @@ class CleanupQueue:
 
 
 class OwnerPeer:
-    def __init__(self, *, endpoint, epoch, pin_cap, cleanup, timeout_s, cooldown_s=1.0):
+    def __init__(
+        self,
+        *,
+        endpoint,
+        epoch,
+        pin_cap,
+        cleanup,
+        timeout_s,
+        cooldown_s=1.0,
+        lease_s=None,
+    ):
         self.endpoint, self.epoch, self.pin_cap = endpoint.encode(), epoch, pin_cap
         self.cleanup = cleanup
         self.timeout_ms = math.ceil(timeout_s * 1000)
         self.cooldown_s = cooldown_s
+        self.lease_s = lease_s
         self.reader = uuid.uuid4().int & ((1 << 64) - 1)
         self.seq = 0
         self.retry_after = 0.0
+        self.retired = False
 
-    def request(self, op, keys, *, seq=0):
-        rows = np.empty(len(keys), dtype=np.int64)
+    def request(self, op, keys, *, seq=0, reply_capacity=None):
+        count = len(keys) if reply_capacity is None else reply_capacity
+        rows = np.empty(count, dtype=np.int64)
         n = native().l1_owner_rpc(
             self.endpoint,
             op,
@@ -172,7 +187,7 @@ class OwnerPeer:
             seq,
             keys.ctypes.data,
             rows.ctypes.data,
-            len(keys),
+            count,
             self.timeout_ms,
         )
         return None if n < 0 else rows[:n]
@@ -182,7 +197,9 @@ class OwnerPeer:
 
         from .registry import OwnerHello
 
-        result = self.request(Operation.HELLO, np.empty((32768, 4), dtype=np.uint64))
+        result = self.request(
+            Operation.HELLO, np.empty((0, 4), dtype=np.uint64), reply_capacity=131072
+        )
         if result is None or not len(result):
             return None
         size = int(result[0])
@@ -192,7 +209,7 @@ class OwnerPeer:
         return hello if hello.descriptor == expected else None
 
     def available(self):
-        return time.monotonic() >= self.retry_after
+        return not self.retired and time.monotonic() >= self.retry_after
 
     def lookup(self, keys):
         if not self.available():
@@ -207,7 +224,12 @@ class OwnerPeer:
         if not self.available():
             return None
         self.seq += 1
-        rows = self.request(Operation.ACQUIRE_EXACT, keys, seq=self.seq)
+        op = (
+            Operation.ACQUIRE_EXACT
+            if self.lease_s is None
+            else Operation.ACQUIRE_LEASED
+        )
+        rows = self.request(op, keys, seq=self.seq)
         if rows is None:
             self.cleanup.enqueue(self.cleanup.prepare(self, self.seq, cancel=True))
             self.retry_after = time.monotonic() + self.cooldown_s
