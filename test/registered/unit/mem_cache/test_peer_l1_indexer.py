@@ -408,7 +408,7 @@ def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
     outcomes = iter(
         [
             (1, None),
-            (11, grpc.StatusCode.DEADLINE_EXCEEDED),
+            (51, grpc.StatusCode.DEADLINE_EXCEEDED),
             (5, grpc.StatusCode.UNAVAILABLE),
             (3, None),
             (9, None),
@@ -423,7 +423,7 @@ def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
             return self.status
 
     def match(request, timeout):
-        assert len(request.hashes) <= 2 and timeout == 0.01
+        assert len(request.hashes) <= 2 and timeout == 0.05
         elapsed, status = next(outcomes)
         now[0] += elapsed / 1000
         if status:
@@ -434,9 +434,9 @@ def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
     try:
         assert client.lookup([1, 2, 3]) is None  # Partial result is discarded.
         assert client.lookup([1, 2, 3]) is None  # Cooldown makes no RPC.
-        now[0] += 1.001
+        now[0] += 0.101
         assert client.lookup([1, 2, 3]) is None
-        now[0] += 1.001
+        now[0] += 0.101
         assert client.lookup([1, 2, 3]) == {}
         stats = client.stats_snapshot()
         for status in ("ok", "timeout", "error", "cooldown_skip"):
@@ -448,8 +448,8 @@ def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
         assert stats["indexer_rpc_latency_samples"] == 3
         assert stats["indexer_rpc_ms_p50"] == pytest.approx(5)
         assert stats["indexer_rpc_ms_p99"] == pytest.approx(9)
-        assert stats["indexer_rpc_ms_max"] == pytest.approx(11)
-        assert stats["indexer_rpc_ms_total"] == pytest.approx(29)
+        assert stats["indexer_rpc_ms_max"] == pytest.approx(51)
+        assert stats["indexer_rpc_ms_total"] == pytest.approx(69)
         empty = client.stats_snapshot()
         assert empty["indexer_rpc_latency_count"] == 0
         assert empty["indexer_rpc_ms_max"] == 0
@@ -580,7 +580,7 @@ def test_publisher_retries_exact_batch_before_newer_deltas(monkeypatch, operatio
         assert held == {indexer.block_hash(key(2))} | (
             {indexer.block_hash(key(1))} if operation == "revoke" else set()
         )
-        assert len(waits) == 1 and 0 < waits[0] <= 1.0
+        assert len(waits) == 1 and 0.075 <= waits[0] <= 0.1
         assert publisher.stats_snapshot()["report_retries"] == 1
         assert publisher.stats_snapshot()["recovery_started"] == 1
     finally:

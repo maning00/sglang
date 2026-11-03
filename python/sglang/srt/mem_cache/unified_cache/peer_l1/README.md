@@ -163,8 +163,20 @@ prefix destinations. A deployment must have a unique name and consistent hash,
 page size, model, and KV layout. Discovery returns known peers only and never
 authorizes access to a row.
 
-`timeout_s` defaults to 0.01 for discovery and peer L1 control, `cooldown_s` to
-1.0, and `recovery_s` to 600. Reports have a minimum one-second RPC deadline.
+`timeout_s` defaults to 0.05 for discovery and peer L1 control, `cooldown_s` to
+0.1, and `recovery_s` to 600. Reports have a minimum one-second RPC deadline.
+The discovery defaults were selected from the T2b 1P1D runs on n09-29 + n09-33,
+with Indexer on the decode node. Stage 4 runs 4144 / 4155 (`95f73e4907`) with
+the former 0.01 / 1.0 defaults averaged 3.6% less throughput and 0.1 percentage
+point less cache hit rate than stage 0 runs 4139 / 4156. Run 4158 (`6157478408`)
+used 0.05 / 0.1: throughput was 1,243,024 versus the stage 0 mean of 1,242,820
+tok/s (+0.0%), TTFT p50 / p95 changed by +3.6% / -2.4%, and cache hit rate was
+96.14% versus 96.15%, with no errors or recomputations. A discovery timeout
+disables lending discovery during cooldown; peer L1 has a local fallback.
+The longer deadline and shorter cooldown reduce this loss of lending hits.
+Evidence: UMBP indexer migration evidence 55, `runs/cap_compare_all_pairs_4158.txt`
+and `runs/indexer_diag_4158.txt`.
+
 Each owner restores soft state with CLEAR, a snapshot, then buffered deltas at
 startup and periodically with staggered phases. READY alone does not prove a
 server restart: the protocol has no server incarnation ID, so lost state after

@@ -74,8 +74,8 @@ class IndexerConfig(msgspec.Struct, frozen=True, kw_only=True):
     stage: int = 0
     endpoint: str = ""
     deployment: str = ""
-    timeout_s: float = 0.01
-    cooldown_s: float = 1.0
+    timeout_s: float = 0.05
+    cooldown_s: float = 0.1
     recovery_s: float = 600.0
 
     def __post_init__(self):
