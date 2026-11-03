@@ -322,6 +322,7 @@ class SchedulerPoolStatsObserver:
                     "total": len(lend.pages),
                     "free": len(lend.free),
                     "writing": lend.writing,
+                    "quarantined": lend.poisoned,
                     "pinned": lend.pinned,
                     "demoting": len(lend.demoting),
                     "held": len(lend.pages) - lend.assured_reclaimable,

@@ -85,6 +85,13 @@ class LendablePagedAllocator(PagedTokenToKVPoolAllocator):
             pool.reclaim(len(pool.pages))
         try:
             super().clear()
+            with pool.lock:
+                held = list(pool.pages)
+            if held:
+                excluded = torch.tensor(held, dtype=torch.int64, device=self.device)
+                self.free_pages = self.free_pages[
+                    ~torch.isin(self.free_pages, excluded)
+                ]
         finally:
             with pool.lock:
                 pool.decode_used = 0

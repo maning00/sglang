@@ -24,6 +24,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.quarantine import QuarantinedPages
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -150,6 +151,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        self.quarantine = QuarantinedPages(page_size=page_size, owner=kvcache)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.use_triton_kernels = current_platform.capabilities.supports_triton
@@ -373,6 +375,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        if self.quarantine.pages:
+            page_ids = tuple(self.quarantine.filter_released(ids) for ids in page_ids)
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
@@ -397,6 +401,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
+        self.free_pages = self.quarantine.filter_released(self.free_pages)
         self.free_group = None
         self.free_page_ids_group = []
         # need_sort only: freed pages wait here, unsorted, until an alloc runs short.

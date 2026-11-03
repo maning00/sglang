@@ -51,6 +51,7 @@ def install_decode_lend(scheduler):
         watermark=envs.SGLANG_DISAGGREGATION_DECODE_LEND_FREE_WATERMARK.get(),
         lease_s=envs.SGLANG_DISAGGREGATION_DECODE_LEND_LEASE_S.get(),
     )
+    pool.memory_owner = (cache, manager)
     outer.full_attn_allocator = LendablePagedAllocator.install(
         inner, pool, forward_stream=scheduler.forward_stream
     )
@@ -75,6 +76,8 @@ def unbind_decode_lend(scheduler, *, timeout_s=30.0):
     allocator = scheduler.token_to_kv_pool_allocator.full_attn_allocator
     pool = service.pool
     with pool.lock:
+        if pool.poisoned:
+            raise RuntimeError("Quarantined decode lend pages require process restart")
         pool.draining = True
     # A writer may still own a posted RDMA. Only its COMMIT/ABORT (after
     # draining) permits reuse. Timeout FAILS teardown; it never frees those pages.

@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.utils import get_device_module
 
+from ..rdma_io import UnsafeTransfer
 from .protocol import LendPeer
 from .transport import DemotionStaging, LendTransport
 
@@ -89,7 +90,11 @@ class TieredL2(UnifiedCacheLinker):
             if lower
             else self._load_counter
         )
-        self.stats = Counter()
+        self.stats = Counter(
+            quarantined_read_pages=0,
+            quarantined_write_pages=0,
+            quarantined_staging_pages=0,
+        )
         self._pending, self._results = {}, Queue()
         self._transfers = {}
         self._tasks = Queue(maxsize=256)
@@ -125,7 +130,7 @@ class TieredL2(UnifiedCacheLinker):
             else:
                 time.sleep(0.001)
         self.manager = manager
-        self.transport = LendTransport(manager)
+        self.transport = LendTransport(manager, memory_owner=self.l1.pool_group)
         if self.lower:
             if self.staging is None:
                 self.staging = DemotionStaging(
@@ -145,6 +150,8 @@ class TieredL2(UnifiedCacheLinker):
             return
         self._tasks.join()
         self._loads.join()
+        if self.transport.failed_attempts:
+            raise RuntimeError("Quarantined RDMA operations require process restart")
         self._stop.set()
         self._wake.set()
         self._thread.join()  # never deregister memory while I/O is in flight
@@ -483,10 +490,21 @@ class TieredL2(UnifiedCacheLinker):
         # refused. Each prefill I/O thread holds one lease at a time, so 8 x 64 fits.
         for start in range(0, len(items), _PIN_CHUNK_PAGES):
             chunk = items[start : start + _PIN_CHUNK_PAGES]
-            if peer is not None and self.transport.read(
-                peer, [r for _, r in chunk], [pages[i] for i, _ in chunk]
-            ):
-                continue
+            targets = [pages[i] for i, _ in chunk]
+            try:
+                if peer is not None and self.transport.read(
+                    peer, [r for _, r in chunk], targets
+                ):
+                    continue
+            except UnsafeTransfer as exc:
+                added = self.l1.quarantine.mark(targets, exc.submission)
+                self.stats["quarantined_read_pages"] += added
+                self.stats["quarantined_read_transfers"] += 1
+                logger.error(
+                    "Decode lend read targets quarantined: pages=%d; restart required",
+                    added,
+                )
+                return False
             # A page demoted after lookup is gone from decode but already in the
             # lower tier; only pages decode dropped outright fail the load.
             if not self._read_lower(kv, [i for i, _ in chunk]):
@@ -542,6 +560,8 @@ class TieredL2(UnifiedCacheLinker):
             selected, remaining = remaining[: len(records)], remaining[len(records) :]
             records = [[p, g, kv.keys[i]] for (p, g, _), i in zip(records, selected)]
             committed = []
+            unsafe = False
+            allocation_seq = reply.seq
             try:
                 if self.transport.transfer(
                     peer.info,
@@ -556,10 +576,21 @@ class TieredL2(UnifiedCacheLinker):
                     reply = peer.call("COMMIT", commits)
                     if reply is not None:
                         committed = [i for i, ok in enumerate(reply.data) if ok]
+            except UnsafeTransfer:
+                unsafe = True
+                # WRITING remains unreclaimable if this notification or ACK is lost.
+                peer.cleanup("POISON", allocation_seq)
+                self.stats["quarantined_write_pages"] += len(records)
+                self.stats["quarantined_write_transfers"] += 1
+                logger.error(
+                    "Decode lend write targets quarantined: pages=%d; restart required",
+                    len(records),
+                )
             finally:
                 # Also handles a lost COMMIT reply: ABORT is idempotent and
                 # only touches WRITING; already committed pages stay valid.
-                peer.call("ABORT", records)
+                if not unsafe:
+                    peer.call("ABORT", records)
             remaining.extend(
                 selected[i] for i in range(len(selected)) if i not in committed
             )
@@ -581,13 +612,32 @@ class TieredL2(UnifiedCacheLinker):
         # DEMOTE is a hint. Every read still needs its own PIN.
         started = time.monotonic()
         try:
-            if self.staging and self.transport.read(
-                peer, records, list(range(len(records))), staging=True
-            ):
+            if self.staging is None:
+                return
+            slots = [
+                p
+                for p in range(self.staging.pages)
+                if p not in self.staging.quarantine.pages
+            ][: len(records)]
+            selected = records[: len(slots)]
+            if not selected:
+                self.stats["quarantined_staging_skipped_pages"] += len(records)
+                return
+            try:
+                landed = self.transport.read(peer, selected, slots, staging=True)
+            except UnsafeTransfer as exc:
+                added = self.staging.quarantine.mark(slots, exc.submission)
+                self.stats["quarantined_staging_pages"] += added
+                self.stats["quarantined_staging_transfers"] += 1
+                logger.error(
+                    "Decode lend staging quarantined: slots=%d; restart required", added
+                )
+                return
+            if landed:
                 read = time.monotonic()
                 self.stats["demote_read_ms"] += int((read - started) * 1000)
-                if self.staging.put(self.lower, records):
-                    self.stats["demote_pages"] += len(records)
+                if self.staging.put(self.lower, selected, slots=slots):
+                    self.stats["demote_pages"] += len(selected)
                 self.stats["demote_put_ms"] += int((time.monotonic() - read) * 1000)
         finally:
             peer.call("DEMOTED", records)

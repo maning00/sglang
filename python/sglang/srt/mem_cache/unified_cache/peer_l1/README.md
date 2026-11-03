@@ -299,3 +299,26 @@ restart in this version. This includes weight or adapter-generation changes
 that would change compatibility. Decoder lending keeps its existing PD
 registration; its HELLO validates a configured compatibility ID too. Set the same
 `domain.kv_compatibility_id` on the lending decoder when the prefill uses one.
+
+## RDMA failure quarantine
+
+Once a MoRI native submission call has been entered, failure is conservatively
+classified as possibly posted. Preflight errors and ACQUIRE misses do not poison
+pages. Status objects are allocated and retained before invoking the native batch,
+including when that call raises after a partial post. Terminal failure does not
+mean DMA has stopped.
+
+Failed read destinations are excluded by the full paged allocator's release and
+clear paths. They cannot be used for DRAM fallback. Failed lending writes issue a
+reliable, epoch-bound POISON for the original allocation sequence and never ABORT;
+if notification is lost, WRITING still prevents reuse. Poisoned decode pages count
+against the unreclaimable budget and cannot be reclaimed or cleared back into the
+allocator. Demotion staging skips poisoned slots. Native statuses, registrations
+and allocations survive runtime context resets; affected PD transports cannot be
+unbound without restarting the process.
+
+The 60-second lending stats report `quarantined_read_pages`,
+`quarantined_write_pages`, and `quarantined_staging_pages`. Peer L1 stats include
+`rdma_quarantined_pages` and `rdma_quarantined_retained_pages`; the latter counts
+pages already removed from request ownership. Decode `lend pages` includes
+`quarantined`. Quarantine emits an error log and has no automatic release timer.

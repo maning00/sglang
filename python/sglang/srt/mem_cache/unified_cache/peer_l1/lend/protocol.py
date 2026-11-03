@@ -84,6 +84,8 @@ class LendService:
                                 data = self.pool.allocate(writer, args[0], request.seq)
                             elif op == "CANCEL_ALLOC":
                                 self.pool.cancel_allocation(writer, args[0])
+                            elif op == "POISON":
+                                self.pool.poison_allocation(writer, args[0])
                             elif op == "COMMIT":
                                 data = self.pool.commit(writer, args)
                             elif op == "ABORT":

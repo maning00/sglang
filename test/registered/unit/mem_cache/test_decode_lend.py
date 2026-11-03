@@ -409,34 +409,30 @@ def test_restore_runs_while_lower_write_is_pending():
     assert l2._load_counter.finish(index)
 
 
-def test_drain_finishes_every_status_after_wait_all_failure():
-    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
-    status = MagicMock()
-    status.InProgress.return_value = True
-    status.Wait.side_effect = lambda: (entered.set(), release.wait(5))
-    engine = MagicMock()
-    engine.batch_read.return_value = [status]
+def test_failed_status_retains_all_submission_objects(monkeypatch):
+    from sglang.srt.mem_cache.unified_cache.peer_l1 import rdma_io
+    from sglang.srt.runtime_context import get_resources
+
+    status = SimpleNamespace(Succeeded=lambda: False)
+    monkeypatch.setattr(rdma_io, "new_status", lambda: status)
+    posted = []
+    engine = SimpleNamespace(
+        _engine=SimpleNamespace(BatchRead=lambda *args: posted.append(args)),
+        allocate_transfer_uid=lambda: 1,
+    )
     manager = SimpleNamespace(
         engine=engine,
         kv_mem_descs=[object()],
         kv_args=SimpleNamespace(kv_item_lens=[64]),
-        _wait_transfer_completion=lambda _: "first status failed",
+        _wait_transfer_completion=lambda _: "failed",
     )
     transport = LendTransport(manager)
-    outcome = []
-
-    def read():
-        outcome.append(
-            transport.transfer(SimpleNamespace(dst_kv_mem_descs=[object()]), [1], [2])
-        )
-        returned.set()
-
-    worker = threading.Thread(target=read)
-    worker.start()
-    assert entered.wait(5) and not returned.is_set()
-    release.set()
-    worker.join(5)
-    assert outcome == [False]
+    with pytest.raises(rdma_io.UnsafeTransfer) as failure:
+        transport.transfer(SimpleNamespace(dst_kv_mem_descs=[object()]), [1], [2])
+    attempt = failure.value.submission
+    assert posted and attempt.submitted and attempt.statuses == [status]
+    assert attempt in get_resources().rdma_quarantines
+    assert transport.failed_attempts == [attempt]
 
 
 def test_expired_pin_data_is_discarded_after_drain(monkeypatch):

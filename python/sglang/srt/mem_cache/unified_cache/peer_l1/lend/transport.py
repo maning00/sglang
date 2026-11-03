@@ -7,15 +7,20 @@ import time
 
 import torch
 
+from sglang.srt.mem_cache.allocator.quarantine import QuarantinedPages
+
 from ..channels import LendOwnerChannel
+from ..rdma_io import Submission, UnsafeTransfer, submit_batches
 from ..session import PeerSession
 
 logger = logging.getLogger(__name__)
 
 
 class LendTransport:
-    def __init__(self, manager):
+    def __init__(self, manager, *, memory_owner=None):
         self.manager = manager
+        self.memory_owner = memory_owner
+        self.failed_attempts = []
         self.engine = manager.engine
         self.lengths = list(manager.kv_args.kv_item_lens)
         self.staging = None
@@ -42,7 +47,7 @@ class LendTransport:
         local = (
             [self.staging.desc] * len(remote) if staging else self.manager.kv_mem_descs
         )
-        if len(local) != len(remote) or len(remote) != len(self.lengths):
+        if not local or len(local) != len(remote) or len(remote) != len(self.lengths):
             raise ValueError("Decode lend requires identical PD KV layouts")
         offsets = self.staging.offsets if staging else [0] * len(local)
         local_offsets = [
@@ -51,40 +56,29 @@ class LendTransport:
         ]
         remote_offsets = [[p * size for p in remote_pages] for size in self.lengths]
         sizes = [[size] * len(local_pages) for size in self.lengths]
-        statuses = []
-        success = False
+        submission = Submission(
+            engine=self.engine, local=local, remote=remote, owner=self
+        )
         try:
-            operation = self.engine.batch_write if write else self.engine.batch_read
-            # Record each returned batch before submitting the next one: partial
-            # submission failures must drain the batches already posted.
-            for start in range(0, len(local), 16):
-                end = start + 16
-                statuses.extend(
-                    operation(
-                        local[start:end],
-                        local_offsets[start:end],
-                        remote[start:end],
-                        remote_offsets[start:end],
-                        sizes[start:end],
-                        [self.engine.allocate_transfer_uid() for _ in local[start:end]],
-                    )
-                )
-            success = self.manager._wait_transfer_completion(statuses) is None
-        finally:
-            # wait_all can return on the first error while other entries run.
-            # An indefinite drain intentionally retains the caller's memory.
-            for status in statuses:
-                while True:
-                    try:
-                        if status.InProgress():
-                            status.Wait()
-                        break
-                    except Exception:
-                        logger.exception(
-                            "Decode lend drain failed; retaining its buffers and retrying"
-                        )
-                        time.sleep(0.01)
-        return success and all(s.Succeeded() for s in statuses)
+            submit_batches(
+                submission,
+                local_offsets=local_offsets,
+                remote_offsets=remote_offsets,
+                sizes=sizes,
+                write=write,
+            )
+            ok = self.manager._wait_transfer_completion(submission.statuses) is None
+            if not ok or not all(status.Succeeded() for status in submission.statuses):
+                raise RuntimeError("RDMA status failed or did not complete")
+            return True
+        except BaseException as exc:
+            if not submission.submitted:
+                raise
+            from sglang.srt.runtime_context import get_resources
+
+            self.failed_attempts.append(submission)
+            get_resources().rdma_quarantines.append(submission)
+            raise UnsafeTransfer(submission) from exc
 
     def read(self, peer, records, local_pages, *, staging=False):
         if peer.session is None:
@@ -127,6 +121,7 @@ class DemotionStaging:
             total, dtype=torch.uint8, device=f"cuda:{self.device}"
         )
         self.total = total
+        self.quarantine = QuarantinedPages(page_size=1, owner=self.tensor)
         if not lower.storage.client.register_memory(self.tensor.data_ptr(), total):
             raise RuntimeError("UMBP rejected decode lend demotion staging")
         buffers = {}
@@ -174,13 +169,17 @@ class DemotionStaging:
         )
         self.transport = transport
 
-    def put(self, lower, records):
+    def put(self, lower, records, *, slots=None):
         from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
         from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
             _object_sizes_per_page,
         )
 
-        indices = torch.arange(len(records) * lower.page_size, dtype=torch.int64)
+        slots = list(range(len(records))) if slots is None else slots
+        indices = (
+            torch.tensor(slots, dtype=torch.int64)[:, None] * lower.page_size
+            + torch.arange(lower.page_size)
+        ).flatten()
         expanded = lower.pool_group.resolve_transfers(
             [
                 PoolTransfer(
@@ -212,6 +211,8 @@ class DemotionStaging:
         return True
 
     def close(self):
+        if self.quarantine.pages:
+            raise RuntimeError("Quarantined demotion staging requires process restart")
         if self.desc is not None:
             self.transport.engine.deregister_memory(self.desc)
             self.desc = self.transport = None

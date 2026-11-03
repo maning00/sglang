@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from itertools import chain, islice
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,6 +62,8 @@ class LendPool:
         self.stats = Counter()
         self.decode_used = 0
         self.draining = False
+        self.memory_owner = None
+        self.poisoned = 0
         self.writing = 0
         self.pinned = 0
         self.demoting = OrderedDict()
@@ -69,7 +74,7 @@ class LendPool:
         self._revoked = []
 
     def _unavailable(self):
-        return self.writing + self.pinned
+        return self.writing + self.pinned + self.poisoned
 
     @property
     def reclaimable(self):
@@ -135,6 +140,26 @@ class LendPool:
             for page, p in list(self.pages.items()):
                 if p.state == "writing" and p.writer == writer and p.alloc_seq == seq:
                     self._discard(page)
+
+    def poison_allocation(self, writer, seq):
+        with self.lock:
+            before = self.poisoned
+            for p in self.pages.values():
+                if p.writer == writer and p.alloc_seq == seq and p.state == "writing":
+                    p.state = "poisoned"
+                    self.writing -= 1
+                    self.poisoned += 1
+                    self.stats["quarantined_pages"] += 1
+            if self.poisoned != before:
+                if not before:
+                    from sglang.srt.runtime_context import get_resources
+
+                    get_resources().rdma_quarantines.append(self)
+                logger.error(
+                    "Decode lend allocation quarantined: pages=%d total=%d; restart required",
+                    self.poisoned - before,
+                    self.poisoned,
+                )
 
     def commit(self, writer, records):
         with self.lock:
@@ -263,7 +288,7 @@ class LendPool:
 
     def _discard(self, page):
         p = self.pages[page]
-        assert not p.pins
+        assert not p.pins and p.state != "poisoned"
         if p.state == "writing":
             self.writing -= 1
         self.demoting.pop(page, None)

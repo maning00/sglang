@@ -627,6 +627,9 @@ class Resources(_FlagGroupBase):
 
     peer_l1_topology: Any = None
 
+    # Failed DMA allocations and status objects survive runtime resets.
+    rdma_quarantines: list[Any] = msgspec.field(default_factory=list)
+
     # CUDA graph memory pool shared across the prefill and decode graph
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None
@@ -1727,6 +1730,7 @@ def snapshot_context() -> dict[str, Any]:
 
 def restore_context(state: dict[str, Any]) -> None:
     """Put back what ``snapshot_context`` captured."""
+    quarantines = list(_CONTEXT.resources.rdma_quarantines)
     for name in RuntimeContext.__slots__:
         if name == "parallel":
             continue
@@ -1741,9 +1745,13 @@ def restore_context(state: dict[str, Any]) -> None:
         setattr(_CONTEXT.parallel, name, value)
     set_global_dwdp_manager(state["__dwdp__"])
 
+    held = _CONTEXT.resources.rdma_quarantines
+    identities = {id(q) for q in held}
+    held.extend(q for q in quarantines if id(q) not in identities)
+
 
 def reset_context() -> None:
-    """Clear published configuration, parallel overrides, flags, and resources.
+    """Reset runtime state, retaining poisoned DMA allocations until process exit.
 
     Used for test teardown and runtime lifecycle reset.
     """
@@ -1754,7 +1762,7 @@ def reset_context() -> None:
     _CONTEXT.parallel._config = None
     _CONTEXT.parallel.clear_stamp()
     _CONTEXT.flags = Flags()
-    _CONTEXT.resources = Resources()
+    _CONTEXT.resources = Resources(rdma_quarantines=_CONTEXT.resources.rdma_quarantines)
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
 

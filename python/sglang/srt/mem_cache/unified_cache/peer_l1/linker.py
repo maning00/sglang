@@ -13,6 +13,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache.allocator.quarantine import full_page_quarantine
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
@@ -137,6 +138,7 @@ class PeerL1Linker(UnifiedCacheLinker):
             params=params,
             components=components,
         )
+        self.quarantine = full_page_quarantine(params.token_to_kv_pool_allocator)
         rows = min(entry._row_count for entry in self.pool_group.entries)
         self.worker_id = f"{self.indexer_config.deployment}/{self.instance_id}/prefill_l1/dp{self.rank}"
         self.directory = L1Directory(rows, self.pin_cap)
@@ -457,6 +459,8 @@ class PeerL1Linker(UnifiedCacheLinker):
             self._log_stats()
 
     def _log_stats(self):
+        self.stats["rdma_quarantined_pages"] = len(self.quarantine.pages)
+        self.stats["rdma_quarantined_retained_pages"] = len(self.quarantine.withheld)
         # These counters are cumulative snapshots, not increments.
         for key, value in self.indexer.stats_snapshot().items():
             self.stats[key] = value
