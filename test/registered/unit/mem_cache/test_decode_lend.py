@@ -262,7 +262,7 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
     l2._wake = threading.Event()
     l2._stop = threading.Event()
     l2._pending = {"r": (None, {0: []})}
-    l2._failed_loads = {}
+    l2._transfers = {}
     l2._demotions = []
     l2._peers = {}
     l2._load_counter = LayerWiseLoadCounter(1)
@@ -320,7 +320,7 @@ def test_stale_lend_page_only_recomputes_its_request(monkeypatch):
     l2 = TieredL2.__new__(TieredL2)
     l2.page_size, l2.num_layers = 1, 1
     l2.transport, l2._peers, l2.lower = transport, {0: peer}, None
-    l2._loads, l2._wake, l2._failed_loads = Queue(), threading.Event(), {}
+    l2._loads, l2._wake, l2._transfers = Queue(), threading.Event(), {}
     l2._load_counter = l2.layer_done_counter = LayerWiseLoadCounter(1)
     l2.stats = Counter()
     l2._pending = {
@@ -349,7 +349,7 @@ def test_stale_lend_page_only_recomputes_its_request(monkeypatch):
         assert wrapper.finish_loads() == ["missing"]
         assert copied == [0, 2]  # A miss must not skip later requests in the batch.
         assert l2.stats["failed_restore_requests"] == 1
-        assert not l2._failed_loads and not wrapper.private_load_indices
+        assert not l2._transfers and not wrapper.private_load_indices
         peer.flush_cleanup()
         # A normal RPC also drains preceding cleanup acknowledgments.
         assert peer.call("HELLO") is not None
@@ -446,7 +446,7 @@ def test_expired_pin_data_is_discarded_after_drain(monkeypatch):
         "sglang.srt.mem_cache.unified_cache.peer_l1.lend.transport.time.monotonic",
         lambda: clock[0],
     )
-    peer = MagicMock(lease_s=30)
+    peer = MagicMock(lease_s=30, session=None, worker_id="lend", epoch="epoch")
     peer.call.return_value = SimpleNamespace(data=[1, [[1, 1, key(1)]]])
 
     def copy(*_, **__):

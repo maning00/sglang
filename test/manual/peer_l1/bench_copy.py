@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
+from sglang.srt.mem_cache.unified_cache.peer_l1.channels import NativeOwnerChannel
 from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
     CleanupQueue,
     OwnerPeer,
@@ -113,6 +114,7 @@ def worker(rank, args, port):
         peer_devices={p: p for p in range(args.ranks) if p != rank},
         sdma_channels=args.sdma_channels,
     )
+    channel = NativeOwnerChannel(peer=control, worker_id=f"owner-{peer}")
     forward = torch.cuda.current_stream()
     remote_keys = keys(peer, count)
     destination = torch.arange((count + 1) * 256, (2 * count + 1) * 256, device=device)
@@ -123,13 +125,13 @@ def worker(rank, args, port):
         identities = full_keys(remote_keys)
         split = max(1, count // 2)
         grants = [
-            control.acquire(part)
+            channel.acquire_exact(part)
             for part in (identities[:split], identities[split:])
             if len(part)
         ]
         assert all(grant is not None for grant in grants)
-        source_rows = np.concatenate([grant[0] for grant in grants])
-        item = grants[0][1]
+        source_rows = np.concatenate([grant.rows for grant in grants])
+        item = grants[0].cleanup
         dist.barrier()
         # RPC connections have closed, and the lease has elapsed before any
         # device read. Neither event may release the source rows.
@@ -168,7 +170,8 @@ def worker(rank, args, port):
                 forward.cuda_stream,
             )
             failed = bool(error.item())
-            for _, item in grants:
+            for grant in grants:
+                item = grant.cleanup
                 cleanup.enqueue(item)
             dist.barrier()
             memory.peer_storages.clear()
@@ -189,7 +192,8 @@ def worker(rank, args, port):
         forward.synchronize()
         start.record(copier.stream)
         plans, offset = [], 0
-        for grant_rows, grant_cleanup in grants:
+        for grant in grants:
+            grant_rows, grant_cleanup = grant.rows, grant.cleanup
             stop = offset + len(grant_rows)
             plans.append(
                 SimpleNamespace(
@@ -207,8 +211,9 @@ def worker(rank, args, port):
         batch = copier.submit(plans, forward)
         end.record(copier.stream)
         end.synchronize()
-        if batch.error_cpu is not None:
-            assert batch.error_cpu.item() == 0
+        assert batch.quiesced()
+        assert len(batch.resolved_layers()) == group.num_layers
+        assert not batch.failed_requests()
         # Independent expected-row oracle, not the same source pointer that
         # the copy/verification kernel used.
         for entry in entries:

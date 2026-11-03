@@ -6,15 +6,48 @@ import ctypes
 import glob
 import os
 import socket
-from dataclasses import dataclass, field
 from pathlib import Path
 
+import msgspec
 import numpy as np
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 from .control import native
+
+
+def validate_ipc_backend(*, server_args, params, pool, world):
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.runtime_context import get_memory
+
+    if not torch.version.hip or params.page_size != 256:
+        raise ValueError("peer_l1 requires ROCm and page_size=256")
+    if get_memory().enable_unified_memory or server_args.enable_memory_saver:
+        raise ValueError("peer_l1 requires fixed KV allocations without memory saver")
+    allocator_config = os.environ.get(
+        "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    )
+    if (
+        "expandable_segments:True" in allocator_config
+        or "backend:cudaMallocAsync" in allocator_config
+    ):
+        raise ValueError(
+            "peer_l1 requires the native, non-expandable PyTorch allocator"
+        )
+    if not isinstance(pool, DeepSeekV4TokenToKVPool) or not pool._unified_kv:
+        raise ValueError("peer_l1 currently supports DeepSeek V4 unified KV only")
+    if (
+        not 2 <= world <= 8
+        or params.pp_size != 1
+        or params.attn_cp_size != 1
+        or torch.distributed.get_world_size(group=params.tp_cache_group) != 1
+    ):
+        raise ValueError(
+            "peer_l1 requires 2–8 local DP workers with attention TP=1, CP=1, PP=1"
+        )
+    if torch.cuda.device_count() < world:
+        raise ValueError("Every peer_l1 worker must see every participating GPU")
 
 
 @cache_once
@@ -215,8 +248,7 @@ class PeerMemoryMap:
             raise
 
 
-@dataclass
-class CopyBatch:
+class CopyBatch(msgspec.Struct):
     rids: list[str]
     index: int
     finish: object
@@ -224,7 +256,21 @@ class CopyBatch:
     error_cpu: torch.Tensor | None
     # Own every temporary and source grants through the batch
     # event, which is recorded after the cleanup callback returns.
-    keepalive: list = field(default_factory=list)
+    keepalive: list = msgspec.field(default_factory=list)
+    layer_events: list = msgspec.field(default_factory=list)
+
+    def resolved_layers(self):
+        return [i for i, event in enumerate(self.layer_events) if event.query()]
+
+    def failed_requests(self):
+        return (
+            set(self.rids)
+            if self.error_cpu is not None and self.error_cpu.item()
+            else set()
+        )
+
+    def quiesced(self):
+        return self.finish.query()
 
 
 def distinct_stream(stream, avoid):
@@ -366,6 +412,7 @@ class L1Copier:
                 error,
                 job_begin,
             ],
+            events,
         )
 
     def _submit_sdma(self, plans, jobs, events):

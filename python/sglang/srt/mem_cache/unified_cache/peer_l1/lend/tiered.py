@@ -10,6 +10,7 @@ from dataclasses import replace
 from queue import Empty, Full, Queue
 from types import SimpleNamespace
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -51,6 +52,22 @@ def select_pages(transfer, positions, page_size):
     )
 
 
+class LendTransfer(msgspec.Struct):
+    futures: list
+    rids: set[str]
+    failed: set[str]
+
+    def resolved_layers(self):
+        return [i for i, future in enumerate(self.futures) if future.done()]
+
+    def quiesced(self):
+        # Futures resolve only after the I/O thread has drained every transfer.
+        return all(future.done() for future in self.futures)
+
+    def failed_requests(self):
+        return self.rids if any(f.exception() for f in self.futures) else self.failed
+
+
 class TieredL2(UnifiedCacheLinker):
     def __init__(self, l1, lower):
         from ..composite import CompositeLayerCounter
@@ -73,7 +90,7 @@ class TieredL2(UnifiedCacheLinker):
         )
         self.stats = Counter()
         self._pending, self._results = {}, Queue()
-        self._failed_loads = {}
+        self._transfers = {}
         self._tasks = Queue(maxsize=256)
         # Forward bounds the number of outstanding loads. They must never wait
         # for write queue capacity or sit behind a backlog of F3 writes.
@@ -97,16 +114,7 @@ class TieredL2(UnifiedCacheLinker):
             self.lower.bind_cache(cache)
 
     def bind_pd(self, manager):
-        if not manager.enable_deferred_decode_kv_release:
-            raise ValueError(
-                "decode lend requires deferred decode KV release on prefill"
-            )
-        if (
-            not hasattr(manager, "kv_mem_descs")
-            or manager.attn_tp_size != 1
-            or manager.dcp_size != 1
-        ):
-            raise ValueError("decode lend requires MoRI with attention TP=1 and CP=1")
+        LendTransport.validate(manager)
         if self.manager is not None:
             raise RuntimeError("Decode lend is already bound")
         while self._unbound_writes:
@@ -269,18 +277,24 @@ class TieredL2(UnifiedCacheLinker):
             if self.lower
             else index
         )
-        self._failed_loads[result] = failed
+        self._transfers[result] = LendTransfer(
+            self._load_counter.futures[index] if index >= 0 else [],
+            set(pending),
+            failed,
+        )
         return result
 
     def finish_layer_wise_loading(self, index):
         landed = self.layer_done_counter.finish(index)
-        failed = self._failed_loads.pop(index, set())
-        return landed and not failed
+        transfer = self._transfers.pop(index, None)
+        return landed and (transfer is None or not transfer.failed_requests())
 
     def finish_loads(self, index, rids):
         landed = self.layer_done_counter.finish(index)
-        failed = self._failed_loads.pop(index, set())
-        return failed if landed else set(rids)
+        transfer = self._transfers.pop(index, None)
+        if not landed:
+            return set(rids)
+        return transfer.failed_requests() if transfer is not None else set()
 
     def offload(self, transfers):
         if self.manager is None:
@@ -577,7 +591,7 @@ class TieredL2(UnifiedCacheLinker):
         self._tasks.join()
         self._loads.join()
         self._pending.clear()
-        self._failed_loads.clear()
+        self._transfers.clear()
         self.l1.placements.clear()
         if self.lower:
             self.lower.reset()

@@ -7,6 +7,9 @@ import time
 
 import torch
 
+from ..channels import LendOwnerChannel
+from ..session import PeerSession
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,6 +19,21 @@ class LendTransport:
         self.engine = manager.engine
         self.lengths = list(manager.kv_args.kv_item_lens)
         self.staging = None
+
+    @staticmethod
+    def validate(manager):
+        from sglang.srt.disaggregation.mori.conn import MoriKVManager
+
+        if not manager.enable_deferred_decode_kv_release:
+            raise ValueError(
+                "decode lend requires deferred decode KV release on prefill"
+            )
+        if (
+            not isinstance(manager, MoriKVManager)
+            or manager.attn_tp_size != 1
+            or manager.dcp_size != 1
+        ):
+            raise ValueError("decode lend requires MoRI with attention TP=1 and CP=1")
 
     def transfer(self, info, local_pages, remote_pages, *, write=False, staging=False):
         if len(local_pages) != len(remote_pages) or not local_pages:
@@ -69,22 +87,25 @@ class LendTransport:
         return success and all(s.Succeeded() for s in statuses)
 
     def read(self, peer, records, local_pages, *, staging=False):
-        started = time.monotonic()  # BEFORE ACQUIRE, including control-plane delay.
-        reply = peer.call("ACQUIRE", [r[2] for r in records])
-        lease = reply.data[0] if reply is not None and reply.data else 0
-        if not lease:
+        if peer.session is None:
+            peer.session = PeerSession(
+                endpoint=f"tcp://{peer.info.endpoint}:{peer.info.lend_port}",
+                owner=LendOwnerChannel(peer),
+                mover=self,
+                mapping=peer.info,
+                cost="rdma",
+            )
+        session = peer.session
+        grant = session.owner.acquire_exact([r[2] for r in records])
+        if grant is None:
             return False
         try:
-            granted = reply.data[1]
-            if len(granted) != len(records):
-                return False
-            records = granted
-            ok = self.transfer(
-                peer.info, local_pages, [r[0] for r in records], staging=staging
+            ok = session.mover.transfer(
+                session.mapping, local_pages, grant.rows.tolist(), staging=staging
             )
-            return ok and time.monotonic() - started < peer.lease_s / 2
+            return ok and time.monotonic() - grant.acquired_before < grant.lease_s / 2
         finally:
-            peer.cleanup("UNPIN", lease)
+            session.owner.release(grant)
 
 
 class DemotionStaging:

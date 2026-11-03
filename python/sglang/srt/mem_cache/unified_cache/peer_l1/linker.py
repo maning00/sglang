@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import socket
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 import msgspec
 import numpy as np
@@ -22,12 +20,14 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_parallel
 
+from .channels import NativeGrant, NativeOwnerChannel
 from .control import CleanupQueue, OwnerPeer, OwnerService, full_keys
-from .copier import L1Copier, PeerMemoryMap
+from .copier import L1Copier, PeerMemoryMap, validate_ipc_backend
 from .debug import CollectiveGuard
 from .directory import L1Directory
 from .indexer import IndexerClient, IndexerConfig, PlacementPublisher, Placements
 from .owner import L1Owner
+from .session import PeerSession
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +43,15 @@ class PeerInfo(msgspec.Struct, frozen=True):
     epoch: int
 
 
-@dataclass
-class Reservation:
+class Reservation(msgspec.Struct):
     peer: int
     keys: list[str]
     rows: np.ndarray
-    cleanup: int = 0
+    grant: NativeGrant | None = None
     identities: np.ndarray | None = None
 
 
-@dataclass
-class LoadPlan:
+class LoadPlan(msgspec.Struct):
     rid: str
     peer: int
     keys: list[str]
@@ -66,43 +64,17 @@ class PeerL1Linker(UnifiedCacheLinker):
     persists = False
 
     def __init__(self, server_args, params, *, components, extra_config=None):
-        if not torch.version.hip or params.page_size != 256:
-            raise ValueError("peer_l1 requires ROCm and page_size=256")
         memory = get_memory()
-        if memory.enable_unified_memory or server_args.enable_memory_saver:
-            raise ValueError(
-                "peer_l1 requires fixed KV allocations without memory saver"
-            )
-        allocator_config = os.environ.get(
-            "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        )
-        if (
-            "expandable_segments:True" in allocator_config
-            or "backend:cudaMallocAsync" in allocator_config
-        ):
-            raise ValueError(
-                "peer_l1 requires the native, non-expandable PyTorch allocator"
-            )
         pool = params.token_to_kv_pool_allocator.get_kvcache()
-        if not getattr(pool, "_unified_kv", False):
-            raise ValueError("peer_l1 currently supports DeepSeek V4 unified KV only")
         parallel = get_parallel()
         self.cpu_group = parallel.world_group.cpu_group
         self.rank = torch.distributed.get_rank(group=self.cpu_group)
         world = torch.distributed.get_world_size(group=self.cpu_group)
-        if (
-            not 2 <= world <= 8
-            or params.pp_size != 1
-            or params.attn_cp_size != 1
-            or torch.distributed.get_world_size(group=params.tp_cache_group) != 1
-        ):
-            raise ValueError(
-                "peer_l1 requires 2–8 local DP workers with attention TP=1, CP=1, PP=1"
-            )
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.page_size = params.page_size
-        if torch.cuda.device_count() < world:
-            raise ValueError("Every peer_l1 worker must see every participating GPU")
+        validate_ipc_backend(
+            server_args=server_args, params=params, pool=pool, world=world
+        )
         config = (
             memory.hicache_storage_backend_extra_config
             if extra_config is None
@@ -217,6 +189,19 @@ class PeerL1Linker(UnifiedCacheLinker):
                     if peer != self.rank
                 },
             )
+            self.sessions = {
+                peer: PeerSession(
+                    endpoint=info.endpoint,
+                    owner=NativeOwnerChannel(
+                        peer=self.controls[peer], worker_id=info.worker_id
+                    ),
+                    mover=self.copier,
+                    mapping=self.memory,
+                    cost="local",
+                )
+                for peer, info in enumerate(self.memory.directory_infos)
+                if peer != self.rank
+            }
             self.layer_done_counter = self.copier.counter
         except BaseException:
             self._close_control()
@@ -329,12 +314,12 @@ class PeerL1Linker(UnifiedCacheLinker):
             self._collective_guard.enable()
         try:
             self.stats["reserve_attempts"] += 1
-            granted = self.controls[found.peer].acquire(found.identities)
+            granted = self.sessions[found.peer].owner.acquire_exact(found.identities)
             if granted is None:
                 self.stats["reserve_failures"] += 1
                 self.stats["reserve_failed_pages"] += num_pages
                 return False
-            found.rows, found.cleanup = granted
+            found.rows, found.grant = granted.rows, granted
             self.stats["reserved_pages"] += num_pages
             self._reservations[rid] = found
             return True
@@ -359,7 +344,7 @@ class PeerL1Linker(UnifiedCacheLinker):
         ):
             return
         reservation = self._forget_reservation(rid)
-        self.cleanup.enqueue(reservation.cleanup)
+        self.sessions[reservation.peer].owner.release(reservation.grant)
         self._stop_collective_guard_if_submitted()
 
     def load(self, rid, transfers):
@@ -373,7 +358,7 @@ class PeerL1Linker(UnifiedCacheLinker):
             list(transfer.keys),
             reservation.rows,
             transfer.device_indices,
-            reservation.cleanup,
+            reservation.grant.cleanup,
         )
         return True
 
@@ -423,17 +408,18 @@ class PeerL1Linker(UnifiedCacheLinker):
         if batch is None:
             return True
         self.layer_done_counter.finish(counter_index)
-        error = batch.error_cpu.item() if batch.error_cpu is not None else 0
-        if error:
+        failed = batch.failed_requests()
+        if failed:
             logger.error(
-                "peer_l1 byte verification failed at copy work item %d", error - 1
+                "peer_l1 byte verification failed at copy work item %d",
+                batch.error_cpu.item() - 1,
             )
             self.stats["failed_load_batches"] += 1
         for rid in batch.rids:
             self._inflight.remove(rid)
             self._forget_reservation(rid)
         del self._batches[counter_index]
-        return not error
+        return not failed
 
     def offload(self, transfers):
         return False

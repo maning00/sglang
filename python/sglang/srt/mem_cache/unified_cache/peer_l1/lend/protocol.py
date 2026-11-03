@@ -142,6 +142,7 @@ class LendPeer:
         self.socket.connect(f"tcp://{host}:{info.lend_port}")
         self.seq, self.epoch, self.lease_s = 0, "", 30.0
         self.worker_id = ""
+        self.session = None
         self._cleanup = {}
         self._cleanup_seqs = {}
         reply = self.call("HELLO")

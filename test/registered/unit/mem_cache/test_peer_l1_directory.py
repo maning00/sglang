@@ -64,7 +64,19 @@ def peer_linker():
     peer = PeerL1Linker.__new__(PeerL1Linker)
     peer.indexer = SimpleNamespace(lookup=lambda hashes: None, rpc_count=0)
     peer.placements = Placements(peer.indexer)
+    from sglang.srt.mem_cache.unified_cache.peer_l1.channels import NativeOwnerChannel
+    from sglang.srt.mem_cache.unified_cache.peer_l1.session import PeerSession
+
     peer.controls = {1: control}
+    peer.sessions = {
+        1: PeerSession(
+            endpoint=service.endpoint,
+            owner=NativeOwnerChannel(peer=control, worker_id="peer"),
+            mover=None,
+            mapping=None,
+            cost="local",
+        )
+    }
     peer.worker_ids = {1: "peer"}
     peer.cleanup = cleanup
     peer._rpc_pool = ThreadPoolExecutor(max_workers=1)
@@ -120,7 +132,9 @@ def test_peer_finish_waits_before_retiring_even_on_failure(peer_linker, error):
     _queue_peer(peer)
     plan = peer._queued.pop("r")
     peer._inflight.add("r")
-    peer._batches[0] = SimpleNamespace(rids=["r"], error_cpu=torch.tensor(error))
+    from sglang.srt.mem_cache.unified_cache.peer_l1.copier import CopyBatch
+
+    peer._batches[0] = CopyBatch(["r"], 0, None, [], torch.tensor(error))
 
     def finish(index):
         assert index == 0 and peer.has_loads

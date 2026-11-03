@@ -887,21 +887,34 @@ def test_cancel_keeps_submitted_grant_until_completion(owner, submitted):
 
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    rows, cleanup = peer.acquire(full_keys([key(1)]))
+    from sglang.srt.mem_cache.unified_cache.peer_l1.channels import NativeOwnerChannel
+    from sglang.srt.mem_cache.unified_cache.peer_l1.session import PeerSession
+
+    channel = NativeOwnerChannel(peer=peer, worker_id="owner")
+    grant = channel.acquire_exact(full_keys([key(1)]))
     linker = PeerL1Linker.__new__(PeerL1Linker)
     linker.cleanup = queue
+    linker.sessions = {
+        0: PeerSession(
+            endpoint=service.endpoint,
+            owner=channel,
+            mover=None,
+            mapping=None,
+            cost="local",
+        )
+    }
     linker.stats = Counter()
     linker.placements = Placements(None)
     linker._lookups = {}
     linker._queued = {} if submitted else {"r": object()}
     linker._inflight = {"r"} if submitted else set()
-    linker._reservations = {"r": Reservation(0, [key(1)], rows, cleanup=cleanup)}
+    linker._reservations = {"r": Reservation(0, [key(1)], grant.rows, grant=grant)}
     linker._collective_guard = None
     linker.release_reservation("r")
     linker.release_reservation("r")
     assert directory.pinned_refs == 1 and queue.pending == 0
     if submitted:
-        queue.enqueue(cleanup)  # The real host callback is checked on GPU.
+        queue.enqueue(grant.cleanup)  # The real host callback is checked on GPU.
         linker._forget_reservation("r")
     else:
         assert linker.cancel_queued_load("r")
