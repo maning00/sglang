@@ -486,9 +486,9 @@ class FullComponent(TreeComponent):
                 device_indices=value.to(torch.int64),
                 keys=list(node.hash_value),
                 first_parent=node.parent.hash_value[-1]
-                if self.tree_core.enable_l1_metadata and node.parent.hash_value
+                if self.tree_core.enable_l1_events and node.parent.hash_value
                 else None,
-                indexer_eligible=self.tree_core.enable_l1_metadata
+                indexer_eligible=self.tree_core.enable_l1_events
                 and node.key.extra_key is None
                 and node.key.cache_salt is None,
             )

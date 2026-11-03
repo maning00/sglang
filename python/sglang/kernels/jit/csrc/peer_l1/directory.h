@@ -1,4 +1,4 @@
-// Single-writer, multi-reader directory over process-shared, cache-coherent RAM.
+// Private owner directory; atomic pins also coordinate allocator freeze and reuse.
 // Readers pin a physical row and generation, never a tree node.
 #pragma once
 
@@ -62,7 +62,7 @@ class Directory {
     auto* table = reinterpret_cast<std::atomic<uint64_t>*>(r + rows);
     for (uint32_t i = 0; i < h->capacity; ++i)
       new (table + i) std::atomic<uint64_t>{0};
-    h->magic = kMagic;  // Exchanged with peers only after initialization completes.
+    h->magic = kMagic;
   }
 
   explicit Directory(void* memory) : h_(static_cast<Header*>(memory)), rows_(reinterpret_cast<Row*>(h_ + 1)) {
@@ -126,8 +126,7 @@ class Directory {
     return false;
   }
 
-  // Called by the copy stream's native host callback. The reservation owns the
-  // exact rows and directory mapping until this operation completes.
+  // Called by the owner after acknowledged reader cleanup.
   void unpin(const int64_t* rows, size_t count) {
     for (size_t i = 0; i < count; ++i)
       rows_[rows[i]].state.fetch_sub(kPin, std::memory_order_release);
@@ -163,8 +162,7 @@ class Directory {
     return row;
   }
 
-  // The single owner can compact tombstones while readers probe. A concurrent
-  // probe may miss, but a successful pin still validates the row generation.
+  // The owner compacts tombstones under its control lock.
   void rebuild() {
     for (uint32_t i = 0; i < h_->capacity; ++i)
       table_[i].store(0, std::memory_order_release);

@@ -32,7 +32,6 @@ class Placement(msgspec.Struct):
     keys: tuple[str, ...]
     full: np.ndarray
     hashes: list[int]
-    short: np.ndarray
     by_key: dict[str, int] | None = None
     matches: dict | None = None
     expires: float = 0.0
@@ -49,9 +48,7 @@ class Placements:
         if item is None or item.keys != tuple(keys):
             full = full_keys(keys)
             hashes = full.view(">i8").reshape(-1)[::4].tolist()
-            item = Placement(
-                tuple(keys), full, hashes, np.ascontiguousarray(full[:, :2])
-            )
+            item = Placement(tuple(keys), full, hashes)
         if item.eligible != eligible:
             item.expires = 0.0
             item.eligible = eligible
@@ -71,7 +68,6 @@ class Placements:
 
 
 class IndexerConfig(msgspec.Struct, frozen=True, kw_only=True):
-    stage: int = 0
     endpoint: str = ""
     deployment: str = ""
     timeout_s: float = 0.05
@@ -79,9 +75,7 @@ class IndexerConfig(msgspec.Struct, frozen=True, kw_only=True):
     recovery_s: float = 600.0
 
     def __post_init__(self):
-        if not 0 <= self.stage <= 4:
-            raise ValueError("indexer stage must be between 0 and 4")
-        if self.stage and (not self.endpoint or not self.deployment):
+        if not self.endpoint or not self.deployment:
             raise ValueError("indexer requires endpoint and deployment")
         if min(self.timeout_s, self.cooldown_s, self.recovery_s) <= 0:
             raise ValueError("indexer timeouts must be positive")

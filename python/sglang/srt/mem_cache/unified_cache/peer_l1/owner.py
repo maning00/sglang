@@ -28,13 +28,13 @@ class L1Owner:
     def __init__(self, cache, linker):
         self.cache, self.linker = cache, linker
         self.directory = linker.directory
-        self.authority = linker.control or linker.directory
+        self.authority = linker.control
         # High priority for the same reason as the copier's stream: it waits on
         # the forward stream and must not share a hardware queue with the scheduler.
         self.stream = torch.cuda.Stream(device=linker.device, priority=-1)
         self._version = 0
         self._pending = {}
-        self._metadata = {} if linker.indexer_config.stage else None
+        self._metadata = {}
         self._attaches = []
         self._publications = deque()
         self._published = set()
@@ -47,7 +47,6 @@ class L1Owner:
         self.last_replica_writer = None
         self.withheld_total = 0
         cache.tree_core.enable_l1_events = True
-        cache.tree_core.enable_l1_metadata = bool(linker.indexer_config.stage)
 
     @property
     def deferred_tokens(self):
@@ -63,29 +62,23 @@ class L1Owner:
     def consume_events(self):
         retired, retired_keys = [], set()
         for keys, value, parent, eligible in self.cache.tree_core.take_l1_events():
-            if self._metadata is not None:
-                for key in keys:
-                    self._metadata[key] = (parent, eligible)
-                    parent = key
+            for key in keys:
+                self._metadata[key] = (parent, eligible)
+                parent = key
             if value is None:
-                if self._metadata is not None:
-                    retired_keys.update(keys)
+                retired_keys.update(keys)
                 for key in keys:
                     self._pending.pop(key, None)
                     self._published.discard(key)
                 aligned = self.authority.retire(keys, aligned=True)
-                if self.linker.publisher:
-                    self.linker.publisher.retire(keys)
+                self.linker.publisher.retire(keys)
                 rows = aligned[aligned >= 0]
                 self.linker.stats["retired_pages"] += len(rows)
                 if len(rows):
                     pins, _ = self.directory.states(rows)
                     self._hold.update(int(row) for row in rows[pins > 0])
                     if self.last_replica_writer is not None:
-                        if self.linker.indexer_config.stage >= 4:
-                            retired.append((keys, aligned))
-                        else:
-                            self._write_last_replicas(keys, aligned)
+                        retired.append((keys, aligned))
             else:
                 self._version += 1
                 for key in keys:
@@ -97,10 +90,9 @@ class L1Owner:
             self._write_last_replicas(
                 keys, np.concatenate([rows for _, rows in retired])
             )
-        if self._metadata is not None:
-            for key in retired_keys:
-                if key not in self._pending:
-                    self._metadata.pop(key, None)
+        for key in retired_keys:
+            if key not in self._pending:
+                self._metadata.pop(key, None)
 
     def _write_last_replicas(self, keys, aligned):
         """Write retired pages that no other rank publishes to L2, then hold them.
@@ -120,9 +112,6 @@ class L1Owner:
             return
         rows = aligned[last]
         selected = [keys[i] for i in last]
-        if self._metadata is None:
-            self._write_rows(selected, rows)
-            return
         # A transfer carries one chain and one namespace eligibility value.
         start = 0
         for end in range(1, len(selected) + 1):
@@ -243,12 +232,11 @@ class L1Owner:
             rows = publication.rows.numpy()[selected]
             if keys:
                 self.authority.publish(keys, rows)
-                if self.linker.publisher:
-                    self.linker.publisher.publish(
-                        (key, self._metadata[key][0])
-                        for key in keys
-                        if self._metadata[key][1]
-                    )
+                self.linker.publisher.publish(
+                    (key, self._metadata[key][0])
+                    for key in keys
+                    if self._metadata[key][1]
+                )
                 self.linker.stats["published_pages"] += len(keys)
                 self._published.update(keys)
                 for key in keys:
@@ -311,12 +299,10 @@ class L1Owner:
         # Called only after begin_flush, or after the whole worker quiesces.
         if self._published:
             self.authority.retire(list(self._published))
-            if self.linker.publisher:
-                self.linker.publisher.retire(self._published)
+            self.linker.publisher.retire(self._published)
         self._published.clear()
         self._pending.clear()
-        if self._metadata is not None:
-            self._metadata.clear()
+        self._metadata.clear()
         self._attaches.clear()
         # The gather may still reference value tensors and pinned CPU buffers.
         # Reset is cold; finish it before releasing those allocations.

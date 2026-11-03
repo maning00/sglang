@@ -208,7 +208,6 @@ def test_allocation_failure_releases_peer_reservation_once():
     linker.release_reservation.assert_called_once_with("r")
 
 
-@pytest.mark.parametrize("stage", range(5))
 @pytest.mark.parametrize(
     "peer_pages,drop_placement,namespace",
     [
@@ -219,9 +218,7 @@ def test_allocation_failure_releases_peer_reservation_once():
         pytest.param(1, True, "cache_salt", id="salted"),
     ],
 )
-def test_match_to_load_preserves_lend_discovery(
-    stage, peer_pages, drop_placement, namespace
-):
+def test_match_to_load_preserves_lend_discovery(peer_pages, drop_placement, namespace):
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
     from sglang.srt.mem_cache.unified_cache.peer_l1.composite import PeerL1PlusL2Linker
     from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import Placements
@@ -252,8 +249,7 @@ def test_match_to_load_preserves_lend_discovery(
 
     def lookup_peer(rid, transfers):
         (kv,) = transfers
-        if stage:
-            l1.placements.get(rid, kv.keys, eligible=kv.indexer_eligible)
+        l1.placements.get(rid, kv.keys, eligible=kv.indexer_eligible)
         return list(range(1, peer_pages + 1))
 
     l1.lookup = lookup_peer
@@ -262,14 +258,11 @@ def test_match_to_load_preserves_lend_discovery(
         [namespace is not None] * len(transfers[0].keys)
     )
     l2 = TieredL2.__new__(TieredL2)
-    l2.indexer_stage, l2.l1, l2.lower = stage, l1, lower
+    l2.l1, l2.lower = l1, lower
     l2.manager, l2.page_size = object(), cache.page_size
     l2.layer_done_counter = LayerWiseLoadCounter(1)
     l2._peers, l2._pending = {0: SimpleNamespace(worker_id="lend")}, {}
     l2.stats = Counter()
-    l2.directory = SimpleNamespace(
-        query=lambda keys: [[0, i, 1] for i in range(len(keys))]
-    )
     backend = PeerL1PlusL2Linker(l1, l2, l2_write="last_replica")
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     req = SimpleNamespace(
@@ -288,7 +281,7 @@ def test_match_to_load_preserves_lend_discovery(
     kv, grouped = l2._pending[req.rid]
     assert kv.keys == keys[peer_pages:]
     assert kv.device_indices.tolist() == list(range(peer_pages * 2, 6))
-    if not stage or namespace is None:
+    if namespace is None:
         assert not lower.queued_loads, "lend-only keys were incorrectly routed to UMBP"
         assert [record[2] for _, record in grouped[0]] == keys[peer_pages:]
     else:

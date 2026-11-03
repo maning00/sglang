@@ -9,7 +9,7 @@ Add these options to a DEP8 launch:
 ```bash
 --enable-unified-cache-external-linker \
 --unified-cache-external-linker-backend peer_l1 \
---hicache-storage-backend-extra-config '{"blocks":32,"layer_group":8}'
+--hicache-storage-backend-extra-config '{"blocks":32,"layer_group":8,"indexer":{"endpoint":"127.0.0.1:50051","deployment":"example"}}'
 ```
 
 Use page size 256 and the `unified_kv_triton` attention layout. For the fp8
@@ -32,7 +32,6 @@ The extra-config object accepts:
 | `wait_timeout_ms` | 200 | Bounded capacity wait; 0 disables waiting |
 | `verify_bytes` | false | Compare every copied row before releasing its source pin |
 | `check_hooks` | false | Check allocator frees and reject collectives between pin and copy submission |
-| `stitch_stats` | false | Count the prefix pages restorable if runs could come from different peers (`lookup_stitched_pages` against `lookup_single_peer_pages`) |
 | `l2_write` | `write_through` | With an L2 (`PeerL1PlusL2Linker`): `write_through` keeps the wrapper's L2 write-through; `last_replica` writes a page to L2 only when its last HBM copy on the node is evicted, holding the row until the write lands |
 | `l2_write_max_inflight_pages` | 15% of page rows | `last_replica` only: a write that would put more pages in flight is refused (the page is freed without an L2 copy) |
 | `l2_write_timeout_s` | 60 | `last_replica` only: once a write is in flight this long, new writes are refused until it lands; the late write keeps its rows |
@@ -51,7 +50,7 @@ aliases. It cannot run alongside another Python profiler on that thread.
 
 ## Ownership and completion
 
-The shared directory contains atomic row identities and pin counts. Retirement
+The owner keeps row identities and pin counts in private memory. Retirement
 changes the generation before allocator reuse. Pinned rows leave the tree but
 stay out of the allocator until the reader releases them. Allocation-driven
 eviction checks actual available space and reclaims completed holds between
@@ -59,7 +58,7 @@ passes. Genuine shortages retain the caller's existing retract/ABORT behavior.
 
 Tree publications wait for both the scheduler's index writes and the forward's
 KV writes. The consumer queues layer events for forward and a separate batch
-event after verification and the native unpin callback. Batch cleanup and event
+event after verification and the native cleanup callback. Batch cleanup and event
 slot reuse use the latter. Loads stay request-private until the forward finishes;
 checkpoint insertion publishes them through the same events as computed KV.
 Failed loads are discarded before publication. A missing lending page that
@@ -70,7 +69,7 @@ I/O quiesces. Unknown batch I/O failures remain conservative. Queued loads can
 be cancelled before the request frees its private slots.
 
 Flush checks local activity, atomically freezes new remote reservations, then
-withdraws the directory before clearing the pool. Completed offloads are reaped
+withdraws owner records before clearing the pool. Completed offloads are reaped
 when flushing a paused engine; pending loads, offloads or remote pins return busy.
 Weight updates use the upstream failure response when a flush is refused.
 
@@ -85,7 +84,7 @@ with the existing UMBP write-through store. UMBP configuration stays at the top
 level and peer options go in `peer_l1`, for example:
 
 ```json
-{"ssd_enabled":false,"peer_l1":{"blocks":32,"layer_group":8,"pin_cap":16384}}
+{"ssd_enabled":false,"peer_l1":{"blocks":32,"layer_group":8,"pin_cap":16384,"indexer":{"endpoint":"127.0.0.1:50051","deployment":"example"}}}
 ```
 
 This requires the same UMBP standalone setup as the `mori` backend. With
@@ -99,7 +98,7 @@ Writes always go to UMBP.
 Restores stay private until their whole load succeeds and checkpoint inserts them.
 A batch-level L1 or L2 failure aborts requests using that source; lending misses
 can identify and fail individual requests.
-Flush checks both loaders and UMBP offloads; it clears device directories while
+Flush checks both loaders and UMBP offloads; it clears owner records while
 preserving the UMBP tier. The periodic peer stats distinguish `l1_loaded_pages`
 and `l2_loaded_pages` for successful requests, and
 `failed_composite_load_batches/requests`. Lending also reports
@@ -117,8 +116,8 @@ ordering. It needs a supported Rust/PyTorch environment to cover the Rust cases.
 `test/manual/peer_l1/bench_copy.py` exercises real IPC mappings with the unified
 fp8 Pro row geometry. It validates a warmup copy against both the remote bytes
 and an independent row oracle, then times the production copy path. Its
-`--skip-copy` negative control must fail. `stress_directory.cpp` runs the native
-protocol across forked processes without a GPU.
+`--skip-copy` negative control must fail. `stress_owner.py` exercises concurrent
+retirement across owner processes without a GPU.
 
 With a real-weight DEP8 server and both verification options enabled, run
 `test/manual/peer_l1/restore_smoke.py`. It checks cross-rank restores, local reuse,
@@ -129,29 +128,23 @@ Pass `--combined` for `mori_peer_l1`: after flush it requires an L2 hit, followe
 by another peer read of that restored prefix. Check both loaded-page counters
 in the server log to confirm the selected sources.
 
-## Indexer migration
+## Indexer discovery and owner services
 
-`peer_l1.indexer` selects cumulative migration stages. For the standalone
-`peer_l1` backend, put `indexer` directly in the extra-config object. Use the
-same stage, endpoint, and deployment on all prefill and decode ranks:
+Peer L1 and decode lending use KV Indexer for discovery. Configure
+`peer_l1.indexer` with the same endpoint and deployment on all prefill and decode
+ranks. For the standalone `peer_l1` backend, put `indexer` directly in the
+extra-config object. Both fields are required; missing values fail at startup.
 
 ```json
-{"peer_l1":{"l2_backend":"decode_lend+umbp","l2_write":"last_replica","indexer":{"stage":4,"endpoint":"127.0.0.1:50051","deployment":"example"}}}
+{"peer_l1":{"l2_backend":"decode_lend+umbp","l2_write":"last_replica","indexer":{"endpoint":"127.0.0.1:50051","deployment":"example"}}}
 ```
 
-| Stage | Discovery and ownership |
-|---|---|
-| 0 (default) | Original shm discovery and pins; directory names are unlinked after every rank maps them |
-| 1 | Decode lending reports to Indexer and grants pages by complete key with ACQUIRE |
-| 2 | Peer L1 also reports to Indexer; the selected candidate's shm provides rows and generations |
-| 3 | Native Unix socket owner RPCs grant pins; HIP callbacks enqueue reliable batched cleanup; shm is retained for F3 only |
-| 4 | Batched authoritative CONTAINS replaces F3 shm reads; peer directories use private anonymous memory |
-
-Stage 0 restores the original path for comparisons. These are engine startup
-options; changing a stage requires restarting all ranks. Stage 1 and later do
-not create the decode lending shm directory. Stage 4 creates neither directory.
-The deprecated multi-peer stitching diagnostic is disabled at stages 3 and 4,
-where remote shm probes are no longer permitted.
+Ownership remains authoritative on each owner. Peer L1 uses native Unix socket
+ACQUIRE, cancellation, RELEASE and LOOKUP; HIP callbacks enqueue reliable batched
+cleanup after device reads finish. F3 queries owners with batched CONTAINS before
+writing last replicas. Decode lending grants pages by complete key with ACQUIRE.
+Both owners keep their state in private memory; neither creates or maps a
+`/dev/shm` hint directory. The original shm implementation remains at `7ad884811e`.
 
 Run `kv-indexer-server` separately, using the wire protocol from SGLang upstream
 commit `2c362af4cc`. The protobuf source is `experimental/sgl-router/sgl-kv-indexer/proto/kv_indexer.proto`;
@@ -166,10 +159,10 @@ authorizes access to a row.
 `timeout_s` defaults to 0.05 for discovery and peer L1 control, `cooldown_s` to
 0.1, and `recovery_s` to 600. Reports have a minimum one-second RPC deadline.
 The discovery defaults were selected from the T2b 1P1D runs on n09-29 + n09-33,
-with Indexer on the decode node. Stage 4 runs 4144 / 4155 (`95f73e4907`) with
+with Indexer on the decode node. Indexer runs 4144 / 4155 (`95f73e4907`) with
 the former 0.01 / 1.0 defaults averaged 3.6% less throughput and 0.1 percentage
-point less cache hit rate than stage 0 runs 4139 / 4156. Run 4158 (`6157478408`)
-used 0.05 / 0.1: throughput was 1,243,024 versus the stage 0 mean of 1,242,820
+point less cache hit rate than runs 4139 / 4156 using the original shm path
+from `7ad884811e`. Run 4158 (`6157478408`) used 0.05 / 0.1: throughput was 1,243,024 versus the shm baseline mean of 1,242,820
 tok/s (+0.0%), TTFT p50 / p95 changed by +3.6% / -2.4%, and cache hit rate was
 96.14% versus 96.15%, with no errors or recomputations. A discovery timeout
 disables lending discovery during cooldown; peer L1 has a local fallback.
@@ -193,10 +186,10 @@ can remain stale during an outage; ACQUIRE still checks complete keys and pins.
 The publisher runs outside the scheduler thread. A request shares one discovery
 result between peer L1 and lending; requests over 16,384 pages require multiple
 bounded RPCs.
-Indexer failures use local shm probes before stage 3 and parallel LOOKUP from
-stage 3 onwards; lending falls back to DRAM. Namespaced requests skip Indexer,
-using local discovery and the DRAM tier. Partial peer L1 grants are released and
-remain misses; they do not introduce a different L2 stitching boundary.
+Indexer failures use parallel LOOKUP from node-local owners; lending falls back
+to DRAM. Namespaced requests skip Indexer, using local discovery and the DRAM
+tier. A peer must grant the complete requested prefix; refusal remains a miss
+and does not introduce a different L2 stitching boundary.
 
 The 60-second stats include discovery diagnostics. Counters are cumulative;
 take per-rank window deltas before summing them:
@@ -245,6 +238,5 @@ An owner that stays dead leaves cleanup retrying until collective engine shutdow
 individual-owner recovery remains outside this PoC. Placement hints are shared
 by peer and lending lookup, bounded to 128 request IDs and refreshed after 100 ms.
 With more than 128 waiting request IDs, eviction can reduce reuse to one RPC per
-match. Stage 4 F3 splits writes by chain; the additional offloads can fill
-TieredL2's 256-task queue and count toward `write_refused_pages`. This retains
-the per-node granularity of stages 0–3; tune only after measurement.
+match. F3 splits writes by chain; these offloads can fill TieredL2's 256-task
+queue and count toward `write_refused_pages`.

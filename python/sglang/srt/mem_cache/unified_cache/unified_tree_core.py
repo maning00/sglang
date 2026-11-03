@@ -1574,7 +1574,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     # Peer L1 records storage hashes and exact device values independently of
     # optional public KV events. Splits preserve the hash-to-slot relation.
     enable_l1_events = False
-    enable_l1_metadata = False
 
     def record_l1_event(self, node, *, attach: bool) -> None:
         if self.enable_l1_events:
@@ -1583,13 +1582,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     list(node.hash_value),
                     node.component_data[BASE_COMPONENT_TYPE].value if attach else None,
                     node.parent.hash_value[-1]
-                    if self.enable_l1_metadata
-                    and node.parent is not None
-                    and node.parent.hash_value
+                    if node.parent is not None and node.parent.hash_value
                     else None,
-                    self.enable_l1_metadata
-                    and node.key.extra_key is None
-                    and node.key.cache_salt is None,
+                    node.key.extra_key is None and node.key.cache_salt is None,
                 )
             )
 

@@ -1,6 +1,5 @@
-"""Ownership, real control sockets/shared directory, and RDMA completion boundaries."""
+"""Ownership, real control sockets, and RDMA completion boundaries."""
 
-import random
 import threading
 from collections import Counter
 from contextlib import nullcontext
@@ -14,7 +13,6 @@ import torch
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.allocator import (
     LendablePagedAllocator,
 )
-from sglang.srt.mem_cache.unified_cache.peer_l1.lend.directory import LendDirectory
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.lifecycle import unbind_decode_lend
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.pool import LendPool
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.protocol import (
@@ -42,7 +40,7 @@ def committed(p, count=2):
     records = p.allocate("writer", count)
     for i, r in enumerate(records):
         r[2] = key(i)
-    assert all(p.commit("writer", records))
+    assert all(p.commit("writer", [[*r, None] for r in records]))
     return records
 
 
@@ -78,7 +76,7 @@ def test_writing_is_never_timeout_reclaimed_and_stale_generation_is_rejected():
     new = p.allocate("writer", 10)
     for r in new:
         r[2] = key(r[0])
-    assert all(p.commit("writer", new))
+    assert all(p.commit("writer", [[*r, None] for r in new]))
     assert not p.pin("reader", [[r[0], r[1] - 1, r[2]] for r in new])
 
 
@@ -90,7 +88,7 @@ def test_unique_pinned_pages_budget_and_growth_gate():
     assert a and b and p.pinned == 10
     extra = p.allocate("writer", 1)
     extra[0][2] = key(100)
-    assert p.commit("writer", extra) == [True]
+    assert p.commit("writer", [[*r, None] for r in extra]) == [True]
     assert not p.pin("c", extra)
     p.decode_used = 901
     assert not p.allocate("writer", 1)
@@ -98,50 +96,6 @@ def test_unique_pinned_pages_budget_and_growth_gate():
     p.clock = lambda: 31
     p.expire()
     assert p.pinned == 0 and not p.leases
-
-
-def test_native_directory_conditional_removal_and_shared_mapping(tmp_path):
-    path = str(tmp_path / "lend")
-    first = LendDirectory(path, 17, create=True)
-    second = LendDirectory(path, 17)
-    try:
-        first.put(3, [[7, 1, key(1)]])
-        assert second.query([key(1), key(2)]) == [[3, 7, 1], [-1, 0, 0]]
-        second.put(3, [[7, 2, key(1)]])
-        first.remove(3, [[7, 1, key(1)]])
-        assert first.query([key(1)]) == [[3, 7, 2]]
-        first.remove(3, [[7, 2, key(1)]])
-        assert second.query([key(1)])[0][0] == -1
-        # Deletion must preserve probe chains, including a fully populated table.
-        records = [[i, 1, key(i)] for i in range(17)]
-        assert first.put(1, records) == 17
-        first.remove(1, records)
-        assert first.put(2, records) == 17
-    finally:
-        second.close()
-        first.close()
-
-
-def test_native_directory_churn_preserves_colliding_and_wrapped_entries(tmp_path):
-    directory = LendDirectory(str(tmp_path / "lend"), 17, create=True)
-    rng = random.Random(7)
-    expected = {}
-    try:
-        for _ in range(400):
-            n = rng.randrange(35)
-            record = [n + 1, rng.randrange(1, 8), key(n)]
-            if rng.randrange(2):
-                accepted = directory.put(2, [record])
-                if accepted:
-                    expected[key(n)] = [2, *record[:2]]
-            else:
-                directory.remove(2, [record])
-                if expected.get(key(n)) == [2, *record[:2]]:
-                    del expected[key(n)]
-            keys = [key(i) for i in range(35)]
-            assert directory.query(keys) == [expected.get(k, [-1, 0, 0]) for k in keys]
-    finally:
-        directory.close()
 
 
 def test_real_control_service_roundtrip():
@@ -154,8 +108,9 @@ def test_real_control_service_roundtrip():
         assert peer.epoch == p.epoch
         record = peer.call("ALLOC", [1]).data[0]
         record[2] = key(7)
-        assert peer.call("COMMIT", [record]).data == [True]
-        lease = peer.call("PIN", [record]).data[0]
+        assert peer.call("COMMIT", [[*record, None]]).data == [True]
+        lease, granted = peer.call("ACQUIRE", [record[2]]).data
+        assert granted == [record]
         assert lease
         p.request_demotions(1)
         peer.call("DEMOTED", [record])
@@ -302,7 +257,6 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
     )
 
     l2 = TieredL2.__new__(TieredL2)
-    l2.indexer_stage = 0
     l2._tasks = Queue(maxsize=1)
     l2._loads = Queue()
     l2._wake = threading.Event()
@@ -343,8 +297,7 @@ def test_restore_bypasses_full_write_queue(monkeypatch):
     assert l2._results.get_nowait() is True
 
 
-@pytest.mark.parametrize("stage", [0, 4])
-def test_stale_lend_page_only_recomputes_its_request(monkeypatch, stage):
+def test_stale_lend_page_only_recomputes_its_request(monkeypatch):
     from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
         LayerWiseLoadCounter,
@@ -361,13 +314,11 @@ def test_stale_lend_page_only_recomputes_its_request(monkeypatch, stage):
     )
     transport = LendTransport(
         SimpleNamespace(engine=None, kv_args=SimpleNamespace(kv_item_lens=[])),
-        acquire=bool(stage),
     )
     copied = []
     transport.transfer = lambda info, local, remote, **kw: copied.extend(local) or True
     l2 = TieredL2.__new__(TieredL2)
-    l2.indexer_stage, l2.page_size, l2.num_layers = stage, 1, 1
-    l2.directory = None if stage else MagicMock()
+    l2.page_size, l2.num_layers = 1, 1
     l2.transport, l2._peers, l2.lower = transport, {0: peer}, None
     l2._loads, l2._wake, l2._failed_loads = Queue(), threading.Event(), {}
     l2._load_counter = l2.layer_done_counter = LayerWiseLoadCounter(1)
@@ -410,7 +361,6 @@ def test_stale_lend_page_only_recomputes_its_request(monkeypatch, stage):
 
 def test_failed_peer_discovery_cools_down_and_new_registration_retries(monkeypatch):
     l2 = TieredL2.__new__(TieredL2)
-    l2.indexer_stage = 0
     info = SimpleNamespace(engine_key="old", decode_dp_rank=0, lend_port=1)
     l2.manager = SimpleNamespace(decode_kv_args_table={"old": info})
     l2.transport = SimpleNamespace(lengths=[])
@@ -442,7 +392,6 @@ def test_restore_runs_while_lower_write_is_pending():
     )
 
     l2 = TieredL2.__new__(TieredL2)
-    l2.indexer_stage = 0
     l2.page_size, l2.num_layers = 256, 1
     l2._peers, l2._loads = {}, Queue()
     l2.stats = Counter()
@@ -498,7 +447,7 @@ def test_expired_pin_data_is_discarded_after_drain(monkeypatch):
         lambda: clock[0],
     )
     peer = MagicMock(lease_s=30)
-    peer.call.return_value = SimpleNamespace(data=[1])
+    peer.call.return_value = SimpleNamespace(data=[1, [[1, 1, key(1)]]])
 
     def copy(*_, **__):
         clock[0] = 16
@@ -506,4 +455,4 @@ def test_expired_pin_data_is_discarded_after_drain(monkeypatch):
 
     transport.transfer = copy
     assert not transport.read(peer, [[1, 1, key(1)]], [2])
-    assert peer.call.call_args.args == ("UNPIN", [1])
+    peer.cleanup.assert_called_once_with("UNPIN", 1)

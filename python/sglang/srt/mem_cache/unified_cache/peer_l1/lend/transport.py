@@ -11,12 +11,11 @@ logger = logging.getLogger(__name__)
 
 
 class LendTransport:
-    def __init__(self, manager, *, acquire=False):
+    def __init__(self, manager):
         self.manager = manager
         self.engine = manager.engine
         self.lengths = list(manager.kv_args.kv_item_lens)
         self.staging = None
-        self.acquire = acquire
 
     def transfer(self, info, local_pages, remote_pages, *, write=False, staging=False):
         if len(local_pages) != len(remote_pages) or not local_pages:
@@ -70,30 +69,22 @@ class LendTransport:
         return success and all(s.Succeeded() for s in statuses)
 
     def read(self, peer, records, local_pages, *, staging=False):
-        started = time.monotonic()  # BEFORE PIN, including control-plane delay.
-        reply = (
-            peer.call("ACQUIRE", [r[2] for r in records])
-            if self.acquire
-            else peer.call("PIN", records)
-        )
+        started = time.monotonic()  # BEFORE ACQUIRE, including control-plane delay.
+        reply = peer.call("ACQUIRE", [r[2] for r in records])
         lease = reply.data[0] if reply is not None and reply.data else 0
         if not lease:
             return False
         try:
-            if self.acquire:
-                granted = reply.data[1]
-                if len(granted) != len(records):
-                    return False
-                records = granted
+            granted = reply.data[1]
+            if len(granted) != len(records):
+                return False
+            records = granted
             ok = self.transfer(
                 peer.info, local_pages, [r[0] for r in records], staging=staging
             )
             return ok and time.monotonic() - started < peer.lease_s / 2
         finally:
-            if self.acquire:
-                peer.cleanup("UNPIN", lease)
-            else:
-                peer.call("UNPIN", [lease])
+            peer.cleanup("UNPIN", lease)
 
 
 class DemotionStaging:

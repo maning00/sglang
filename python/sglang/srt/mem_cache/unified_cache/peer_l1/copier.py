@@ -26,7 +26,6 @@ def copy_module():
         cuda_files=["peer_l1/copy.cuh"],
         cuda_wrappers=[
             ("copy", "peer_l1::launch_copy"),
-            ("unpin", "peer_l1::enqueue_unpin"),
             ("cleanup", "peer_l1::enqueue_cleanup"),
         ],
     )
@@ -223,8 +222,8 @@ class CopyBatch:
     finish: object
     keys: list[str]
     error_cpu: torch.Tensor | None
-    # Own every temporary and all source directory mappings through the batch
-    # event, which is recorded after the unpin callback returns.
+    # Own every temporary and source grants through the batch
+    # event, which is recorded after the cleanup callback returns.
     keepalive: list = field(default_factory=list)
 
 
@@ -293,22 +292,15 @@ class L1Copier:
         sources = torch.empty(
             (len(keys), 2), dtype=torch.int64, device="cpu", pin_memory=True
         )
-        unpins, cleanups = [], []
+        cleanups = []
         offset = 0
         for plan in plans:
             count = len(plan.keys)
             sources[offset : offset + count, 0] = plan.peer
             sources[offset : offset + count, 1].copy_(torch.from_numpy(plan.rows))
             offset += count
-            if plan.cleanup:
-                cleanups.append(plan.cleanup)
-            else:
-                unpins.extend(
-                    (plan.directory.address, int(row)) for row in plan.reserved_rows
-                )
-        unpins = torch.tensor(unpins, dtype=torch.int64, device="cpu").reshape(-1, 2)
-        if cleanups:
-            cleanups = torch.tensor(cleanups, dtype=torch.int64, device="cpu")
+            cleanups.append(plan.cleanup)
+        cleanups = torch.tensor(cleanups, dtype=torch.int64, device="cpu")
         with torch.cuda.stream(self.stream):
             destinations = (
                 torch.cat([plan.indices.reshape(-1, 256)[:, 0] for plan in plans])
@@ -354,12 +346,9 @@ class L1Copier:
                     1, dtype=torch.int64, device="cpu", pin_memory=True
                 )
                 error_cpu.copy_(error, non_blocking=True)
-            if len(cleanups):
-                self.module.cleanup(
-                    cleanups, self.cleanup_callback, self.stream.cuda_stream
-                )
-            else:
-                self.module.unpin(unpins, self.stream.cuda_stream)
+            self.module.cleanup(
+                cleanups, self.cleanup_callback, self.stream.cuda_stream
+            )
             finish.record(self.stream)
         return CopyBatch(
             [plan.rid for plan in plans],
@@ -367,7 +356,16 @@ class L1Copier:
             finish,
             keys,
             error_cpu,
-            [plans, sources, unpins, destinations, source_gpu, jobs, error, job_begin],
+            [
+                plans,
+                sources,
+                cleanups,
+                destinations,
+                source_gpu,
+                jobs,
+                error,
+                job_begin,
+            ],
         )
 
     def _submit_sdma(self, plans, jobs, events):

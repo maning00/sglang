@@ -17,7 +17,6 @@ from .directory import _native
 # Keep aligned with native/owner.h::Operation.
 class Operation(IntEnum):
     LOOKUP = 1
-    ACQUIRE = 2
     RELEASE = 3
     CANCEL = 4
     CONTAINS = 5

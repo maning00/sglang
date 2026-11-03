@@ -21,8 +21,7 @@ using Clock = std::chrono::steady_clock;
 using Key = std::array<uint64_t, 4>;
 enum Operation : uint64_t {
   Lookup = 1,
-  Acquire,
-  Release,
+  Release = 3,
   Cancel,
   Contains,
   Cleanups,
@@ -186,7 +185,7 @@ private:
       finish(request.reader, request.seq);
       return {};
     }
-    if (request.op == Acquire || request.op == AcquireExact) {
+    if (request.op == AcquireExact) {
       if (saved != grants_.end())
         return saved->second.rows;
       if (request.seq <= completed_[request.reader])
@@ -214,8 +213,8 @@ private:
         gens.push_back(gen);
       }
     }
-    if (request.op == Acquire || request.op == AcquireExact) {
-      if (request.op == AcquireExact && rows.size() != keys.size()) {
+    if (request.op == AcquireExact) {
+      if (rows.size() != keys.size()) {
         completed_[request.reader] =
             std::max(completed_[request.reader], request.seq);
         return {};
@@ -237,7 +236,9 @@ private:
     auto deadline = Clock::now() + std::chrono::milliseconds(100);
     if (!transfer_bytes(fd, &request, sizeof(request), false, deadline) ||
         request.magic != Request{}.magic || request.n > (1 << 20) ||
-        request.op < Lookup || request.op > AcquireExact)
+        (request.op != Lookup && request.op != Release &&
+         request.op != Cancel && request.op != Contains &&
+         request.op != Cleanups && request.op != AcquireExact))
       return;
     std::vector<Key> keys(request.n);
     if (!transfer_bytes(fd, keys.data(), keys.size() * sizeof(Key), false,

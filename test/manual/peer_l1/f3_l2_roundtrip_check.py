@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
@@ -118,7 +119,7 @@ class Peer:
     def reserve(self, rid, num_pages):
         return True
 
-    def release_reservation(self, rid):
+    def release_reservation(self, rid, *, keep_placement=False):
         pass
 
     def load(self, rid, transfers):
@@ -146,6 +147,9 @@ class Peer:
 
     def finish_layer_wise_loading(self, index):
         return self.layer_done_counter.finish(index)
+
+    def finish_loads(self, index, rids):
+        return set() if self.finish_layer_wise_loading(index) else set(rids)
 
 
 def main():

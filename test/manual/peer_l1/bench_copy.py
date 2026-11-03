@@ -3,15 +3,14 @@
 PYTHONPATH=python python test/manual/peer_l1/bench_copy.py --ranks 2 --pages 256
 --skip-copy is the negative control: it must fail byte verification.
 --engine sdma copies through mori anvil SDMA queues instead of the copy kernel.
---owner-stage 3/4 exercises native grants and callback cleanup with shared/private
-owner state, including a pause beyond the test lease before any device read.
+Exercises native grants and callback cleanup with private owner state,
+including a pause beyond the test lease before any device read.
 """
 
 import argparse
 import hashlib
 import json
 import socket
-import tempfile
 import time
 from types import SimpleNamespace
 
@@ -32,7 +31,7 @@ from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
     full_keys,
 )
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import L1Copier, PeerMemoryMap
-from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
+from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory
 
 
 def keys(rank, count):
@@ -82,49 +81,28 @@ def worker(rank, args, port):
             )
         )
     group = DevicePoolGroup(entries, 61, 256, rank_replicated=True)
-    path = (
-        tempfile.mktemp(prefix="sglang_peer_l1_", dir="/dev/shm")
-        if args.owner_stage < 4
-        else None
-    )
-    directory = L1Directory(path, rows, count, create=True)
-    owner = OwnerService(directory, lease_s=0.02) if args.owner_stage else None
-    cleanup = CleanupQueue(timeout_s=0.2) if owner else None
+    directory = L1Directory(rows, count)
+    owner = OwnerService(directory, lease_s=0.02)
+    cleanup = CleanupQueue(timeout_s=0.2)
     local_keys = keys(rank, count)
-    (owner or directory).publish(local_keys, np.arange(1, count + 1))
+    owner.publish(local_keys, np.arange(1, count + 1))
     memory = PeerMemoryMap(
         group,
         rank,
         args.ranks,
         device,
         dist.group.WORLD,
-        (
-            path,
-            rows,
-            count,
-            owner.endpoint if owner else "",
-            owner.epoch if owner else 0,
-        ),
+        (owner.endpoint, owner.epoch),
     )
     peer = (rank + 1) % args.ranks
-    remote = (
-        L1Directory(*memory.directory_infos[peer][:3], create=False)
-        if args.owner_stage < 4
-        else None
-    )
-    control = (
-        OwnerPeer(
-            endpoint=memory.directory_infos[peer][3],
-            epoch=memory.directory_infos[peer][4],
-            pin_cap=count,
-            cleanup=cleanup,
-            timeout_s=0.2,
-        )
-        if owner
-        else None
+    control = OwnerPeer(
+        endpoint=memory.directory_infos[peer][0],
+        epoch=memory.directory_infos[peer][1],
+        pin_cap=count,
+        cleanup=cleanup,
+        timeout_s=0.2,
     )
     dist.barrier()
-    directory.unlink()
     copier = L1Copier(
         memory,
         layers=61,
@@ -137,42 +115,34 @@ def worker(rank, args, port):
     )
     forward = torch.cuda.current_stream()
     remote_keys = keys(peer, count)
-    if not control:
-        source_rows, gens = remote.probe(hash_words(remote_keys))
     destination = torch.arange((count + 1) * 256, (2 * count + 1) * 256, device=device)
     torch.cuda.synchronize()
     dist.barrier()
     timings = []
     for iteration in range(args.iterations + 1):
-        if control:
-            identities = full_keys(remote_keys)
-            split = max(1, count // 2)
-            grants = [
-                control.acquire(part)
-                for part in (identities[:split], identities[split:])
-                if len(part)
-            ]
-            assert all(grant is not None for grant in grants)
-            source_rows = np.concatenate([grant[0] for grant in grants])
-            item = grants[0][1]
-            dist.barrier()
-            # RPC connections have closed, and the lease has elapsed before any
-            # device read. Neither event may release the source rows.
-            time.sleep(0.04)
-            assert directory.pinned_refs == count
-            assert not directory.freeze()
-            dist.barrier()
-        else:
-            assert remote.pin(source_rows, gens)
-            item = 0
+        identities = full_keys(remote_keys)
+        split = max(1, count // 2)
+        grants = [
+            control.acquire(part)
+            for part in (identities[:split], identities[split:])
+            if len(part)
+        ]
+        assert all(grant is not None for grant in grants)
+        source_rows = np.concatenate([grant[0] for grant in grants])
+        item = grants[0][1]
+        dist.barrier()
+        # RPC connections have closed, and the lease has elapsed before any
+        # device read. Neither event may release the source rows.
+        time.sleep(0.04)
+        assert directory.pinned_refs == count
+        assert not directory.freeze()
+        dist.barrier()
         plan = SimpleNamespace(
             rid=str(iteration),
             peer=peer,
             keys=remote_keys,
             rows=source_rows,
             indices=destination,
-            directory=remote,
-            reserved_rows=source_rows,
             cleanup=item,
         )
         if args.skip_copy:
@@ -198,19 +168,13 @@ def worker(rank, args, port):
                 forward.cuda_stream,
             )
             failed = bool(error.item())
-            if control:
-                for _, item in grants:
-                    cleanup.enqueue(item)
-            else:
-                remote.unpin(source_rows)
+            for _, item in grants:
+                cleanup.enqueue(item)
             dist.barrier()
             memory.peer_storages.clear()
             dist.barrier()
-            if remote:
-                remote.close()
-            if owner:
-                cleanup.close()
-                owner.close()
+            cleanup.close()
+            owner.close()
             directory.close()
             dist.destroy_process_group()
             assert not failed, "negative control: skipped copy detected"
@@ -224,25 +188,22 @@ def worker(rank, args, port):
         copier.verify = iteration == 0
         forward.synchronize()
         start.record(copier.stream)
-        plans = [plan]
-        if control:
-            plans, offset = [], 0
-            for grant_rows, grant_cleanup in grants:
-                stop = offset + len(grant_rows)
-                plans.append(
-                    SimpleNamespace(
-                        **{
-                            **vars(plan),
-                            "rid": f"{iteration}:{offset}",
-                            "keys": remote_keys[offset:stop],
-                            "rows": grant_rows,
-                            "reserved_rows": grant_rows,
-                            "indices": destination[offset * 256 : stop * 256],
-                            "cleanup": grant_cleanup,
-                        }
-                    )
+        plans, offset = [], 0
+        for grant_rows, grant_cleanup in grants:
+            stop = offset + len(grant_rows)
+            plans.append(
+                SimpleNamespace(
+                    **{
+                        **vars(plan),
+                        "rid": f"{iteration}:{offset}",
+                        "keys": remote_keys[offset:stop],
+                        "rows": grant_rows,
+                        "indices": destination[offset * 256 : stop * 256],
+                        "cleanup": grant_cleanup,
+                    }
                 )
-                offset = stop
+            )
+            offset = stop
         batch = copier.submit(plans, forward)
         end.record(copier.stream)
         end.synchronize()
@@ -264,12 +225,11 @@ def worker(rank, args, port):
                 assert torch.equal(got, expected)
         if iteration:
             timings.append(start.elapsed_time(end))
-        if cleanup:
-            deadline = time.monotonic() + 5
-            while cleanup.pending:
-                assert time.monotonic() < deadline, "source cleanup did not drain"
-                time.sleep(0.001)
-            dist.barrier()
+        deadline = time.monotonic() + 5
+        while cleanup.pending:
+            assert time.monotonic() < deadline, "source cleanup did not drain"
+            time.sleep(0.001)
+        dist.barrier()
     dist.barrier()
     assert directory.pinned_refs == 0
     amount = count * sum(width * len(layers) for _, width, layers in layouts)
@@ -282,7 +242,6 @@ def worker(rank, args, port):
                 blocks=args.blocks,
                 layer_group=args.layer_group,
                 engine=args.engine,
-                owner_stage=args.owner_stage,
                 sdma_channels=args.sdma_channels,
                 ms=ms,
                 GBps=amount / ms / 1e6,
@@ -292,11 +251,8 @@ def worker(rank, args, port):
     )
     memory.peer_storages.clear()
     dist.barrier()
-    if remote:
-        remote.close()
-    if owner:
-        cleanup.close()
-        owner.close()
+    cleanup.close()
+    owner.close()
     directory.close()
     dist.destroy_process_group()
 
@@ -311,7 +267,6 @@ if __name__ == "__main__":
     parser.add_argument("--skip-copy", action="store_true")
     parser.add_argument("--engine", default="kernel", choices=["kernel", "sdma"])
     parser.add_argument("--sdma-channels", type=int, default=2)
-    parser.add_argument("--owner-stage", type=int, default=0, choices=[0, 3, 4])
     args = parser.parse_args()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

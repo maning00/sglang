@@ -17,7 +17,7 @@ def key(i):
 
 
 def _retire_process(connection, barrier):
-    directory = L1Directory(None, 32, 4, create=True)
+    directory = L1Directory(32, 4)
     service = OwnerService(directory)
     queue = CleanupQueue(timeout_s=0.1)
     try:

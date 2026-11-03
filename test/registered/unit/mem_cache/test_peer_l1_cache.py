@@ -6,9 +6,11 @@ from array import array
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+from test_peer_l1_indexer import eventually
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -17,10 +19,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.peer_l1.control import OwnerPeer, OwnerService
+from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
+    CleanupQueue,
+    Operation,
+    OwnerPeer,
+    OwnerService,
+    full_keys,
+)
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import distinct_stream
-from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
-from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import IndexerConfig
+from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory
 from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker
 from sglang.srt.mem_cache.unified_cache.peer_l1.owner import L1Owner
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -28,8 +35,17 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
-def test_flush_refuses_private_loads_offloads_and_remote_pins(tmp_path, caplog):
-    directory = L1Directory(str(tmp_path / "flush"), 17, 4, create=True)
+def test_flush_refuses_private_loads_offloads_and_remote_pins(caplog):
+    directory = L1Directory(17, 4)
+    service = OwnerService(directory)
+    cleanup = CleanupQueue(timeout_s=0.2)
+    peer = OwnerPeer(
+        endpoint=service.endpoint,
+        epoch=service.epoch,
+        pin_cap=4,
+        cleanup=cleanup,
+        timeout_s=0.2,
+    )
     wrapper = SimpleNamespace(inflight_load_rids=["r"], pending_offloads=[])
     owner = L1Owner.__new__(L1Owner)
     owner.cache = SimpleNamespace(linker=wrapper)
@@ -39,7 +55,7 @@ def test_flush_refuses_private_loads_offloads_and_remote_pins(tmp_path, caplog):
     owner._hold, owner._zombies = set(), set()
     keys = ["0" * 64]
     try:
-        directory.publish(keys, [1])
+        service.publish(keys, [1])
         assert not owner.begin_flush()
         assert "local loads" in caplog.text
         wrapper.inflight_load_rids.clear()
@@ -47,16 +63,18 @@ def test_flush_refuses_private_loads_offloads_and_remote_pins(tmp_path, caplog):
         assert not owner.begin_flush()
         assert "offloads" in caplog.text
         wrapper.pending_offloads.clear()
-        rows, gens = directory.probe(hash_words(keys))
-        assert directory.pin(rows, gens)
+        rows, grant = peer.acquire(full_keys(keys))
         assert not owner.begin_flush()
-        directory.unpin(rows)
+        cleanup.enqueue(grant)
+        eventually(lambda: directory.pinned_refs == 0)
         assert owner.begin_flush()
-        assert not directory.pin(rows, gens)
+        assert peer.acquire(full_keys(keys)) is None
         directory.thaw()
-        assert directory.pin(rows, gens)
-        directory.unpin(rows)
+        rows, grant = peer.acquire(full_keys(keys))
+        cleanup.enqueue(grant)
     finally:
+        cleanup.close()
+        service.close()
         directory.close()
 
 
@@ -97,7 +115,7 @@ def test_hip_event_waits_for_host_callback():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache fixtures need CUDA")
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
+def test_pinned_eviction_compensates_and_reclaims(backend):
     cache, allocator, _ = build_fixture(
         CacheConfig(page_size=4, kv_size=64, num_layers=2), tree_core_backend=backend
     )
@@ -107,12 +125,20 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
         )
     cache.tree_core.enable_external_cache_linker = True
     cache.write_through_threshold = (1 << 63) - 1
-    directory = L1Directory(str(tmp_path / "directory"), 17, 4, create=True)
+    directory = L1Directory(17, 4)
+    control = OwnerService(directory)
+    cleanup = CleanupQueue(timeout_s=0.2)
+    peer = OwnerPeer(
+        endpoint=control.endpoint,
+        epoch=control.epoch,
+        pin_cap=4,
+        cleanup=cleanup,
+        timeout_s=0.2,
+    )
     linker = SimpleNamespace(
         directory=directory,
-        control=None,
-        publisher=None,
-        indexer_config=IndexerConfig(),
+        control=control,
+        publisher=MagicMock(),
         device=allocator.device,
         check_hooks=True,
         stats=Counter(),
@@ -136,12 +162,11 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
         first_keys = [
             key
             for key in owner._published
-            if directory.probe(hash_words([key]))[0][0] in first_rows
+            if peer.request(Operation.LOOKUP, full_keys([key]))[0] in first_rows
         ]
-        rows_and_gens = [directory.probe(hash_words([key])) for key in first_keys]
         # Pin separately so key-set ordering cannot affect the assertion.
-        for rows, gens in rows_and_gens:
-            assert directory.pin(rows, gens)
+        grants = [peer.acquire(full_keys([key])) for key in first_keys]
+        assert all(grants)
         # The older leaf is pinned; its replacement must be compensated by
         # another eviction, without making those still-readable rows reusable.
         result = cache.evict(EvictParams(num_tokens=8))
@@ -149,8 +174,9 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
         assert allocator.available_size() == 56
         assert owner.deferred_tokens == 8
         assert linker.stats["compensation_rounds"] >= 1
-        for rows, _ in rows_and_gens:
-            directory.unpin(rows)
+        for _, grant in grants:
+            cleanup.enqueue(grant)
+        eventually(lambda: directory.pinned_refs == 0)
         assert owner.reclaim() == 8
         assert allocator.available_size() == 64
         assert owner.deferred_tokens == 0
@@ -169,8 +195,8 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
         owner.poll(torch.cuda.current_stream())
         owner.stream.synchronize()
         owner.poll(torch.cuda.current_stream())
-        rows, gens = directory.probe(hash_words(sorted(owner._published)))
-        assert len(rows) == 2 and directory.pin(rows, gens)
+        rows, grant = peer.acquire(full_keys(sorted(owner._published)))
+        assert len(rows) == 2
         linker.has_unstarted_reservations = True
         cache.evict_for_alloc(EvictParams(num_tokens=8))
         assert owner.deferred_tokens == 8 and allocator.available_size() == 0
@@ -185,7 +211,7 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
         def release_when_waiting():
             while not stop.wait(0.001):
                 if linker.stats["capacity_waits"]:
-                    directory.unpin(rows)
+                    cleanup.enqueue(grant)
                     return
 
         reader = threading.Thread(target=release_when_waiting)
@@ -200,6 +226,8 @@ def test_pinned_eviction_compensates_and_reclaims(tmp_path, backend):
         allocator.free(occupied[8:])
     finally:
         owner.stream.synchronize()
+        cleanup.close()
+        control.close()
         directory.close()
 
 
@@ -230,10 +258,7 @@ def test_split_preserves_publications_and_eviction_retires_them(backend):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache fixtures need CUDA")
-@pytest.mark.parametrize("stage", [0, 4])
-def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(
-    tmp_path, stage
-):
+def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written():
     """With L2 written only for last copies, an evicted page that a peer still
     publishes is freed at once, and a page no peer holds is handed to L2 and
     stays allocated until that write lands (it is read asynchronously)."""
@@ -242,21 +267,22 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(
     )
     cache.tree_core.enable_external_cache_linker = True
     cache.write_through_threshold = (1 << 63) - 1
-    directory = L1Directory(
-        None if stage else str(tmp_path / "own"), 17, 4, create=True
+    directory = L1Directory(17, 4)
+    peer = L1Directory(17, 4)
+    control = OwnerService(directory)
+    peer_control = OwnerService(peer)
+    local = OwnerPeer(
+        endpoint=control.endpoint,
+        epoch=control.epoch,
+        pin_cap=4,
+        cleanup=None,
+        timeout_s=0.2,
     )
-    peer = L1Directory(None if stage else str(tmp_path / "peer"), 17, 4, create=True)
-    control = OwnerService(directory) if stage else None
-    peer_control = OwnerService(peer) if stage else None
-    executor = ThreadPoolExecutor(max_workers=1) if stage else None
+    executor = ThreadPoolExecutor(max_workers=1)
     linker = SimpleNamespace(
         directory=directory,
         control=control,
-        publisher=None,
-        indexer_config=IndexerConfig(
-            stage=stage, endpoint="unused", deployment="f3-check"
-        ),
-        peers={} if stage else {1: peer},
+        publisher=MagicMock(),
         controls={
             1: OwnerPeer(
                 endpoint=peer_control.endpoint,
@@ -265,9 +291,7 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(
                 cleanup=None,
                 timeout_s=0.2,
             )
-        }
-        if stage
-        else {},
+        },
         _rpc_pool=executor,
         device=allocator.device,
         check_hooks=True,
@@ -296,10 +320,10 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(
         shared_keys = [
             key
             for key in owner._published
-            if int(directory.probe(hash_words([key]))[0][0]) in shared_rows
+            if int(local.request(Operation.LOOKUP, full_keys([key]))[0]) in shared_rows
         ]
         assert len(shared_keys) == 2
-        (peer_control or peer).publish(shared_keys, [1, 2])
+        peer_control.publish(shared_keys, [1, 2])
 
         cache.evict(EvictParams(num_tokens=16))
         assert len(writes) == 1
@@ -314,9 +338,8 @@ def test_last_replica_eviction_writes_to_l2_and_holds_rows_until_written(
         assert allocator.available_size() == 64 and owner.deferred_tokens == 0
     finally:
         owner.stream.synchronize()
-        if executor:
-            executor.shutdown()
-            control.close()
-            peer_control.close()
+        executor.shutdown()
+        control.close()
+        peer_control.close()
         peer.close()
         directory.close()

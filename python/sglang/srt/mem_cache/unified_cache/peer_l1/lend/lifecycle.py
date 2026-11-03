@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 
 def install_decode_lend(scheduler):
+    from ..indexer import IndexerConfig, PlacementPublisher
+
+    raw = get_memory().hicache_storage_backend_extra_config
+    config = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    indexer = IndexerConfig(**config.get("peer_l1", config).get("indexer", {}))
+
     manager = scheduler.disagg_decode_prealloc_queue.kv_manager
     outer = scheduler.token_to_kv_pool_allocator
     cache = outer.get_kvcache()
@@ -48,15 +54,8 @@ def install_decode_lend(scheduler):
     outer.full_attn_allocator = LendablePagedAllocator.install(
         inner, pool, forward_stream=scheduler.forward_stream
     )
-    from ..indexer import IndexerConfig, PlacementPublisher
-
-    raw = get_memory().hicache_storage_backend_extra_config
-    config = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-    indexer = IndexerConfig(**config.get("peer_l1", config).get("indexer", {}))
-    worker_id = ""
-    if indexer.stage:
-        worker_id = f"{indexer.deployment}/lend/{socket.gethostname()}/dp{get_parallel().attn_dp_rank}"
-        pool.publisher = PlacementPublisher(config=indexer, worker_id=worker_id)
+    worker_id = f"{indexer.deployment}/lend/{socket.gethostname()}/dp{get_parallel().attn_dp_rank}"
+    pool.publisher = PlacementPublisher(config=indexer, worker_id=worker_id)
     scheduler.decode_lend_service = LendService(
         pool,
         manager.local_ip,

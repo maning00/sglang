@@ -1,4 +1,4 @@
-"""Phase 0a: the peer L1 copy against real mori EP dispatch/combine and a GEMM.
+"""The peer L1 copy against real mori EP dispatch/combine and a GEMM.
 
 PYTHONPATH=python python test/manual/peer_l1/bench_ep_interference.py --blocks 8,16,32,64
 
@@ -15,7 +15,7 @@ import hashlib
 import json
 import os
 import socket
-import tempfile
+import time
 from types import SimpleNamespace
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
@@ -30,8 +30,14 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
+from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
+    CleanupQueue,
+    OwnerPeer,
+    OwnerService,
+    full_keys,
+)
 from sglang.srt.mem_cache.unified_cache.peer_l1.copier import L1Copier, PeerMemoryMap
-from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory, hash_words
+from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory
 
 # Unified fp8 Pro row geometry, as in bench_copy.py.
 LAYOUTS = [
@@ -71,26 +77,28 @@ def build_copy(rank, world, pages, device, inflight):
             )
         )
     group = DevicePoolGroup(entries, 61, 256, rank_replicated=True)
-    path = tempfile.mktemp(prefix="sglang_peer_l1_bench_", dir="/dev/shm")
-    directory = L1Directory(path, rows, pin_cap, create=True)
-    directory.publish(page_keys(rank, pages), np.arange(1, pages + 1))
+    directory = L1Directory(rows, pin_cap)
+    owner = OwnerService(directory)
+    cleanup = CleanupQueue(timeout_s=0.2)
+    owner.publish(page_keys(rank, pages), np.arange(1, pages + 1))
     memory = PeerMemoryMap(
-        group, rank, world, device, dist.group.WORLD, (path, rows, pin_cap)
+        group, rank, world, device, dist.group.WORLD, (owner.endpoint, owner.epoch)
     )
     peer = (rank + 1) % world
-    remote = L1Directory(*memory.directory_infos[peer], create=False)
-    source_rows, gens = remote.probe(hash_words(page_keys(peer, pages)))
+    remote = OwnerPeer(
+        endpoint=memory.directory_infos[peer][0],
+        epoch=memory.directory_infos[peer][1],
+        pin_cap=pin_cap,
+        cleanup=cleanup,
+        timeout_s=0.2,
+    )
     destination = torch.arange((pages + 1) * 256, (2 * pages + 1) * 256, device=device)
     plan = SimpleNamespace(
         peer=peer,
         keys=page_keys(peer, pages),
-        rows=source_rows,
         indices=destination,
-        directory=remote,
-        reserved_rows=source_rows,
-        cleanup=0,
     )
-    return memory, directory, remote, plan, gens
+    return memory, directory, owner, cleanup, remote, plan
 
 
 def build_ep(rank, world, tokens):
@@ -152,7 +160,7 @@ def worker(rank, args, port):
     dist.init_process_group(
         "cpu:gloo,cuda:nccl", rank=rank, world_size=world, device_id=device
     )
-    memory, directory, remote, plan, gens = build_copy(
+    memory, directory, owner, cleanup, remote, plan = build_copy(
         rank, world, args.pages, device, args.copy_iters + 2
     )
     ep_step = build_ep(rank, world, args.tokens)
@@ -175,8 +183,10 @@ def worker(rank, args, port):
         forward = torch.cuda.current_stream()
 
         def copy_once(tag):
-            assert remote.pin(plan.rows, gens)
-            p = SimpleNamespace(rid=tag, **vars(plan))
+            grant = remote.acquire(full_keys(plan.keys))
+            assert grant is not None
+            rows, item = grant
+            p = SimpleNamespace(rid=tag, rows=rows, cleanup=item, **vars(plan))
             return copier.submit([p], forward)
 
         def copy_loop(count=None, until=None):
@@ -264,7 +274,12 @@ def worker(rank, args, port):
 
     torch.cuda.synchronize()
     dist.barrier()
-    # Every reader's host callbacks have unpinned this rank's rows.
+    deadline = time.monotonic() + 5
+    while cleanup.pending:
+        assert time.monotonic() < deadline, "source cleanup did not drain"
+        time.sleep(0.001)
+    dist.barrier()
+    # Every reader's cleanup has released this rank's rows.
     assert directory.pinned_refs == 0, directory.pinned_refs
     gathered = [None] * world
     dist.all_gather_object(gathered, (results, memcpy_gbps))
@@ -288,7 +303,8 @@ def worker(rank, args, port):
         )
     memory.peer_storages.clear()
     dist.barrier()
-    remote.close()
+    cleanup.close()
+    owner.close()
     directory.close()
 
 

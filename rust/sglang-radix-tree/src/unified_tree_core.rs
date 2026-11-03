@@ -657,7 +657,6 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Whether a direct device-to-external-cache linker is wired.
     pub(crate) enable_external_cache_linker: bool,
     pub(crate) enable_l1_events: bool,
-    pub(crate) enable_l1_metadata: bool,
     pub(crate) l1_events: Vec<L1Event>,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
@@ -942,7 +941,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_storage: false,
             enable_external_cache_linker: false,
             enable_l1_events: false,
-            enable_l1_metadata: false,
             l1_events: Vec::new(),
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
@@ -2385,7 +2383,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     pub(crate) fn l1_metadata_(&self, node_id: NodeIdx_) -> (Option<String>, bool) {
-        if !self.enable_l1_metadata {
+        if !self.enable_l1_events {
             return (None, false);
         }
         let node = self.arena.node(node_id);

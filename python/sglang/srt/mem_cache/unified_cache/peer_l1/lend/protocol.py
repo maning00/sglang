@@ -88,8 +88,6 @@ class LendService:
                                 data = self.pool.acquire(writer, request.seq, args)
                             elif op == "CANCEL_ACQUIRE":
                                 self.pool.cancel_acquire(writer, args[0])
-                            elif op == "PIN":
-                                data = [self.pool.pin(writer, args)]
                             elif op == "UNPIN":
                                 self.pool.unpin(writer, args[0])
                             elif op == "DEMOTED":
@@ -113,11 +111,12 @@ class LendService:
                     events = list(self.pool.events)
                     self.pool.events.clear()
                 for op, writer, records in events:
-                    recipients = peers if op == "EVICTED" else [writer.encode("ascii")]
-                    for identity in recipients:
-                        sock.send_multipart(
-                            [identity, encode(Message(0, op, self.pool.epoch, records))]
-                        )
+                    sock.send_multipart(
+                        [
+                            writer.encode("ascii"),
+                            encode(Message(0, op, self.pool.epoch, records)),
+                        ]
+                    )
         finally:
             sock.close()
 

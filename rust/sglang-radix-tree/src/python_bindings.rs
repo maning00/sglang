@@ -2171,14 +2171,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.detach(|| self.core().enable_l1_events)
     }
 
-    fn set_enable_l1_metadata(&self, py: Python<'_>, value: bool) {
-        py.detach(|| self.core().enable_l1_metadata = value);
-    }
-
-    fn enable_l1_metadata(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().enable_l1_metadata)
-    }
-
     fn take_l1_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let events = py.detach(|| std::mem::take(&mut self.core().l1_events));
         let list = PyList::empty(py);
@@ -2310,7 +2302,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .detach(|| {
                 let core = self.core();
                 let transfers = core.build_external_linker_offload_transfers(node_id)?;
-                let metadata = if core.enable_l1_metadata {
+                let metadata = if core.enable_l1_events {
                     Some(core.l1_metadata_(core.arena.resolve(node_id)?))
                 } else {
                     None
@@ -3548,14 +3540,6 @@ macro_rules! tree_core_binding {
 
             fn enable_l1_events(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.enable_l1_events(py)))
-            }
-
-            fn set_enable_l1_metadata(&self, py: Python<'_>, value: bool) -> PyResult<()> {
-                catch_native_panic(|| { self.inner.set_enable_l1_metadata(py, value); Ok(()) })
-            }
-
-            fn enable_l1_metadata(&self, py: Python<'_>) -> PyResult<bool> {
-                catch_native_panic(|| Ok(self.inner.enable_l1_metadata(py)))
             }
 
             fn take_l1_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {

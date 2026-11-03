@@ -14,7 +14,10 @@ from sglang.srt.mem_cache.unified_cache.peer_l1.control import (
     full_keys,
 )
 from sglang.srt.mem_cache.unified_cache.peer_l1.directory import L1Directory
-from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import report_batches
+from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
+    Placements,
+    report_batches,
+)
 from sglang.srt.mem_cache.unified_cache.peer_l1.lend.pool import LendPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -40,8 +43,8 @@ def cleanup_drained(peer, pool):
 
 
 @pytest.fixture
-def owner(tmp_path):
-    directory = L1Directory(str(tmp_path / "directory"), 32, 4, create=True)
+def owner():
+    directory = L1Directory(32, 4)
     service = OwnerService(directory, lease_s=0.02)
     queue = CleanupQueue(timeout_s=0.02)
     peer = OwnerPeer(
@@ -62,21 +65,19 @@ def owner(tmp_path):
 def test_owner_timeout_and_disconnect_do_not_release_source(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    rows = peer.request(2, full_keys([key(1)]), seq=1)
+    rows = peer.request(Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=1)
     assert rows.tolist() == [3]
-    assert peer.request(2, full_keys([key(1)]), seq=1).tolist() == [3]
+    assert peer.request(
+        Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=1
+    ).tolist() == [3]
     assert directory.pinned_refs == 1
     time.sleep(0.04)
     # Each RPC closes its connection. Neither close nor expiry authorizes reuse.
-    assert peer.request(2, full_keys([key(1)]), seq=2).tolist() == []
-    mapping = L1Directory(directory.path, 32, 4, create=False)
-    try:
-        service.retire([key(1)])
-        from sglang.srt.mem_cache.unified_cache.peer_l1.directory import hash_words
-
-        assert not mapping.contains(hash_words([key(1)]))[0]
-    finally:
-        mapping.close()
+    assert (
+        peer.request(Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=2).tolist() == []
+    )
+    service.retire([key(1)])
+    assert not peer.contains(full_keys([key(1)]))[0]
     assert not directory.freeze()
     with pytest.raises(RuntimeError, match="pinned"):
         service.publish([key(2)], [3])
@@ -92,13 +93,19 @@ def test_cancel_before_acquire_and_repeated_cleanup(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
     assert peer.request(4, full_keys([]), seq=8).tolist() == []
-    assert peer.request(2, full_keys([key(1)]), seq=8).tolist() == []
+    assert (
+        peer.request(Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=8).tolist() == []
+    )
     assert directory.pinned_refs == 0
-    assert peer.request(2, full_keys([key(1)]), seq=9).tolist() == [3]
+    assert peer.request(
+        Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=9
+    ).tolist() == [3]
     for _ in range(2):
         queue.enqueue(queue.prepare(peer, 9, cancel=True))
     eventually(lambda: queue.pending == 0 and directory.pinned_refs == 0)
-    assert peer.request(2, full_keys([key(1)]), seq=9).tolist() == []
+    assert (
+        peer.request(Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=9).tolist() == []
+    )
 
 
 def test_full_key_authority_and_pin_cap(owner):
@@ -113,9 +120,25 @@ def test_full_key_authority_and_pin_cap(owner):
     assert _queue.pending == 0
 
 
+def test_collisions_churn_and_cap(owner):
+    directory, service, queue, peer = owner
+    # Same hash bucket, but distinct full keys; repeated retirement reuses slots.
+    keys = ["0" * 16 + f"{i:016x}" + "0" * 32 for i in range(5)]
+    for _ in range(100):
+        service.publish(keys, range(5))
+        assert peer.lookup(full_keys(keys)) == 4
+        rows, grant = peer.acquire(full_keys(keys[:4]))
+        assert rows.tolist() == list(range(4))
+        assert peer.acquire(full_keys(keys[4:])) is None
+        service.retire(keys)
+        assert peer.lookup(full_keys(keys)) == 0
+        queue.enqueue(grant)
+        eventually(lambda: queue.pending == 0 and directory.pinned_refs == 0)
+
+
 def test_retire_order_requires_at_least_one_writer(owner):
     directory, service, _queue, peer = owner
-    other_directory = L1Directory(None, 32, 4, create=True)
+    other_directory = L1Directory(32, 4)
     other = OwnerService(other_directory)
     other_peer = OwnerPeer(
         endpoint=other.endpoint,
@@ -142,7 +165,7 @@ def test_lend_acquire_arbitrary_pages_cancel_and_expiry():
     records = pool.allocate("writer", 4)
     for i, record in enumerate(records):
         record[2] = key(i)
-    assert all(pool.commit("writer", records))
+    assert all(pool.commit("writer", [[*r, None] for r in records]))
     lease, granted = pool.acquire("reader", 3, [key(0), key(2)])
     assert [r[2] for r in granted] == [key(0), key(2)]
     assert pool.acquire("reader", 3, [key(0), key(2)]) == [lease, granted]
@@ -242,7 +265,12 @@ def test_cleanup_survives_lost_grant_send_failure_and_lost_ack(owner):
         allow_cleanup.set()
         eventually(lambda: queue.pending == 0 and directory.pinned_refs == 0)
         assert lost_ack[0]
-        assert peer.request(2, full_keys([key(1)]), seq=peer.seq).tolist() == []
+        assert (
+            peer.request(
+                Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=peer.seq
+            ).tolist()
+            == []
+        )
     finally:
         stop.set()
         thread.join()
@@ -344,7 +372,6 @@ def test_publisher_recovers_missing_revoke_restart_and_concurrent_retire():
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     config = IndexerConfig(
-        stage=1,
         endpoint=f"127.0.0.1:{port}",
         deployment="test",
         recovery_s=0.2,
@@ -397,7 +424,9 @@ def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
 
     from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
 
-    client = indexer.IndexerClient(indexer.IndexerConfig())
+    client = indexer.IndexerClient(
+        indexer.IndexerConfig(endpoint="unused", deployment="test")
+    )
     now = [100.0]
     monkeypatch.setattr(indexer, "time", SimpleNamespace(monotonic=lambda: now[0]))
     monkeypatch.setattr(indexer, "MAX_HASHES", 2)
@@ -481,7 +510,9 @@ def test_publisher_stats_include_failed_recovery_and_retry_gap(monkeypatch):
         channel=SimpleNamespace(unsubscribe=lambda callback: None),
     )
     publisher = indexer.PlacementPublisher(
-        config=indexer.IndexerConfig(), worker_id="test/lend/dp0", client=client
+        config=indexer.IndexerConfig(endpoint="unused", deployment="test"),
+        worker_id="test/lend/dp0",
+        client=client,
     )
     try:
         publisher.publish([(key(1), None)])
@@ -557,7 +588,9 @@ def test_publisher_retries_exact_batch_before_newer_deltas(monkeypatch, operatio
         channel=SimpleNamespace(unsubscribe=lambda callback: None),
     )
     publisher = indexer.PlacementPublisher(
-        config=indexer.IndexerConfig(), worker_id="test/lend/dp0", client=client
+        config=indexer.IndexerConfig(endpoint="unused", deployment="test"),
+        worker_id="test/lend/dp0",
+        client=client,
     )
     publisher._stop = SimpleNamespace(
         wait=lambda delay: waits.append(delay) or False, set=lambda: None
@@ -626,7 +659,9 @@ def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
         channel=SimpleNamespace(unsubscribe=lambda callback: None),
     )
     publisher = indexer.PlacementPublisher(
-        config=indexer.IndexerConfig(cooldown_s=0.001, recovery_s=60),
+        config=indexer.IndexerConfig(
+            endpoint="unused", deployment="test", cooldown_s=0.001, recovery_s=60
+        ),
         worker_id="test/lend/dp0",
         client=client,
     )
@@ -660,7 +695,9 @@ def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
 def test_old_epoch_cleanup_does_not_touch_current_grant(owner):
     directory, service, queue, peer = owner
     service.publish([key(1)], [3])
-    assert peer.request(2, full_keys([key(1)]), seq=1).tolist() == [3]
+    assert peer.request(
+        Operation.ACQUIRE_EXACT, full_keys([key(1)]), seq=1
+    ).tolist() == [3]
     current_epoch = peer.epoch
     peer.epoch ^= 1
     queue.enqueue(queue.prepare(peer, 1))
@@ -688,7 +725,7 @@ def test_lend_cleanup_retries_send_failure_and_missing_ack():
     pool.add_free(range(1, 10))
     record = pool.allocate("writer", 1)[0]
     record[2] = key(1)
-    assert pool.commit("writer", [record]) == [True]
+    assert pool.commit("writer", [[*record, None]]) == [True]
     service = LendService(pool, "127.0.0.1")
     peer = LendPeer(
         SimpleNamespace(endpoint="127.0.0.1", lend_port=service.port),
@@ -742,7 +779,6 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
 
     from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
     from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
-        IndexerConfig,
         Placements,
         block_hash,
     )
@@ -751,7 +787,6 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
 
     keys = [key(i) for i in range(130)]
     l1 = PeerL1Linker.__new__(PeerL1Linker)
-    l1.indexer_config = IndexerConfig(stage=3, endpoint="unused", deployment="test")
     l1.controls = {
         0: SimpleNamespace(pin_cap=4, available=lambda: True),
         1: SimpleNamespace(pin_cap=3, available=lambda: True),
@@ -765,12 +800,11 @@ def test_discovery_keeps_peer_prefix_and_lend_scattered_coverage_distinct():
             "unknown": set(map(block_hash, keys)),
         }
     )
-    l1.sources = l1.controls
     l1.placements = Placements(SimpleNamespace(lookup=lambda hashes: matches))
     l1.placement = l1.placements.get("r", keys)
     assert len(l1.discover(keys, start=1).rows) == 4
     l2 = TieredL2.__new__(TieredL2)
-    l2.indexer_stage, l2.l1, l2.manager, l2.lower = 1, l1, object(), None
+    l2.l1, l2.manager, l2.lower = l1, object(), None
     l2._peers = {
         0: SimpleNamespace(worker_id="lend0"),
         1: SimpleNamespace(worker_id="lend1"),
@@ -813,7 +847,7 @@ def test_lend_reads_more_than_owner_pin_limit_in_chunks():
         allocated = pool.allocate("writer", min(64, 130 - start))
         for i, record in enumerate(allocated, start):
             record[2] = key(i)
-        assert all(pool.commit("writer", allocated))
+        assert all(pool.commit("writer", [[*r, None] for r in allocated]))
         records.extend(allocated)
     assert pool.pin_limit == 64 and len(records) == 130
     service = LendService(pool, "127.0.0.1")
@@ -821,7 +855,7 @@ def test_lend_reads_more_than_owner_pin_limit_in_chunks():
         SimpleNamespace(endpoint="127.0.0.1", lend_port=service.port), lambda *_: None
     )
     manager = SimpleNamespace(engine=None, kv_args=SimpleNamespace(kv_item_lens=[]))
-    transport = LendTransport(manager, acquire=True)
+    transport = LendTransport(manager)
     sizes = []
 
     def copy(_info, local, remote, **_kwargs):
@@ -857,11 +891,11 @@ def test_cancel_keeps_submitted_grant_until_completion(owner, submitted):
     linker = PeerL1Linker.__new__(PeerL1Linker)
     linker.cleanup = queue
     linker.stats = Counter()
-    linker.placements = None
+    linker.placements = Placements(None)
     linker._lookups = {}
     linker._queued = {} if submitted else {"r": object()}
     linker._inflight = {"r"} if submitted else set()
-    linker._reservations = {"r": Reservation(0, [key(1)], rows, None, cleanup)}
+    linker._reservations = {"r": Reservation(0, [key(1)], rows, cleanup=cleanup)}
     linker._collective_guard = None
     linker.release_reservation("r")
     linker.release_reservation("r")
@@ -884,7 +918,6 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(
 
     import numpy as np
 
-    from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import IndexerConfig
     from sglang.srt.mem_cache.unified_cache.peer_l1.owner import L1Owner
 
     directory, service, _queue, peer = owner
@@ -909,10 +942,9 @@ def test_f3_retires_whole_batch_before_query_and_drops_retired_metadata(
         return np.array([elsewhere, False], dtype=bool)
 
     cache_owner.linker = SimpleNamespace(
-        publisher=None,
+        publisher=SimpleNamespace(retire=lambda keys: None),
         stats=Counter(),
         contains_peers=contains,
-        indexer_config=IndexerConfig(stage=4, endpoint="unused", deployment="test"),
     )
     cache_owner.last_replica_writer = lambda keys, rows, **_metadata: (
         writes.append(
@@ -965,7 +997,6 @@ def test_lookup_failure_cools_owner_and_discovery_skips_it(owner, monkeypatch):
     from types import SimpleNamespace
 
     from sglang.srt.mem_cache.unified_cache.peer_l1.indexer import (
-        IndexerConfig,
         Placements,
     )
     from sglang.srt.mem_cache.unified_cache.peer_l1.linker import PeerL1Linker
@@ -979,8 +1010,7 @@ def test_lookup_failure_cools_owner_and_discovery_skips_it(owner, monkeypatch):
     assert peer.lookup(full_keys(keys)) == peer.lookup(full_keys(keys)) == 0
     assert len(calls) == 1
     linker = PeerL1Linker.__new__(PeerL1Linker)
-    linker.indexer_config = IndexerConfig(stage=3, endpoint="unused", deployment="test")
-    linker.sources = {0: peer}
+    linker.controls = {0: peer}
     linker.worker_ids = {0: "peer"}
     cache = Placements(SimpleNamespace(lookup=lambda hashes: {"peer": set(hashes)}))
     linker.placement = cache.get("r", keys)

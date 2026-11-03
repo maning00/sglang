@@ -1,8 +1,4 @@
-"""Batched native operations on a peer's process-shared directory.
-
-The host-only library deliberately does not initialize a GPU runtime. This lets
-the identical pin protocol run in CPU tests and in the HIP stream callback.
-"""
+"""Private owner state; remote access is mediated by the native owner service."""
 
 from __future__ import annotations
 
@@ -69,14 +65,8 @@ def _native():
     signatures = {
         "bytes": [ctypes.c_uint32],
         "init": [ptr, ctypes.c_uint32, ctypes.c_uint64],
-        "publish": [ptr, ptr, ptr, size],
-        "retire": [ptr, ptr, ptr, size],
-        "probe": [ptr, ptr, ptr, ptr, size],
-        "contains": [ptr, ptr, ptr, size],
-        "pin": [ptr, ptr, ptr, size],
-        "unpin": [ptr, ptr, size],
         "states": [ptr, ptr, ptr, ptr, size],
-        **{name: [ptr] for name in ("refs", "freeze", "thaw", "rebuild")},
+        **{name: [ptr] for name in ("refs", "freeze", "thaw")},
     }
     native.l1_error.restype = ctypes.c_char_p
 
@@ -93,91 +83,15 @@ def _native():
     return native
 
 
-def hash_words(keys) -> np.ndarray:
-    """The first 128 SHA-256 bits, with the same byte order on every worker."""
-    return np.frombuffer(
-        b"".join(bytes.fromhex(key[:32]) for key in keys), dtype="<u8"
-    ).reshape(-1, 2)
-
-
 class L1Directory:
-    def __init__(self, path: str, rows: int, pin_cap: int, *, create: bool):
-        self.path, self.num_rows, self.pin_cap = path, rows, pin_cap
+    def __init__(self, rows: int, pin_cap: int):
+        self.num_rows, self.pin_cap = rows, pin_cap
         self._native = _native()
-        self._owner = create
-        self._retired = 0
-        length = self._native.l1_bytes(rows)
-        if path is None:
-            if not create:
-                raise ValueError("Private peer L1 directories must be owned locally")
-            self._mapping = mmap.mmap(
-                -1, length, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
-            )
-            self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
-            self._native.l1_init(self.address, rows, pin_cap)
-            return
-        fd = os.open(path, os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0), 0o600)
-        try:
-            if create:
-                os.ftruncate(fd, length)
-            if os.fstat(fd).st_size != length:
-                raise ValueError("Peer L1 directory has an incompatible size")
-            self._mapping = mmap.mmap(fd, length)
-        finally:
-            os.close(fd)
+        self._mapping = mmap.mmap(
+            -1, self._native.l1_bytes(rows), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        )
         self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
-        if create:
-            self._native.l1_init(self.address, rows, pin_cap)
-        else:
-            self._native.l1_refs(self.address)  # Validate the header before use.
-
-    def probe(self, hashes: np.ndarray):
-        count = min(len(hashes), self.pin_cap)
-        rows, gens = np.empty(count, dtype=np.int64), np.empty(count, dtype=np.int64)
-        count = self._native.l1_probe(
-            self.address, hashes.ctypes.data, rows.ctypes.data, gens.ctypes.data, count
-        )
-        return rows[:count], gens[:count]
-
-    def contains(self, hashes: np.ndarray) -> np.ndarray:
-        """Whether each hash is published, unlike probe without stopping at a miss."""
-        found = np.empty(len(hashes), dtype=np.int64)
-        if len(hashes):
-            self._native.l1_contains(
-                self.address, hashes.ctypes.data, found.ctypes.data, len(hashes)
-            )
-        return found.astype(bool)
-
-    def pin(self, rows: np.ndarray, gens: np.ndarray) -> bool:
-        return bool(
-            self._native.l1_pin(
-                self.address, rows.ctypes.data, gens.ctypes.data, len(rows)
-            )
-        )
-
-    def unpin(self, rows: np.ndarray):
-        self._native.l1_unpin(self.address, rows.ctypes.data, len(rows))
-
-    def publish(self, keys, rows):
-        hashes, rows = hash_words(keys), np.ascontiguousarray(rows, dtype=np.int64)
-        if len(hashes) != len(rows):
-            raise ValueError("Peer L1 publication needs one hash per row")
-        self._native.l1_publish(
-            self.address, hashes.ctypes.data, rows.ctypes.data, len(rows)
-        )
-
-    def retire(self, keys, *, aligned=False) -> np.ndarray:
-        """Rows of the retired keys; with aligned, one entry per key, -1 if absent."""
-        hashes = hash_words(keys)
-        rows = np.empty(len(hashes), dtype=np.int64)
-        self._native.l1_retire(
-            self.address, hashes.ctypes.data, rows.ctypes.data, len(rows)
-        )
-        self._retired += len(rows)
-        if self._retired >= self.num_rows:
-            self._native.l1_rebuild(self.address)
-            self._retired = 0
-        return rows if aligned else rows[rows >= 0]
+        self._native.l1_init(self.address, rows, pin_cap)
 
     def states(self, rows):
         rows = np.ascontiguousarray(rows, dtype=np.int64)
@@ -201,14 +115,8 @@ class L1Directory:
     def thaw(self):
         self._native.l1_thaw(self.address)
 
-    def unlink(self):
-        """Drop the name once every peer has mapped it; mappings stay valid."""
-        if self._owner and self.path is not None:
-            Path(self.path).unlink(missing_ok=True)
-
     def close(self):
         if self._mapping is None:
             return
         self._mapping.close()
         self._mapping = None
-        self.unlink()

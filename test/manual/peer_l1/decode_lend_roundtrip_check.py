@@ -1,12 +1,13 @@
 """GPU byte checks for DSv4 decode lending, mixed L2 reads and DRAM demotion.
 
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-    MORI_RDMA_DEVICES=bnxt_re0 python test/manual/peer_l1/decode_lend_roundtrip_check.py
+    MORI_RDMA_DEVICES=ionic_2 python test/manual/peer_l1/decode_lend_roundtrip_check.py \
+        --indexer 127.0.0.1:50051
 
 Uses the production 61-layer/182-region unified fp8 layout on two GPUs. No model
 weights are needed. Control plane, RDMA and UMBP are real; the scheduler and PD
 registration are represented by their already-registered manager descriptors.
---indexer HOST:PORT enables real gRPC discovery/reporting and key-based ACQUIRE.
+--indexer HOST:PORT supplies real gRPC discovery/reporting and key-based ACQUIRE.
 """
 
 import argparse
@@ -126,11 +127,10 @@ def wait_write(l2):
 
 
 def restore(l2, keys, pages):
-    if l2.indexer_stage:
-        l2.l1.placements.get("restore", keys)
-    assert l2.lookup("restore", [PoolTransfer(name=PoolName.KV, keys=keys)])[-1] == len(
-        keys
-    )
+    l2.l1.placements.get("restore", keys)
+    assert l2.lookup(
+        "restore", [PoolTransfer(name=PoolName.KV, keys=keys, indexer_eligible=True)]
+    )[-1] == len(keys)
     assert l2.load("restore", [transfer(keys, pages)])
     index = l2.start_layer_wise_loading()
     l2.layer_done_counter.set_consumer(index)
@@ -385,13 +385,11 @@ def check_overlap_lending(prefill, decode):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--indexer", help="Upstream Indexer gRPC endpoint")
-    args = parser.parse_args()
-    config = (
-        IndexerConfig(stage=1, endpoint=args.indexer, deployment="lend-roundtrip")
-        if args.indexer
-        else IndexerConfig()
+    parser.add_argument(
+        "--indexer", required=True, help="Upstream Indexer gRPC endpoint"
     )
+    args = parser.parse_args()
+    config = IndexerConfig(endpoint=args.indexer, deployment="lend-roundtrip")
     get_context().override_server_args(
         dsv4_attn_backend="flashmla", enable_deepseek_v4_fp4_indexer=True
     ).install()
@@ -436,19 +434,14 @@ def main():
         page_size=PAGE,
         pool_group=lower.pool_group,
         rank=0,
-        cpu_group=None,
-        directory=SimpleNamespace(num_rows=PAGES),
-        indexer_config=config,
-        indexer=IndexerClient(config) if args.indexer else None,
-        placement=(None, None),
+        indexer=IndexerClient(config),
     )
-    l1.placements = Placements(l1.indexer) if args.indexer else None
+    l1.placements = Placements(l1.indexer)
     # 16 writes admitted; first eight pages in HBM, next eight in DRAM.
     pool = LendPool(PAGES, limit=0.25)
     pool.add_free(range(1, 9))
     worker_id = "lend-roundtrip/lend/dp0"
-    if args.indexer:
-        pool.publisher = PlacementPublisher(config=config, worker_id=worker_id)
+    pool.publisher = PlacementPublisher(config=config, worker_id=worker_id)
     service = LendService(
         pool, "127.0.0.1", layout=source_args.kv_item_lens, worker_id=worker_id
     )
@@ -485,18 +478,17 @@ def main():
         assert l2.offload([transfer(keys, written)])
         wait_write(l2)
         assert l2.stats["write_pages"] == 8
-        if args.indexer:
-            deadline = time.monotonic() + 10
-            while (
-                len(
-                    (l1.indexer.lookup([block_hash(k) for k in keys]) or {}).get(
-                        worker_id, set()
-                    )
+        deadline = time.monotonic() + 10
+        while (
+            len(
+                (l1.indexer.lookup([block_hash(k) for k in keys]) or {}).get(
+                    worker_id, set()
                 )
-                != 8
-            ):
-                assert time.monotonic() < deadline, "lending publication missing"
-                time.sleep(0.01)
+            )
+            != 8
+        ):
+            assert time.monotonic() < deadline, "lending publication missing"
+            time.sleep(0.01)
         fill(original_spans, rng)  # original source slots have now been reused
         restore(l2, keys, restored)
         got = read(ranges(lower, restored))
@@ -510,15 +502,10 @@ def main():
         while l2.stats["demote_pages"] < 8:
             assert time.monotonic() < deadline, "demotion did not complete"
             time.sleep(0.01)
-        if args.indexer:
-            deadline = time.monotonic() + 10
-            while (l1.indexer.lookup([block_hash(k) for k in keys]) or {}).get(
-                worker_id
-            ):
-                assert time.monotonic() < deadline, "demoted placement still published"
-                time.sleep(0.01)
-        else:
-            assert all(v[0] < 0 for v in l2.directory.query(keys))
+        deadline = time.monotonic() + 10
+        while (l1.indexer.lookup([block_hash(k) for k in keys]) or {}).get(worker_id):
+            assert time.monotonic() < deadline, "demoted placement still published"
+            time.sleep(0.01)
         fill(ranges(lower, restored), rng)
         restore(l2, keys, restored)
         assert all(
@@ -546,15 +533,13 @@ def main():
                     "staging_rebind": True,
                     "gpu_reclaim": True,
                     "overlap_lending": True,
-                    "indexer_stage": config.stage,
                 }
             )
         )
     finally:
         l2.close()
         service.close()
-        if l1.indexer:
-            l1.indexer.close()
+        l1.indexer.close()
         for engine, descs in ((prefill, source_descs), (decode, target_descs)):
             for desc in descs:
                 engine.deregister_memory(desc)

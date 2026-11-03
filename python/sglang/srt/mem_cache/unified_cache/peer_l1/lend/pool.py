@@ -139,8 +139,7 @@ class LendPool:
     def commit(self, writer, records):
         with self.lock:
             result, published = [], []
-            for record in records:
-                page, gen, key = record[:3]
+            for page, gen, key, parent in records:
                 if not self._matches(page, gen):
                     result.append(False)
                     continue
@@ -162,8 +161,8 @@ class LendPool:
                     p.state, p.key = "valid", key
                     self.keys[key] = page
                     self.lru[page] = None
-                    if self.publisher and len(record) == 4:
-                        published.append((key, record[3]))
+                    if self.publisher:
+                        published.append((key, parent))
                     result.append(True)
             if published:
                 self.publisher.publish(published)
@@ -273,7 +272,6 @@ class LendPool:
                 self._revoked.append(p.key)
             if self.keys.get(p.key) == page:
                 del self.keys[p.key]
-            self.events.append(("EVICTED", p.writer, [self._record(page)]))
         self.lru.pop(page, None)
         self.pages[page] = Page(p.generation)
         self.free[page] = None

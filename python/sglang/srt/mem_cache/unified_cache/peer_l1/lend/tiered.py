@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import uuid
 from collections import Counter, defaultdict, deque
 from dataclasses import replace
 from queue import Empty, Full, Queue
@@ -20,7 +19,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.utils import get_device_module
 
-from .directory import LendDirectory
 from .protocol import LendPeer
 from .transport import DemotionStaging, LendTransport
 
@@ -59,10 +57,7 @@ class TieredL2(UnifiedCacheLinker):
 
         self.page_size, self.num_layers = l1.page_size, l1.pool_group.num_layers
         self.lower = lower
-        self.indexer_stage = l1.indexer_config.stage
         self.l1 = l1
-        l1.indexer_discovery = bool(self.indexer_stage)
-        self.directory = self._open_directory(l1) if not self.indexer_stage else None
         rank = l1.rank
         self._load_counter = LayerWiseLoadCounter(self.num_layers)
         self.layer_done_counter = (
@@ -97,49 +92,6 @@ class TieredL2(UnifiedCacheLinker):
         self._rank = rank
         self._next_stats_log = time.monotonic() + _STATS_LOG_SECONDS
 
-    @staticmethod
-    def _open_directory(l1):
-        rank, group = l1.rank, l1.cpu_group
-        path = [
-            f"/dev/shm/sglang_decode_lend_{uuid.uuid4().hex}" if rank == 0 else None
-        ]
-        distributed = torch.distributed.is_initialized()
-        if distributed:
-            torch.distributed.broadcast_object_list(path, src=0, group=group)
-        # Prefill can have a much smaller KV pool than decode (e.g. the 186 GB
-        # prefill limit). Size hints for the node's possible decode HBM instead.
-        page_bytes = sum(
-            size
-            for entry in l1.pool_group.entries
-            for component in entry.buffer_meta
-            for _, _, size in component
-        )
-        world = torch.distributed.get_world_size(group) if distributed else 1
-        capacity = max(
-            1024,
-            2
-            * world
-            * (
-                torch.cuda.get_device_properties(
-                    torch.cuda.current_device()
-                ).total_memory
-                // page_bytes
-            ),
-        )
-        if rank == 0:
-            directory = LendDirectory(path[0], capacity, create=True)
-        if distributed:
-            torch.distributed.barrier(group=group)
-        if rank != 0:
-            directory = LendDirectory(path[0], capacity)
-        # Every rank has mapped the directory, so a crash after this point leaves
-        # no named segment behind in /dev/shm.
-        if distributed:
-            torch.distributed.barrier(group=group)
-        if rank == 0:
-            directory.unlink()
-        return directory
-
     def bind_cache(self, cache):
         if self.lower:
             self.lower.bind_cache(cache)
@@ -164,7 +116,7 @@ class TieredL2(UnifiedCacheLinker):
             else:
                 time.sleep(0.001)
         self.manager = manager
-        self.transport = LendTransport(manager, acquire=bool(self.indexer_stage))
+        self.transport = LendTransport(manager)
         if self.lower:
             if self.staging is None:
                 self.staging = DemotionStaging(
@@ -199,8 +151,6 @@ class TieredL2(UnifiedCacheLinker):
         self.manager = self.transport = None
 
     def discover(self, keys, *, rid=None, eligible=False):
-        if not self.indexer_stage:
-            return self.directory.query(keys)
         placement = self.l1.placements.entries.get(rid)
         if placement is None or placement.eligible != eligible:
             placement = self.l1.placements.get(rid, keys, eligible=eligible)
@@ -231,13 +181,12 @@ class TieredL2(UnifiedCacheLinker):
         ]
 
     def release_reservation(self, rid):
-        if self.indexer_stage:
-            self.l1.placements.pop(rid)
+        self.l1.placements.pop(rid)
 
     def lookup(self, rid, transfers):
         kv = next(t for t in transfers if t.name == PoolName.KV)
-        # The directory is node-wide; a page on a decode rank this prefill rank has
-        # no live peer for cannot be read here, and lend holds its only copy.
+        # Discovery can include a decode rank without a live connection from this
+        # prefill rank. Its lent pages cannot be read here.
         values = (
             self.discover(kv.keys, rid=rid, eligible=kv.indexer_eligible)
             if self.manager
@@ -249,7 +198,7 @@ class TieredL2(UnifiedCacheLinker):
         self.stats["lookup_calls"] += 1
         self.stats["lookup_pages"] += len(kv.keys)
         self.stats["lookup_lend_pages"] += sum(present)
-        if self.indexer_stage and self.manager and kv.indexer_eligible:
+        if self.manager and kv.indexer_eligible:
             placement = self.l1.placements.entries.get(rid)
             if placement is not None and placement.matches is None:
                 self.stats["lookup_discovery_unavailable_calls"] += 1
@@ -407,11 +356,7 @@ class TieredL2(UnifiedCacheLinker):
             self._peers[info.decode_dp_rank] = peer
 
     def _on_event(self, peer, message):
-        rank = peer.info.decode_dp_rank
-        if message.op == "EVICTED":
-            if self.directory is not None:
-                self.directory.remove(rank, message.data)
-        elif message.op == "DEMOTE":
+        if message.op == "DEMOTE":
             for start in range(0, len(message.data), _DEMOTE_BATCH_PAGES):
                 self._demotions.append(
                     (peer, message.data[start : start + _DEMOTE_BATCH_PAGES])
@@ -503,8 +448,6 @@ class TieredL2(UnifiedCacheLinker):
             ).tolist()
             for rank, items in grouped.items():
                 if not self._read_pinned(self._peers.get(rank), kv, items, pages):
-                    if self.directory is not None:
-                        self.directory.remove(rank, [r for _, r in items])
                     self.stats["pin_or_read_miss_pages"] += len(items)
                     failed.add(rid)
                     self.stats["failed_restore_requests"] += 1
@@ -558,14 +501,13 @@ class TieredL2(UnifiedCacheLinker):
             kv.device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         ).tolist()
         remaining = list(range(len(pages)))
-        if self.indexer_stage and not kv.indexer_eligible:
+        if not kv.indexer_eligible:
             peers = []
         else:
             peers = list(self._peers.items())
         # Rotate the first decode rank so writes, and later restores, spread over
         # all decode NICs instead of filling the first registered rank.
-        if self.indexer_stage:
-            peers = [(rank, peer) for rank, peer in peers if peer.worker_id]
+        peers = [(rank, peer) for rank, peer in peers if peer.worker_id]
         if peers:
             start = self._next_write_peer % len(peers)
             self._next_write_peer += 1
@@ -587,25 +529,13 @@ class TieredL2(UnifiedCacheLinker):
                     [r[0] for r in records],
                     write=True,
                 ):
-                    commits = (
-                        [
-                            r + [kv.keys[i - 1] if i else kv.first_parent]
-                            for r, i in zip(records, selected)
-                        ]
-                        if self.indexer_stage
-                        else records
-                    )
+                    commits = [
+                        r + [kv.keys[i - 1] if i else kv.first_parent]
+                        for r, i in zip(records, selected)
+                    ]
                     reply = peer.call("COMMIT", commits)
                     if reply is not None:
                         committed = [i for i, ok in enumerate(reply.data) if ok]
-                        published = (
-                            self.directory.put(rank, [records[i] for i in committed])
-                            if self.directory is not None
-                            else len(committed)
-                        )
-                        self.stats["directory_refused_pages"] += (
-                            len(committed) - published
-                        )
             finally:
                 # Also handles a lost COMMIT reply: ABORT is idempotent and
                 # only touches WRITING; already committed pages stay valid.
@@ -637,8 +567,6 @@ class TieredL2(UnifiedCacheLinker):
                 read = time.monotonic()
                 self.stats["demote_read_ms"] += int((read - started) * 1000)
                 if self.staging.put(self.lower, records):
-                    if self.directory is not None:
-                        self.directory.remove(peer.info.decode_dp_rank, records)
                     self.stats["demote_pages"] += len(records)
                 self.stats["demote_put_ms"] += int((time.monotonic() - read) * 1000)
         finally:
@@ -650,8 +578,7 @@ class TieredL2(UnifiedCacheLinker):
         self._loads.join()
         self._pending.clear()
         self._failed_loads.clear()
-        if self.indexer_stage:
-            self.l1.placements.clear()
+        self.l1.placements.clear()
         if self.lower:
             self.lower.reset()
         self._load_counter.reset()
@@ -666,7 +593,5 @@ class TieredL2(UnifiedCacheLinker):
             self.lower.close()
         if self.staging:
             self.staging.release()
-        if self.directory is not None:
-            self.directory.close()
         logger.info("decode lend L2 stats: %s", self.stats)
         self._closed = True
