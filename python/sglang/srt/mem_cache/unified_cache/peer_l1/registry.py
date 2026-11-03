@@ -58,9 +58,12 @@ def topology(config: DomainConfig) -> Topology:
         dist.all_gather_object(entries, (socket.gethostname(), identity), group=group)
         if any(entry[1] != identity for entry in entries):
             raise ValueError("peer domain identity must agree across instance ranks")
-        resources.peer_l1_topology = Topology(
-            config.instance_id or entries[0][0], tuple(e[0] for e in entries)
+        instance_id = (
+            config.instance_id.replace("{hostname}", entries[0][0]) or entries[0][0]
         )
+        if "/" in instance_id:
+            raise ValueError("invalid peer domain configuration")
+        resources.peer_l1_topology = Topology(instance_id, tuple(e[0] for e in entries))
     return resources.peer_l1_topology
 
 

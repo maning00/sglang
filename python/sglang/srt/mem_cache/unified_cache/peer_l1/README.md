@@ -286,19 +286,55 @@ usable. HTTP is never called from an inference request.
 
 The `peer_l1.domain` object accepts `enabled`, `instance_id`, `seeds` (instance API
 URLs) and `kv_compatibility_id`. When enabled all three identity/discovery fields
-are required. Otherwise the instance uses rank 0's hostname, gathered at startup;
-no new configuration is required. Two instances on one host must not reuse a
-deployment without explicit instance identities. Worker IDs are
+are required. With sharing disabled, omitting `instance_id` uses rank 0's hostname,
+gathered at startup; no new configuration is required. Two instances on one host
+must not reuse a deployment without explicit instance identities. Worker IDs are
 `deployment/instance_id/role/dpN`; they contain no addresses. A restarted logical
 instance keeps its ID; replacement with a new ID requires the deployment to CLEAR
 old worker records explicitly. Upgrading from the older worker-ID format also
 requires clearing the old records or using fresh Indexer state.
+
+`instance_id` supports the literal `{hostname}` placeholder, for example
+`"prefill-{hostname}"`. Startup expands it using rank 0's hostname from the
+existing instance-wide all-gather, then validates the resulting ID (no `/`).
+Every rank must supply the same template; follower hostnames do not affect it.
+The ID is restart-stable while the leader hostname stays unchanged. Two instances
+on the same leader host must not share this template in one deployment; use
+distinct fixed prefixes or explicit IDs. Moving the leader or changing its
+hostname changes the expanded ID and requires the old-worker cleanup described
+above. Only `{hostname}` is substituted.
+
+Seeds are instance API base URLs, such as `http://PREFILL_A_IP:6100`, with an
+optional trailing slash. The resolver appends `/peer_l1/owners`; do not include
+that path or use the Indexer/native-owner endpoint. Both prefills may use the
+same seed list including themselves: after fetching a manifest, the resolver
+skips its own `instance_id` before creating owner or RDMA sessions.
 
 Owner identity, KV compatibility, membership and capability changes require a
 restart in this version. This includes weight or adapter-generation changes
 that would change compatibility. Decoder lending keeps its existing PD
 registration; its HELLO validates a configured compatibility ID too. Set the same
 `domain.kv_compatibility_id` on the lending decoder when the prefill uses one.
+
+For 2P1D with lending, merge these discovery settings into the existing
+`--hicache-storage-backend-extra-config`, retaining the UMBP/F3/stitch settings.
+Both prefills use the same JSON, `l2_backend="decode_lend+umbp"` (or
+`"decode_lend"` without UMBP), and the existing peer-L1 linker launch flags:
+
+```json
+{"peer_l1":{"indexer":{"endpoint":"INDEXER_IP:50061","deployment":"xdomain-2p1d"},"domain":{"enabled":true,"instance_id":"prefill-{hostname}","kv_compatibility_id":"weights-layout-v1","seeds":["http://PREFILL_A_IP:6100","http://PREFILL_B_IP:6100"]}}}
+```
+
+The decoder uses `--disaggregation-decode-lend-kv` with the existing MoRI lending
+prerequisites. It needs the same Indexer endpoint/deployment and compatibility ID,
+but no cross-instance resolver or seeds. `enabled=false` does not require a
+compatibility ID at config parsing; it is nevertheless required here because the
+prefills check it during lending HELLO. Its instance ID may be omitted to use
+the leader hostname, or supplied explicitly as below:
+
+```json
+{"peer_l1":{"indexer":{"endpoint":"INDEXER_IP:50061","deployment":"xdomain-2p1d"},"domain":{"enabled":false,"instance_id":"decode-{hostname}","kv_compatibility_id":"weights-layout-v1"}}}
+```
 
 ## RDMA failure quarantine
 

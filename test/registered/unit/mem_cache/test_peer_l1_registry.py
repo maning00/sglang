@@ -3,6 +3,7 @@
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.unified_cache.peer_l1.registry import (
     PeerDescriptor,
     Resolver,
     merge_manifests,
+    topology,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -193,9 +195,50 @@ def test_cross_instance_configuration_requires_explicit_identity():
         DomainConfig(enabled=True, seeds=("http://peer",), kv_compatibility_id="w")
 
 
-def test_successful_removal_is_not_revived_by_a_failed_duplicate_seed():
-    from types import SimpleNamespace
+@pytest.mark.parametrize(
+    "template, expected",
+    [
+        ("", "leader"),
+        ("fixed", "fixed"),
+        ("{hostname}", "leader"),
+        ("p-{hostname}", "p-leader"),
+    ],
+)
+def test_instance_identity_expands_only_the_gathered_leader_hostname(
+    monkeypatch, template, expected
+):
+    import socket
 
+    import torch.distributed as dist
+
+    from sglang.srt import runtime_context
+
+    config = DomainConfig(instance_id=template)
+    resources = SimpleNamespace(peer_l1_topology=None)
+    parallel = SimpleNamespace(world_group=SimpleNamespace(cpu_group=object()))
+    monkeypatch.setattr(runtime_context, "get_resources", lambda: resources)
+    monkeypatch.setattr(runtime_context, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    hosts = ["leader", "follower"]
+
+    def gather(output, local, *, group):
+        output[:] = [(host, local[1]) for host in hosts]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    for host in hosts:
+        resources.peer_l1_topology = None
+        monkeypatch.setattr(socket, "gethostname", lambda: host)
+        assert topology(config).instance_id == expected
+        assert topology(config).hosts == tuple(hosts)
+    if "{hostname}" in template:
+        resources.peer_l1_topology = None
+        hosts[0] = "invalid/leader"
+        with pytest.raises(ValueError, match="invalid peer domain"):
+            topology(config)
+        assert resources.peer_l1_topology is None
+
+
+def test_successful_removal_is_not_revived_by_a_failed_duplicate_seed():
     desc = descriptor(SimpleNamespace(epoch=1, endpoint="tcp://127.0.0.1:1"))
     manifest = OwnerManifest(deployment="test", instance_id="p", owners=(desc,))
     responses = {"a": manifest, "b": manifest}
@@ -210,6 +253,9 @@ def test_successful_removal_is_not_revived_by_a_failed_duplicate_seed():
     resolver.compatibility_id = "weights-v1"
     resolver._manifests, resolver._stop, resolver._read = {}, threading.Event(), read
     assert desc.worker_id in resolver._candidates()[0]
+    resolver.instance_id = desc.instance_id
+    assert not resolver._candidates()[0]
+    resolver.instance_id = "reader"
     responses.update(a=msgspec.structs.replace(manifest, owners=()), b=None)
     assert not resolver._candidates()[0]
     responses["a"] = None
