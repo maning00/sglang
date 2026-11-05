@@ -1,12 +1,10 @@
 """IPC eligibility and backend-local slots; global ranks never index a GPU kernel."""
 
-import ctypes
 import socket
+from uuid import UUID
 
 import msgspec
 import torch
-
-from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
 
 
 class DeviceInfo(msgspec.Struct, frozen=True):
@@ -15,19 +13,18 @@ class DeviceInfo(msgspec.Struct, frozen=True):
     visible: tuple[str, ...]
 
 
+def _device_uuid(ordinal):
+    # PyTorch exposes the runtime's visible-device identity. Its _CUuuid string
+    # has a GPU- prefix; uuid.UUID also accepts the simulator's UUID object.
+    value = UUID(str(torch.cuda.get_device_properties(ordinal).uuid).removeprefix("GPU-"))
+    if not value.int:
+        raise RuntimeError("PyTorch returned an empty peer GPU UUID")
+    return value.hex
+
+
 def exchange_devices(group, device):
     torch.cuda.current_device()
-    hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
-    hip.hipDeviceGetUuid.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    hip.hipDeviceGetUuid.restype = ctypes.c_int
-    identities = []
-    for ordinal in range(torch.cuda.device_count()):
-        uuid = ctypes.create_string_buffer(16)
-        if hip.hipDeviceGetUuid(uuid, ordinal):
-            raise RuntimeError("Unable to identify peer GPU")
-        if not any(uuid.raw):
-            raise RuntimeError("HIP returned an empty peer GPU UUID")
-        identities.append(uuid.raw.hex())
+    identities = [_device_uuid(ordinal) for ordinal in range(torch.cuda.device_count())]
     local = DeviceInfo(
         socket.gethostname(), identities[device.index], tuple(identities)
     )
