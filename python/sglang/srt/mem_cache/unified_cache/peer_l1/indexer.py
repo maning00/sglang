@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import random
 import threading
 import time
 import zlib
@@ -72,13 +74,26 @@ class IndexerConfig(msgspec.Struct, frozen=True, kw_only=True):
     deployment: str = ""
     timeout_s: float = 0.05
     cooldown_s: float = 0.1
-    recovery_s: float = 600.0
+    # Maximum sparse full-repair interval; independent phases use 80–100%.
+    # Zero disables only this fallback, not event-driven recovery.
+    recovery_s: float = 3600.0
+    # Full-repair event/startup staggering; coalesced requests keep earliest due.
+    recovery_jitter_s: float = 5.0
 
     def __post_init__(self):
         if not self.endpoint or not self.deployment:
             raise ValueError("indexer requires endpoint and deployment")
-        if min(self.timeout_s, self.cooldown_s, self.recovery_s) <= 0:
-            raise ValueError("indexer timeouts must be positive")
+        if not all(
+            math.isfinite(v) and v > 0 for v in (self.timeout_s, self.cooldown_s)
+        ):
+            raise ValueError("indexer timeouts must be finite and positive")
+        if not all(
+            math.isfinite(v) and v >= 0
+            for v in (self.recovery_s, self.recovery_jitter_s)
+        ):
+            raise ValueError(
+                "indexer recovery intervals must be finite and nonnegative"
+            )
 
 
 def block_hash(key):
@@ -116,6 +131,8 @@ class IndexerClient:
 
         self.config, self.pb = config, pb
         self.channel = grpc.insecure_channel(config.endpoint)
+        self._ready = threading.Event()
+        self._connect_future = None
         self.apply = self.channel.unary_unary(
             "/kv_indexer.v1.KVIndexer/ApplyExternalKvBatch",
             request_serializer=pb.ApplyExternalKvBatchRequest.SerializeToString,
@@ -204,14 +221,52 @@ class IndexerClient:
     def on_reconnect(self, callback):
         import grpc
 
+        seen_ready, was_ready = False, False
+        lock = threading.Lock()
+
         def changed(state):
-            if state == grpc.ChannelConnectivity.READY:
+            nonlocal seen_ready, was_ready
+            pending = None
+            with lock:
+                ready = state == grpc.ChannelConnectivity.READY
+                if ready:
+                    self._ready.set()
+                    pending, self._connect_future = self._connect_future, None
+                else:
+                    self._ready.clear()
+                reconnect = ready and seen_ready and not was_ready
+                seen_ready = seen_ready or ready
+                was_ready = ready
+            if pending is not None:
+                pending.cancel()
+            if reconnect:
                 callback()
 
-        self.channel.subscribe(changed)
+        # Keep reconnection discovery active even with no pending publications.
+        # First READY is handled by the publisher's initial snapshot, not twice.
+        self.channel.subscribe(changed, try_to_connect=True)
         return changed
 
+    def ensure_connected(self):
+        if not self._ready.is_set():
+            import grpc
+
+            # The persistent watch can return to IDLE without an RPC. Keep one
+            # readiness future per outage to request a connection, without a
+            # new subscription/thread on every publisher tick. No MATCH is sent
+            # and transport reconnect backoff is not reset.
+            pending = self._connect_future
+            if pending is None or pending.done():
+                ready = grpc.channel_ready_future(self.channel)
+                self._connect_future = ready
+                if self._ready.is_set():
+                    ready.cancel()
+                    if self._connect_future is ready:
+                        self._connect_future = None
+
     def close(self):
+        if self._connect_future is not None:
+            self._connect_future.cancel()
         self.channel.close()
 
 
@@ -232,6 +287,13 @@ class PlacementPublisher:
         self.stats = Counter(recovery_started=0, recovery_ok=0, recovery_failed=0)
         self._recovery_since = None
         self._paused_until = 0.0
+        self._failures = 0
+        self._rng = random.Random()
+        self._recover_at = time.monotonic() + self._rng.uniform(
+            0, config.recovery_jitter_s
+        )
+        self._fallback_at = None
+        self._recovery_reasons = Counter(startup=1)
         self._next_stats_log = time.monotonic() + _STATS_LOG_SECONDS
         self._subscription = self.client.on_reconnect(self._on_reconnect)
         self._thread = threading.Thread(
@@ -241,15 +303,36 @@ class PlacementPublisher:
 
     def recover(self, reason="manual"):
         with self._lock:
-            self._generation += 1
-            self.stats[f"recovery_requested_{reason}"] += 1
+            self._recover_locked(reason, time.monotonic())
         self._wake.set()
 
+    def _recover_locked(self, reason, now, *, jitter=True):
+        self._generation += 1
+        self.stats[f"recovery_requested_{reason}"] += 1
+        self._recovery_reasons[reason] += 1
+        due = now + (
+            self._rng.uniform(0, self.config.recovery_jitter_s) if jitter else 0
+        )
+        # Coalesce requests without postponing an already scheduled repair.
+        self._recover_at = (
+            due if self._recover_at is None else min(self._recover_at, due)
+        )
+
+    def _fallback_locked(self, now):
+        # Bounded, independent worker phases: no silent-state hole waits longer
+        # than recovery_s before the next full repair starts (when reachable).
+        self._fallback_at = (
+            now + self.config.recovery_s * self._rng.uniform(0.8, 1.0)
+            if self.config.recovery_s
+            else None
+        )
+
     def _on_reconnect(self):
-        # READY also occurs after a transient disconnect. The protocol has no
-        # server incarnation, so the periodic fallback repairs lost state.
+        if self._stop.is_set():
+            return
         with self._lock:
             self.stats["reconnects"] += 1
+            self._recover_locked("reconnect", time.monotonic())
         self._wake.set()
 
     def _queue(self, key, value):
@@ -262,6 +345,7 @@ class PlacementPublisher:
             self._pending.clear()
             self._pending_overflow = True
             self.stats["pending_overflows"] += 1
+            self._recover_locked("pending_overflow", time.monotonic())
 
     def publish(self, records):
         with self._lock:
@@ -321,13 +405,24 @@ class PlacementPublisher:
             generation = self._generation
             recover = generation != self._completed_generation
             if self._pending_overflow and not recover:
-                return  # Periodic recovery rebuilds from current ownership.
+                return
             records = list(self._records.items()) if recover else None
             pending, self._pending = self._pending, {}
             if recover:
                 self._pending_overflow = False
+                self._recover_at = None
+                reasons, self._recovery_reasons = self._recovery_reasons, Counter()
         if recover:
             started = time.monotonic()
+            first_seq = self._seq + 1
+            logger.info(
+                "KV placement recovery start worker=%s generation=%d reasons=%s records=%d seq=%d",
+                self.worker_id,
+                generation,
+                dict(reasons),
+                len(records),
+                first_seq,
+            )
             with self._lock:
                 self.stats["recovery_started"] += 1
                 self.stats["recovery_records"] += len(records)
@@ -364,6 +459,16 @@ class PlacementPublisher:
                             self.stats["recovery_gap_ms_max"], gap_ms
                         )
                         self._recovery_since = None
+                        self._fallback_locked(now)
+                logger.info(
+                    "KV placement recovery done worker=%s generation=%d ok=%s seq_first=%d seq_last=%d ms=%.3f",
+                    self.worker_id,
+                    generation,
+                    succeeded,
+                    first_seq,
+                    self._seq,
+                    elapsed_ms,
+                )
         else:
             removed = [block_hash(k) for k, (live, _) in pending.items() if not live]
             for start in range(0, len(removed), MAX_HASHES):
@@ -379,7 +484,8 @@ class PlacementPublisher:
             records = [(k, parent) for k, (live, parent) in pending.items() if live]
             for batch in report_batches(records):
                 self._send(batch)
-        self._completed_generation = generation
+        with self._lock:
+            self._completed_generation = generation
 
     def stats_snapshot(self):
         with self._lock:
@@ -392,6 +498,16 @@ class PlacementPublisher:
                     0.0, self._paused_until - time.monotonic()
                 )
                 * 1000,
+                recovery_wait_remaining_ms=max(
+                    0.0,
+                    max(self._recover_at or 0.0, self._paused_until) - time.monotonic(),
+                )
+                * 1000,
+                fallback_remaining_ms=(
+                    max(0.0, self._fallback_at - time.monotonic()) * 1000
+                    if self._fallback_at is not None
+                    else None
+                ),
                 recovery_active_ms=(time.monotonic() - self._recovery_since) * 1000
                 if self._recovery_since is not None
                 else 0.0,
@@ -408,36 +524,69 @@ class PlacementPublisher:
                 self.stats_snapshot(),
             )
 
+    def _ready_delay(self, now):
+        with self._lock:
+            if self._fallback_at is not None and now >= self._fallback_at:
+                # An outstanding full repair already covers the fallback.
+                if self._generation == self._completed_generation:
+                    self._recover_locked("periodic", now, jitter=False)
+                self._fallback_at = None
+            due = self._paused_until
+            if self._generation != self._completed_generation:
+                due = max(due, self._recover_at or now)
+            return max(0.0, due - now)
+
+    def _report_failed(self, error):
+        now = time.monotonic()
+        with self._lock:
+            self._failures += 1
+            cap = min(
+                _REPORT_BACKOFF_MAX_S,
+                self.config.cooldown_s * 2 ** min(self._failures - 1, 30),
+            )
+            delay = cap * self._rng.uniform(0.5, 1.0)
+            self._paused_until = now + delay
+            self.stats["report_pauses"] += 1
+            self.stats["recovery_retry_backoff_ms"] += delay * 1000
+            self._recover_locked("report_failure", now)
+        logger.warning(
+            "KV placement report failed worker=%s; full recovery after backoff %.3fs: %s",
+            self.worker_id,
+            delay,
+            error,
+        )
+
     def _run(self):
-        phase = zlib.crc32(self.worker_id.encode()) / (1 << 32)
-        next_recovery = time.monotonic() + self.config.recovery_s * (0.5 + 0.5 * phase)
         while not self._stop.is_set():
             self._wake.clear()
+            ensure_connected = getattr(self.client, "ensure_connected", None)
+            if ensure_connected is not None:
+                ensure_connected()
             now = time.monotonic()
-            if now >= next_recovery:
-                self.recover("periodic")
-                next_recovery = now + self.config.recovery_s
-                self._paused_until = 0.0
-            if now < self._paused_until:
+            delay = self._ready_delay(now)
+            if delay:
                 self._maybe_log_stats()
-                self._stop.wait(min(1.0, self._paused_until - now))
+                self._wake.wait(min(1.0, delay))
                 continue
             try:
                 self._flush()
-            except Exception:
+            except Exception as error:
                 if self._stop.is_set():
                     break
-                logger.warning(
-                    "KV placement report retries exhausted or rejected; "
-                    "pausing until periodic recovery",
-                    exc_info=True,
-                )
+                self._report_failed(error)
+            else:
                 with self._lock:
-                    self.stats["report_pauses"] += 1
-                self._paused_until = next_recovery
+                    self._failures = 0
+                    self._paused_until = 0.0
             finally:
                 self._maybe_log_stats()
-            self._wake.wait(min(1.0, max(0, next_recovery - time.monotonic())))
+            with self._lock:
+                due = [
+                    x for x in (self._recover_at, self._fallback_at) if x is not None
+                ]
+            self._wake.wait(
+                min(1.0, max(0.0, min(due) - time.monotonic())) if due else 1.0
+            )
 
     def close(self):
         self._stop.set()

@@ -386,6 +386,7 @@ def test_publisher_recovers_missing_revoke_restart_and_concurrent_retire():
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     config = IndexerConfig(
+        recovery_jitter_s=0,
         endpoint=f"127.0.0.1:{port}",
         deployment="test",
         recovery_s=0.2,
@@ -439,7 +440,7 @@ def test_indexer_query_stats_distinguish_failure_cooldown_and_chunk_latency(
     from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
 
     client = indexer.IndexerClient(
-        indexer.IndexerConfig(endpoint="unused", deployment="test")
+        indexer.IndexerConfig(recovery_jitter_s=0, endpoint="unused", deployment="test")
     )
     now = [100.0]
     monkeypatch.setattr(indexer, "time", SimpleNamespace(monotonic=lambda: now[0]))
@@ -524,16 +525,18 @@ def test_publisher_stats_include_failed_recovery_and_retry_gap(monkeypatch):
         channel=SimpleNamespace(unsubscribe=lambda callback: None),
     )
     publisher = indexer.PlacementPublisher(
-        config=indexer.IndexerConfig(endpoint="unused", deployment="test"),
+        config=indexer.IndexerConfig(
+            recovery_jitter_s=0, endpoint="unused", deployment="test"
+        ),
         worker_id="test/lend/dp0",
         client=client,
     )
     try:
         publisher.publish([(key(1), None)])
         publisher._flush()
-        publisher._subscription()  # READY alone does not prove state loss.
+        publisher._subscription()  # Confirmed reconnect requests a new full snapshot.
         publisher._flush()
-        assert publisher.stats_snapshot()["recovery_started"] == 1
+        assert publisher.stats_snapshot()["recovery_started"] == 2
         publisher.recover()
         fail[0] = True
         with pytest.raises(RuntimeError, match="lost snapshot"):
@@ -543,16 +546,16 @@ def test_publisher_stats_include_failed_recovery_and_retry_gap(monkeypatch):
         publisher.recover()
         publisher._flush()
         stats = publisher.stats_snapshot()
-        assert stats["recovery_started"] == 3
-        assert stats["recovery_ok"] == 2 and stats["recovery_failed"] == 1
+        assert stats["recovery_started"] == 4
+        assert stats["recovery_ok"] == 3 and stats["recovery_failed"] == 1
         assert stats["reconnects"] == 1
         assert stats["recovery_requested_manual"] == 2
-        assert stats["recovery_ms_total"] == pytest.approx(1200)
+        assert stats["recovery_ms_total"] == pytest.approx(1600)
         assert stats["recovery_ms_max"] == pytest.approx(400)
-        assert stats["recovery_gap_ms_total"] == pytest.approx(2200)
+        assert stats["recovery_gap_ms_total"] == pytest.approx(2600)
         assert stats["recovery_gap_ms_max"] == pytest.approx(1800)
         assert stats["recovery_active_ms"] == 0
-        assert stats["report_rpcs"] == 6
+        assert stats["report_rpcs"] == 8
         assert stats["live_records"] == 1 and stats["pending_records"] == 0
     finally:
         publisher.close()
@@ -602,7 +605,9 @@ def test_publisher_retries_exact_batch_before_newer_deltas(monkeypatch, operatio
         channel=SimpleNamespace(unsubscribe=lambda callback: None),
     )
     publisher = indexer.PlacementPublisher(
-        config=indexer.IndexerConfig(endpoint="unused", deployment="test"),
+        config=indexer.IndexerConfig(
+            recovery_jitter_s=0, endpoint="unused", deployment="test"
+        ),
         worker_id="test/lend/dp0",
         client=client,
     )
@@ -634,9 +639,8 @@ def test_publisher_retries_exact_batch_before_newer_deltas(monkeypatch, operatio
         publisher.close()
 
 
-def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
-    monkeypatch,
-):
+def test_publisher_outage_bounds_retries_and_recovers_without_periodic(monkeypatch):
+    import threading
     from types import SimpleNamespace
 
     import grpc
@@ -644,11 +648,17 @@ def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
     from sglang.srt.grpc import kv_indexer_pb2 as pb
     from sglang.srt.mem_cache.unified_cache.peer_l1 import indexer
 
-    offset, outage, sent, held = [0.0], [False], [], set()
-    monkeypatch.setattr(
-        indexer, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0])
-    )
+    outage, sent, held = [False], [], set()
+    failed, resume = threading.Event(), threading.Event()
     monkeypatch.setattr(indexer, "_PENDING_LIMIT", 2)
+    original_failed = indexer.PlacementPublisher._report_failed
+
+    def paused_failure(self, error):
+        original_failed(self, error)
+        failed.set()
+        assert resume.wait(5)
+
+    monkeypatch.setattr(indexer.PlacementPublisher, "_report_failed", paused_failure)
 
     class Unavailable(grpc.RpcError):
         def code(self):
@@ -674,7 +684,11 @@ def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
     )
     publisher = indexer.PlacementPublisher(
         config=indexer.IndexerConfig(
-            endpoint="unused", deployment="test", cooldown_s=0.001, recovery_s=60
+            endpoint="unused",
+            deployment="test",
+            cooldown_s=0.001,
+            recovery_s=0,
+            recovery_jitter_s=0,
         ),
         worker_id="test/lend/dp0",
         client=client,
@@ -683,7 +697,7 @@ def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
         eventually(lambda: publisher.stats_snapshot()["recovery_ok"] == 1)
         outage[0] = True
         publisher.publish([(key(1), None)])
-        eventually(lambda: publisher.stats_snapshot().get("report_pauses") == 1)
+        assert failed.wait(5)
         assert len(sent) == 1 + indexer._REPORT_RETRIES + 1
         assert len(set(sent[1:])) == 1
         publisher.retire([key(1)])
@@ -695,14 +709,18 @@ def test_publisher_outage_bounds_retries_and_pending_until_periodic_recovery(
         assert stats["pending_overflow"] and stats["pending_records"] <= 2
         assert stats["live_records"] == 1
         outage[0] = False
-        publisher._subscription()  # Reconnect must not reset the retry budget.
-        assert publisher.stats_snapshot()["recovery_started"] == 1
-        offset[0] += 60
+        publisher._subscription()
+        resume.set()
         eventually(lambda: publisher.stats_snapshot()["recovery_ok"] == 2)
         assert held == {indexer.block_hash(key(10))}
-        assert not publisher.stats_snapshot()["pending_overflow"]
-        assert publisher.stats_snapshot()["recovery_requested_periodic"] == 1
+        stats = publisher.stats_snapshot()
+        assert not stats["pending_overflow"]
+        assert stats["recovery_requested_report_failure"] == 1
+        assert stats["recovery_requested_pending_overflow"] == 1
+        assert stats["recovery_requested_reconnect"] == 1
+        assert stats.get("recovery_requested_periodic", 0) == 0
     finally:
+        resume.set()
         publisher.close()
 
 
