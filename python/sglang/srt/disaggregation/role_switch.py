@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
 from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -180,6 +181,11 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 
     Table-driven: the first failing precondition's message is returned.
     """
+    if (
+        full_provider_of(getattr(scheduler, "token_to_kv_pool_allocator", None))
+        is not None
+    ):
+        return "KV page provider does not support role switch", True
     sa = scheduler.server_args
     km = _current_kv_manager(scheduler)
     # (failed?, safe to restore routing?, lazy message)
@@ -248,6 +254,11 @@ def _current_kv_manager(scheduler: Scheduler):
 def teardown_disaggregation(scheduler: Scheduler) -> None:
     """Release the current role's disaggregation structures (queues, metadata
     buffers, KV transfer manager) so the other role can be rebuilt."""
+    if (
+        full_provider_of(getattr(scheduler, "token_to_kv_pool_allocator", None))
+        is not None
+    ):
+        raise RuntimeError("KV page provider does not support role switch")
     mode = scheduler.disaggregation_mode
     if mode == DisaggregationMode.PREFILL:
         q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
@@ -288,6 +299,11 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     (the instance is already fully idle, checked before teardown) and, for
     hicache, best-effort clears the storage backend so it is released completely.
     """
+    if (
+        full_provider_of(getattr(scheduler, "token_to_kv_pool_allocator", None))
+        is not None
+    ):
+        raise RuntimeError("KV page provider does not support role switch")
     if scheduler.disable_radix_cache:
         return
     tree_cache = scheduler.tree_cache

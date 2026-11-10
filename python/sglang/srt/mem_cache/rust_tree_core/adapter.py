@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     MambaEvictExcessPathStates,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
+    ResidencyAction,
     SWARebuild,
     UpdatePendingBackupOnNodeSplit,
 )
@@ -193,6 +194,16 @@ class _CoreIds:
 def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
     """Build the Python CacheAction for one of the binding's tagged tuples."""
     tag = action[0]
+    if tag == "residency":
+        return ResidencyAction(
+            action[1],
+            action[2],
+            action[3],
+            tuple(action[4]),
+            action[5],
+            action[6],
+            None if action[7] is None else tuple(action[7]),
+        )
     if tag == "free_device_kv":
         return FreeDeviceKV(indices=list(action[1]))
     if tag == "free_device_kv_full_only":
@@ -610,6 +621,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 for slot in params.tree_slots
             ],
         )
+        self._binding.set_enable_residency(params.kv_memory_provider is not None)
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding,
             enabled=params.enable_kv_cache_events,
@@ -923,6 +935,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> torch.Tensor:
         return self._binding.collect_full_device_indices(from_node_id, until_node_id)
 
+    def collect_full_device_page_ids(self, from_node_id, until_node_id):
+        return self._binding.collect_full_device_page_ids(from_node_id, until_node_id)
+
+    def all_full_device_page_ids(self):
+        return self._binding.all_full_device_page_ids()
+
+    def node_full_device_page_ids(self, node_id):
+        return self._binding.node_full_device_page_ids(node_id)
+
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         key = params.key
         key_buffer = _radix_key_buffer(key)
@@ -948,6 +969,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
                 rotation_base=params.rotation_base,
+                provider_page_ids=params.provider_page_ids,
             )
         )
         return self._insert_step_from_binding(step)
@@ -1045,6 +1067,41 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def enable_storage(self, value: bool) -> None:
         # The cache assigns tree_core.enable_storage at storage init; forward it.
         self._binding.set_enable_storage(value)
+
+    def residency_snapshot(self, node_id):
+        snapshot = self._binding.residency_snapshot(node_id)
+        if snapshot is None:
+            return None
+        node, revision, keys, indices, page_ids = snapshot
+        return (
+            node,
+            revision,
+            tuple(keys),
+            indices,
+            None if page_ids is None else tuple(page_ids),
+        )
+
+    def offer_residency_candidates(self, n_pages):
+        return [
+            (
+                node,
+                revision,
+                tuple(keys),
+                indices,
+                None if page_ids is None else tuple(page_ids),
+            )
+            for node, revision, keys, indices, page_ids in self._binding.offer_residency_candidates(
+                n_pages
+            )
+        ]
+
+    def confirm_residency_detach(self, node_id, revision):
+        result = self._binding.confirm_residency_detach(node_id, revision)
+        if result is None:
+            return None
+        return self._fill_evict_result(
+            result, EvictDeviceLeafResult(unbacked_tokens=result.unbacked_tokens)
+        )
 
     @property
     def enable_external_cache_linker(self) -> bool:

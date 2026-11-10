@@ -2,7 +2,9 @@
 #![allow(unused_variables)]
 
 pub use crate::cache_action::{BackupKV, CacheAction, CacheActions};
-use crate::cache_action::{FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit};
+use crate::cache_action::{
+    FreeDeviceKV, FreeDeviceKVFullOnly, ResidencyAction, UpdatePendingBackupOnNodeSplit,
+};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -191,6 +193,7 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     /// Tokens of this request already cached before the insert (the duplicate
     /// window starts past them).
     pub prev_prefix_len: usize,
+    pub provider_page_ids: Option<Arc<[i64]>>,
     /// The request's SWA-evicted prefix boundary; SWA data below it stays tombstoned.
     pub swa_evicted_seqlen: usize,
     /// The Full-KV-derived boundary whose SWA window this insert should materialize.
@@ -301,6 +304,7 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     session_id: Option<Arc<str>>,
     rotation_base: Option<i64>,
     pub(crate) prev_prefix_len: usize,
+    provider_page_ids: Option<Arc<[i64]>>,
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
@@ -637,6 +641,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_storage: bool,
     /// Whether a direct device-to-external-cache linker is wired.
     pub(crate) enable_external_cache_linker: bool,
+    pub enable_residency: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -1009,6 +1014,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             is_host_memory_buffer_only: false,
             enable_storage: false,
             enable_external_cache_linker: false,
+            enable_residency: false,
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
             dynamo_kv_event_format: params.dynamo_kv_event_format,
@@ -1478,7 +1484,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         usize,
         usize,
         Option<NodeId>,
-        Option<UpdatePendingBackupOnNodeSplit>,
+        CacheActions,
     ) {
         // Non-HiCache mode has only device-resident matches, so the scheduler
         // device anchor follows the best match. In HiCache mode, host-backed
@@ -1492,7 +1498,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut best_match_device_node_id = node_id;
         let mut best_match_device_value_len = 0;
         let mut full_kv_hit_length = 0;
-        let mut action: Option<UpdatePendingBackupOnNodeSplit> = None;
+        let mut action: CacheActions = Vec::new();
         let separate_device_match = self.enable_hicache;
 
         fn update_best_if_valid<K: ChildKeyType>(
@@ -1545,7 +1551,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let prefix_len = key.match_len(offset, &child.key, self.page_size);
             full_kv_hit_length += prefix_len;
             if prefix_len < child.key.atom_len() {
-                let (split_node_id, split_action) = self.split_node_(child_id, prefix_len);
+                let (split_node_id, split_action) =
+                    self.split_node_with_actions_(child_id, prefix_len);
                 node_id = split_node_id;
                 action = split_action;
                 let node = self.arena.node(node_id);
@@ -1659,7 +1666,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         best_match_device_value_len: usize,
         full_kv_hit_length: usize,
         last_visited_node_id: Option<NodeId>,
-        action: Option<UpdatePendingBackupOnNodeSplit>,
+        action: CacheActions,
     ) -> MatchResult {
         for i in 0..self.components.len() {
             // Full uses last_access ticks, not LRU.
@@ -1734,10 +1741,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 best_match_device_value_len,
             );
         }
-        result.cache_actions = action
-            .into_iter()
-            .map(|action| Box::new(action) as Box<dyn CacheAction>)
-            .collect();
+        result.cache_actions = action;
         result
     }
 
@@ -1790,6 +1794,53 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(Tensor::cat(&prefix_chunks, 0))
     }
 
+    /// CPU FULL geometry in root-to-leaf order. No tensor data is read.
+    pub fn collect_full_device_page_ids(
+        &self,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> Result<Option<Vec<i64>>, NodeAccessError> {
+        let mut node_id = self.arena.resolve(from_node_id)?;
+        let until = self.arena.resolve(until_node_id)?;
+        let mut chunks = Vec::new();
+        while node_id != until {
+            let node = self.arena.node(node_id);
+            let Some(ids) = node.residency_page_ids.as_ref() else {
+                return Ok(None);
+            };
+            chunks.push(ids.as_slice());
+            node_id = node.parent();
+        }
+        Ok(Some(chunks.into_iter().rev().flatten().copied().collect()))
+    }
+
+    pub fn node_full_device_page_ids(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<Vec<i64>>, NodeAccessError> {
+        let id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(id).residency_page_ids.clone())
+    }
+
+    pub fn all_full_device_page_ids(&self) -> Option<Vec<i64>> {
+        let mut stack = vec![self.arena.root()];
+        let mut pages = Vec::new();
+        while let Some(id) = stack.pop() {
+            let node = self.arena.node(id);
+            if let Some(value) = node.try_device_value(FULL)
+                && value.numel() != 0
+            {
+                let ids = node.residency_page_ids.as_ref()?;
+                if ids.len() * self.page_size != value.numel() {
+                    return None;
+                }
+                pages.extend_from_slice(ids);
+            }
+            stack.extend(node.children.values().copied());
+        }
+        Some(pages)
+    }
+
     /// Refresh a node's access tick and component LRU positions.
     pub fn touch_node_(&mut self, node_id: NodeIdx_) {
         let tick = self.arena.get_and_bump_access_counter();
@@ -1818,6 +1869,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         node.hit_count += 1;
+        if self.enable_residency {
+            return false;
+        }
 
         if self.enable_external_cache_linker {
             return Self::needs_external_linker_offload_(node)
@@ -1937,6 +1991,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             session_id: params.session_id.map(Arc::from),
             rotation_base: params.rotation_base,
             prev_prefix_len: params.prev_prefix_len,
+            provider_page_ids: params.provider_page_ids.clone(),
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
@@ -2081,11 +2136,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let node = self.arena.node(node_id);
         let prefix_len = state.key.match_len(cursor, &node.key, self.page_size);
         if prefix_len < node.key.atom_len() {
-            let (split_node_id, action) = self.split_node_(node_id, prefix_len);
+            let (split_node_id, action) = self.split_node_with_actions_(node_id, prefix_len);
             node_id = split_node_id;
-            if let Some(action) = action {
-                state.pending_actions.push(Box::new(action));
-            }
+            state.pending_actions.extend(action);
         }
         {
             let node = self.arena.node_mut(node_id);
@@ -2099,6 +2152,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return;
         }
         let params = InsertParams {
+            provider_page_ids: state.provider_page_ids.clone(),
             rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
@@ -2119,6 +2173,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &state.value.narrow(0, cursor as i64, prefix_len as i64),
             state.session_id.as_deref(),
         );
+        self.set_residency_page_ids_(node_id, &params, cursor, cursor + prefix_len);
+        self.residency_action_(node_id, "restore", &mut state.pending_actions);
         state
             .result
             .as_mut()
@@ -2157,6 +2213,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let prefix_len = state.overlap_prefix_len;
         let cursor = state.total_prefix_length;
         let params = InsertParams {
+            provider_page_ids: state.provider_page_ids.clone(),
             rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
@@ -2278,6 +2335,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 state.session_id.as_deref(),
             );
             self.arena.node_mut(new_node_id).rotation_base = state.rotation_base;
+            let pages = state
+                .provider_page_ids
+                .as_deref()
+                .filter(|_| state.total_prefix_length >= state.prev_prefix_len)
+                .map(|ids| {
+                    let start = state.total_prefix_length / self.page_size
+                        - state.prev_prefix_len / self.page_size;
+                    let count =
+                        (state.aligned_key_len - state.total_prefix_length) / self.page_size;
+                    ids[start..start + count].to_vec()
+                });
+            self.arena.node_mut(new_node_id).residency_page_ids = pages;
+            self.residency_action_(new_node_id, "attach", &mut state.pending_actions);
             new_node_id
         } else {
             state.node_id
@@ -2295,6 +2365,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         result.prefix_len = state.total_prefix_length;
         result.last_device_node_id = Some(self.arena.node(target_node_id).id);
         let params = InsertParams {
+            provider_page_ids: state.provider_page_ids.clone(),
             rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
@@ -2430,10 +2501,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
+        child.residency_revision += 1;
+        let split_pages = child
+            .residency_page_ids
+            .as_mut()
+            .map(|ids| ids.split_off(split_len / self.page_size));
+        let prefix_pages = child.residency_page_ids.take();
+        child.residency_page_ids = split_pages;
         child.key = key_tail;
         let (new_node_hash, child_hash) =
             crate::node::split_node_hash_value(child.hash_value.take(), split_len, self.page_size);
         child.hash_value = child_hash;
+        self.arena.node_mut(new_node_id).residency_page_ids = prefix_pages;
         self.arena.node_mut(new_node_id).hash_value = new_node_hash;
         let child_handle = self.arena.node(child_id).id;
         if let Some(mut parent_event_hashes) = self.namespaced_event_hashes.remove(&child_handle) {
@@ -2468,7 +2547,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(new_node_id).write_through_pending_id = Some(ack_id);
         }
         // Buffer-only writes are tracked by the cache rather than a node ack.
-        let action = if ack_id.is_some() || self.is_host_memory_buffer_only {
+        let action = if ack_id.is_some() || self.is_host_memory_buffer_only || self.enable_residency
+        {
             Some(UpdatePendingBackupOnNodeSplit {
                 ack_id,
                 old_node_id: self.arena.node(child_id).id,
@@ -2493,6 +2573,149 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.update_evictable_leaf_sets_(child_id);
         self.update_full_coexisting_host_tracking_(new_node_id);
         (new_node_id, action)
+    }
+
+    pub(crate) fn set_residency_page_ids_(
+        &mut self,
+        node_id: NodeIdx_,
+        params: &InsertParams<'_, K>,
+        start: usize,
+        end: usize,
+    ) {
+        let ids = params
+            .provider_page_ids
+            .as_deref()
+            .filter(|_| start >= params.prev_prefix_len)
+            .map(|ids| {
+                let first = start / self.page_size - params.prev_prefix_len / self.page_size;
+                let count = (end - start) / self.page_size;
+                ids[first..first + count].to_vec()
+            });
+        self.arena.node_mut(node_id).residency_page_ids = ids;
+    }
+
+    pub(crate) fn residency_action_(
+        &self,
+        node_id: NodeIdx_,
+        reason: &'static str,
+        actions: &mut CacheActions,
+    ) {
+        if !self.enable_residency {
+            return;
+        }
+        let node = self.arena.node(node_id);
+        if node.evicted() {
+            return;
+        }
+        let keys = node
+            .hash_value
+            .clone()
+            .unwrap_or_else(|| self.arena.compute_node_hash_values(node_id, self.page_size));
+        let parent_key = node.try_parent().and_then(|p| {
+            self.arena
+                .node(p)
+                .hash_value
+                .as_ref()
+                .and_then(|v| v.last().cloned())
+        });
+        actions.push(Box::new(ResidencyAction {
+            reason,
+            node_id: node.id,
+            node_revision: node.residency_revision,
+            keys,
+            parent_key,
+            indices: node.device_value(FULL).copy(),
+            page_ids: node.residency_page_ids.clone(),
+        }));
+    }
+
+    pub(crate) fn split_node_with_actions_(
+        &mut self,
+        child_id: NodeIdx_,
+        split_len: usize,
+    ) -> (NodeIdx_, CacheActions) {
+        let (node_id, action) = self.split_node_(child_id, split_len);
+        let mut actions: CacheActions = action
+            .into_iter()
+            .map(|a| Box::new(a) as Box<dyn CacheAction>)
+            .collect();
+        self.residency_action_(node_id, "split", &mut actions);
+        self.residency_action_(child_id, "split", &mut actions);
+        (node_id, actions)
+    }
+
+    pub fn residency_snapshot(
+        &self,
+        node_id: NodeId,
+    ) -> Option<(NodeId, u64, Vec<String>, Tensor, Option<Vec<i64>>)> {
+        let idx = self.arena.resolve(node_id).ok()?;
+        let node = self.arena.node(idx);
+        if !self.is_evictable_device_leaf_(node)
+            || node.load_back_pending_id.is_some()
+            || node.write_through_pending_id.is_some()
+            || node.write_back_queued
+            || !node.key.atom_len().is_multiple_of(self.page_size)
+            || node.device_value_len(FULL) != node.key.atom_len()
+        {
+            return None;
+        }
+        Some((
+            node.id,
+            node.residency_revision,
+            node.hash_value.clone()?,
+            node.device_value(FULL).copy(),
+            node.residency_page_ids.clone(),
+        ))
+    }
+
+    pub fn confirm_residency_detach(
+        &mut self,
+        node_id: NodeId,
+        revision: u64,
+    ) -> Result<Option<EvictionStepResult>, NodeAccessError> {
+        assert!(
+            !self.has_ongoing_insert(),
+            "cannot detach during an insert walk"
+        );
+        if self
+            .residency_snapshot(node_id)
+            .is_none_or(|s| s.1 != revision)
+        {
+            return Ok(None);
+        }
+        let (backup, result) = self.evict_device_leaf(node_id, false)?;
+        assert!(backup.is_none());
+        Ok(Some(result))
+    }
+
+    pub fn offer_residency_candidates(
+        &mut self,
+        n_pages: usize,
+    ) -> Vec<(NodeId, u64, Vec<String>, Tensor, Option<Vec<i64>>)> {
+        assert!(
+            !self.has_ongoing_insert(),
+            "cannot offer during an insert walk"
+        );
+        self.evict_device_start(FULL, n_pages * self.page_size);
+        let mut snapshots = Vec::new();
+        let mut tokens = 0;
+        while tokens < n_pages * self.page_size {
+            let (node_id, result) = self.evict_device_next_node(FULL, &HashMap::new());
+            assert!(
+                result.device_frees.is_empty()
+                    && result.host_frees.is_empty()
+                    && result.cache_actions.is_empty()
+            );
+            let Some(node_id) = node_id else {
+                break;
+            };
+            if let Some(snapshot) = self.residency_snapshot(node_id) {
+                tokens += snapshot.3.numel();
+                snapshots.push(snapshot);
+            }
+        }
+        self.evict_device_end(FULL);
+        snapshots
     }
 
     /// Record a new tail's depth and raise ancestor history without shrinking
@@ -2585,6 +2808,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         fresh_value: &Tensor,
         session_id: Option<&str>,
     ) {
+        self.arena.node_mut(node_id).residency_revision += 1;
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
         let tokens = self.component_reclaimable_value_len_(node_id, FULL);
@@ -4077,11 +4301,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             matched_length += prefix_len;
 
             if prefix_len < node_key_len {
-                let (split_node_id, action) = self.split_node_(node_id, prefix_len);
+                let (split_node_id, action) = self.split_node_with_actions_(node_id, prefix_len);
                 node_id = split_node_id;
-                if let Some(action) = action {
-                    cache_actions.push(Box::new(action));
-                }
+                cache_actions.extend(action);
             }
 
             if !self.is_write_back {
@@ -5134,16 +5356,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let mut target = child_id;
             if seg_start > pos {
                 // The original handle remains on the suffix, our target.
-                let (_, action) = self.split_node_(target, seg_start - pos);
-                if let Some(action) = action {
-                    actions.push(Box::new(action));
-                }
+                let (_, action) = self.split_node_with_actions_(target, seg_start - pos);
+                actions.extend(action);
             }
             if seg_start + self.arena.node(target).key.atom_len() > seg_end {
-                let (fragment, action) = self.split_node_(target, seg_end - seg_start);
-                if let Some(action) = action {
-                    actions.push(Box::new(action));
-                }
+                let (fragment, action) = self.split_node_with_actions_(target, seg_end - seg_start);
+                actions.extend(action);
                 target = fragment;
             }
             let values = swa_values

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -40,6 +41,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.kv.requests import RequestTable, RowState
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
@@ -88,6 +90,7 @@ class SchedulerInvariantChecker:
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
     checks: Dict[CheckPhase, List[StateCheck]] = field(init=False)
+    _provider_audit_deadline: Optional[float] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.checks = {phase: [] for phase in CheckPhase}
@@ -189,6 +192,63 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
+        provider = full_provider_of(allocator)
+        if provider is not None:
+            errors = self.pool_stats_observer.storage.accounting_violations()
+            interval = max(0.0, envs.SGLANG_KV_PROVIDER_AUDIT_INTERVAL_SECONDS.get())
+            now = time.monotonic()
+            if (
+                interval > 0
+                and self._provider_audit_deadline is not None
+                and now < self._provider_audit_deadline
+            ):
+                return bool(errors), "; ".join(errors)
+            self._provider_audit_deadline = now + interval
+            try:
+                # Provider mode has no ordinary HiCache writes/loads in the
+                # tree. Check its internal ledgers even with session locks.
+                self.tree_cache.tree_core.sanity_check([], [])
+            except (AssertionError, RuntimeError) as exc:
+                errors.append(f"provider tree invariants: {exc}")
+            pages = self.tree_cache.tree_core.all_full_device_page_ids()
+            if pages is None:
+                errors.append("provider tree is missing CPU page geometry")
+                return True, "; ".join(errors)
+            from sglang.srt.mem_cache.provider_indices import find_index_cpu
+
+            ps = self.token_to_kv_pool_allocator.page_size
+            expected = [
+                (
+                    torch.tensor(pages, dtype=torch.int64, device="cpu")[:, None] * ps
+                    + torch.arange(ps, device="cpu")
+                ).reshape(-1)
+            ]
+            # The full audit intentionally bypasses CPU mirrors. One batched
+            # device read detects stale mirrors and untracked device writers.
+            device_values = [self.tree_cache.all_values_flatten()]
+
+            kvs = [req.kv for req in self._requests_owning_rows()]
+            kvs += list(self.tree_cache.session_records().values())
+            for kv in kvs:
+                if kv.holds_kv and kv.kv_allocated_len > 0:
+                    values = self.req_to_token_pool.req_to_token[
+                        kv.req_pool_idx, : kv.kv_allocated_len
+                    ]
+                    cpu = find_index_cpu(values)
+                    if cpu is None:
+                        errors.append("provider request row is missing CPU mirror")
+                        return True, "; ".join(errors)
+                    expected.append(cpu)
+                    device_values.append(values)
+            actual = (
+                torch.cat(device_values).detach().to(device="cpu", dtype=torch.int64)
+            )
+            if not torch.equal(actual, torch.cat(expected)):
+                errors.append("provider device index values disagree with CPU mirrors")
+            errors += provider.validate_projection(
+                None, page_ids=tuple(dict.fromkeys((actual // ps).tolist()))
+            )
+            return bool(errors), "; ".join(errors)
         if ps.windows and not ps.full_capacity:
             return False, ""
         # The token sub-pool's capacity as the stats report it: the sized cap
@@ -536,7 +596,11 @@ class SchedulerInvariantChecker:
         self._check_req_pool()
         # Byte-conservation diagnostic (static pools return [] -- the token
         # identity above can't see byte leaks).
-        byte_violations = self.pool_stats_observer.storage.accounting_violations()
+        byte_violations = (
+            self.pool_stats_observer.storage.accounting_violations()
+            if full_provider_of(self.token_to_kv_pool_allocator) is None
+            else []
+        )
         if byte_violations:
             self.reporter.report(
                 Severity.LEAK,

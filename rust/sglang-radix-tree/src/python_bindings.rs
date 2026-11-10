@@ -510,6 +510,7 @@ impl MatchParamsBinding {
 /// stays a Python-held reference until the insert call unwraps it.
 #[pyclass(get_all, set_all)]
 pub struct InsertParamsBinding {
+    pub provider_page_ids: Option<Vec<i64>>,
     pub rotation_base: Option<i64>,
     pub key: Vec<i64>,
     pub value: Py<PyAny>,
@@ -530,7 +531,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false, provider_page_ids = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -548,8 +549,10 @@ impl InsertParamsBinding {
         rotation_base: Option<i64>,
         mamba_host_value: Option<Py<PyAny>>,
         allow_missing_mamba: bool,
+        provider_page_ids: Option<Vec<i64>>,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
+            provider_page_ids,
             rotation_base,
             key: py_array_to_vec_i64(py, key)?,
             value,
@@ -1118,6 +1121,7 @@ macro_rules! tree_core_methods {
                     None => None,
                 };
                 let params = InsertParams {
+            provider_page_ids: params.provider_page_ids.clone().map(Into::into),
                     rotation_base: params.rotation_base,
                     key,
                     namespace: KeyNamespaceRef::new(
@@ -1164,6 +1168,7 @@ macro_rules! tree_core_methods {
                     None => None,
                 };
                 let params = InsertParams {
+            provider_page_ids: params.provider_page_ids.clone().map(Into::into),
                     rotation_base: params.rotation_base,
                     key,
                     namespace: KeyNamespaceRef::new(
@@ -1562,6 +1567,18 @@ macro_rules! tree_core_methods {
                     })
                     .map_err(node_access_error)?;
                 tensor_to_py(py, value)
+            }
+
+            fn collect_full_device_page_ids(&self, py: Python<'_>, from_node_id: NodeId, until_node_id: NodeId) -> PyResult<Option<Vec<i64>>> {
+                py.detach(|| self.core().collect_full_device_page_ids(from_node_id, until_node_id)).map_err(node_access_error)
+            }
+
+            fn all_full_device_page_ids(&self, py: Python<'_>) -> Option<Vec<i64>> {
+                py.detach(|| self.core().all_full_device_page_ids())
+            }
+
+            fn node_full_device_page_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<Vec<i64>>> {
+                py.detach(|| self.core().node_full_device_page_ids(node_id)).map_err(node_access_error)
             }
 
             /// Every FULL device value in the tree, concatenated.
@@ -2117,6 +2134,34 @@ macro_rules! tree_core_methods {
             /// Whether the direct external-cache linker is wired.
             fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).enable_external_cache_linker()
+            }
+
+            fn set_enable_residency(&self, py: Python<'_>, value: bool) {
+                py.detach(|| self.core().enable_residency = value);
+            }
+
+            fn residency_snapshot(&self, py: Python<'_>, node_id: NodeId) -> Option<(NodeId, u64, Vec<String>, PyTensor, Option<Vec<i64>>)> {
+                py.detach(|| self.core().residency_snapshot(node_id))
+                    .map(|(id, rev, keys, value, page_ids)| (id, rev, keys, PyTensor(value), page_ids))
+            }
+
+            fn confirm_residency_detach(&self, py: Python<'_>, node_id: NodeId, revision: u64) -> PyResult<Option<EvictDeviceLeafResultBinding>> {
+                let result = py.detach(|| self.core().confirm_residency_detach(node_id, revision))
+                    .map_err(node_access_error)?;
+                let Some(result) = result else { return Ok(None); };
+                Ok(Some(EvictDeviceLeafResultBinding {
+                    backup_kv: None,
+                    unbacked_tokens: result.unbacked_tokens,
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                }))
+            }
+
+            fn offer_residency_candidates(&self, py: Python<'_>, n_pages: usize) -> Vec<(NodeId, u64, Vec<String>, PyTensor, Option<Vec<i64>>)> {
+                py.detach(|| self.core().offer_residency_candidates(n_pages)).into_iter()
+                    .map(|(id, rev, keys, value, page_ids)| (id, rev, keys, PyTensor(value), page_ids)).collect()
             }
 
             /// Queue the all-cleared placement event.
@@ -3048,6 +3093,18 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.all_values_flatten(py))
             }
 
+            fn collect_full_device_page_ids(&self, py: Python<'_>, from_node_id: NodeId, until_node_id: NodeId) -> PyResult<Option<Vec<i64>>> {
+                catch_native_panic(|| self.inner.collect_full_device_page_ids(py, from_node_id, until_node_id))
+            }
+
+            fn all_full_device_page_ids(&self, py: Python<'_>) -> PyResult<Option<Vec<i64>>> {
+                catch_native_panic(|| Ok(self.inner.all_full_device_page_ids(py)))
+            }
+
+            fn node_full_device_page_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<Vec<i64>>> {
+                catch_native_panic(|| self.inner.node_full_device_page_ids(py, node_id))
+            }
+
             /// Every Mamba device value in the tree, concatenated.
             fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
                 catch_native_panic(|| self.inner.all_mamba_values_flatten(py))
@@ -3479,6 +3536,22 @@ macro_rules! tree_core_binding {
             /// Whether the direct external-cache linker is wired.
             fn enable_external_cache_linker(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.enable_external_cache_linker(py)))
+            }
+
+            fn set_enable_residency(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+                catch_native_panic(|| { self.inner.set_enable_residency(py, value); Ok(()) })
+            }
+
+            fn residency_snapshot(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<(NodeId, u64, Vec<String>, PyTensor, Option<Vec<i64>>)>> {
+                catch_native_panic(|| Ok(self.inner.residency_snapshot(py, node_id)))
+            }
+
+            fn confirm_residency_detach(&self, py: Python<'_>, node_id: NodeId, revision: u64) -> PyResult<Option<EvictDeviceLeafResultBinding>> {
+                catch_native_panic(|| self.inner.confirm_residency_detach(py, node_id, revision))
+            }
+
+            fn offer_residency_candidates(&self, py: Python<'_>, n_pages: usize) -> PyResult<Vec<(NodeId, u64, Vec<String>, PyTensor, Option<Vec<i64>>)>> {
+                catch_native_panic(|| Ok(self.inner.offer_residency_candidates(py, n_pages)))
             }
 
             /// Queue the all-cleared placement event.

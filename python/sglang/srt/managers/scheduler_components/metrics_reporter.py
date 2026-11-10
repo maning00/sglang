@@ -233,6 +233,22 @@ class SchedulerMetricsReporter:
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
+    last_provider_admission: Optional[dict] = None
+
+    def record_provider_admission_round(self, values, admitted):
+        previous = self.last_provider_admission or {}
+        empty = previous.get("consecutive_empty_rounds", 0)
+        if admitted:
+            empty = 0
+        elif empty or values.get("short", 0):
+            empty += 1
+        self.last_provider_admission = dict(
+            values, admitted=admitted, consecutive_empty_rounds=empty
+        )
+        if self.enable_metrics:
+            self.metrics_collector.observe_provider_admission(
+                self.last_provider_admission
+            )
 
     def __post_init__(self) -> None:
         self.enable_metrics = self.metrics_collector_context.enable_metrics

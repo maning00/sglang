@@ -121,6 +121,21 @@ class InsertParams:
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
+    # CPU geometry of the incoming suffix [prev_prefix_len, ...), supplied
+    # by the provider-aware controller. Not ownership or reuse permission.
+    provider_page_ids: Optional[tuple[int, ...]] = dataclasses.field(
+        default=None, kw_only=True
+    )
+
+    def page_ids_for(self, start: int, end: int, page_size: int):
+        if self.provider_page_ids is None or start < self.prev_prefix_len:
+            return None
+        begin = start // page_size - self.prev_prefix_len // page_size
+        count = (end - start) // page_size
+        pages = self.provider_page_ids[begin : begin + count]
+        if len(pages) != count:
+            raise ValueError("incoming CPU page geometry does not cover adopted range")
+        return pages
 
     def get_evicted_seqlen(self, component_type: ComponentType) -> int:
         return self.component_evicted_seqlens.get(component_type, 0)

@@ -1303,34 +1303,45 @@ class PrefillAdder:
         )
         if not reserved:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
-        req.extend_end = req.prefix_len + new_len
-        self.can_run_list.append(req)
-        self._update_prefill_budget(
-            prefix_tokens,
-            req.extend_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
-                else 0
-            ),
-            req.retracted_stain,
-            state_slots=self._state_slots_for_req(req),
-            request_slot_reserve=request_slot_reserve,
-            is_chunked_continuation=True,
-            # Its window rows behind the chunk are held, as its shape check
-            # credits them.
-            cached_tokens=req.prefix_len,
-            unfinished_input_len=cand_extend_input_len - new_len,
-            deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if truncated
-                else 0
-            ),
-            admitted_chunk_limit=_rem_tokens,
-        )
+        with self.memory_budget.capacity_scope(
+            req,
+            prefix_tokens=req.prefix_len,
+            end_tokens=req.prefix_len + new_len,
+            can_wait=not self.can_run_list,
+        ) as capacity:
+            if capacity is not None and not capacity.ready:
+                return req
+            req.extend_end = req.prefix_len + new_len
+            self.can_run_list.append(req)
+            self._update_prefill_budget(
+                prefix_tokens,
+                req.extend_len,
+                (
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                    if not truncated
+                    else 0
+                ),
+                req.retracted_stain,
+                state_slots=self._state_slots_for_req(req),
+                request_slot_reserve=request_slot_reserve,
+                is_chunked_continuation=True,
+                # Its window rows behind the chunk are held, as its shape check
+                # credits them.
+                cached_tokens=req.prefix_len,
+                unfinished_input_len=cand_extend_input_len - new_len,
+                deferred_max_new_tokens=(
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                    if truncated
+                    else 0
+                ),
+                admitted_chunk_limit=_rem_tokens,
+            )
 
-        # Return if chunked prefill not finished
-        return req if truncated else None
+            if capacity is not None:
+                capacity.commit_to(req)
+
+            # Return if chunked prefill not finished
+            return req if truncated else None
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode, *, lock_host: bool = False):
@@ -1456,79 +1467,103 @@ class PrefillAdder:
         ):
             return AddReqResult.OTHER
 
-        if self.dllm_config is not None:
-            if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+        provider_extend = (
+            cand_extend_input_len
+            if chunk_limit is None
+            else min(
+                cand_extend_input_len,
+                self.floor_chunked_tokens(chunk_limit, cand_extend_input_len),
+            )
+        )
+        with self.memory_budget.capacity_scope(
+            req,
+            prefix_tokens=req.prefix_len,
+            end_tokens=req.prefix_len + provider_extend,
+            can_wait=not self.can_run_list,
+        ) as capacity:
+            if capacity is not None and not capacity.ready:
+                return AddReqResult.NO_TOKEN
+            if self.dllm_config is not None:
+                if self.rem_dllm_tokens <= 0:
+                    return AddReqResult.OTHER
 
-            if (
-                tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
-            ) is not None:
-                return tile_stop
+                if (
+                    tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
+                ) is not None:
+                    return tile_stop
 
-            self._add_dllm_req(req)
-        elif (
-            chunk_limit is None  # chunked prefill is disabled
-            or cand_extend_input_len <= chunk_limit  # it is the last chunk
-        ):
-            if (
-                tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
-            ) is not None:
-                return tile_stop
-
-            # Non-chunked prefill — the whole sequence is committed this iter.
-            if not self._kv_shard_reserve_scratch(
-                prefix_len=req.prefix_len,
-                extend_len=cand_extend_input_len,
+                self._add_dllm_req(req)
+            elif (
+                chunk_limit is None  # chunked prefill is disabled
+                or cand_extend_input_len <= chunk_limit  # it is the last chunk
             ):
-                return AddReqResult.OTHER
-            req.extend_end = len(req.full_untruncated_fill_ids)
-            self.can_run_list.append(req)
-            self._update_prefill_budget(
-                0,
-                req.extend_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
-                req.retracted_stain,
-                state_slots=self._state_slots_for_req(req),
-                request_slot_reserve=self._request_slot_reserve_for_req(req),
-                admitted_chunk_limit=chunk_limit,
-                cached_tokens=req.prefix_len,
-            )
-        else:
-            if chunk_limit <= 0:
-                return AddReqResult.OTHER
+                if (
+                    tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
+                ) is not None:
+                    return tile_stop
 
-            # Chunked prefill
-            trunc_len = self.floor_chunked_tokens(chunk_limit, cand_extend_input_len)
+                # Non-chunked prefill — the whole sequence is committed this iter.
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=req.prefix_len,
+                    extend_len=cand_extend_input_len,
+                ):
+                    return AddReqResult.OTHER
+                req.extend_end = len(req.full_untruncated_fill_ids)
+                self.can_run_list.append(req)
+                self._update_prefill_budget(
+                    0,
+                    req.extend_len,
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                    req.retracted_stain,
+                    state_slots=self._state_slots_for_req(req),
+                    request_slot_reserve=self._request_slot_reserve_for_req(req),
+                    admitted_chunk_limit=chunk_limit,
+                    cached_tokens=req.prefix_len,
+                )
+            else:
+                if chunk_limit <= 0:
+                    return AddReqResult.OTHER
 
-            if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
-                return tile_stop
+                # Chunked prefill
+                trunc_len = self.floor_chunked_tokens(
+                    chunk_limit, cand_extend_input_len
+                )
 
-            # Reserve after the tile gate so rejected requests consume no scratch.
-            if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
-                return AddReqResult.OTHER
+                if (
+                    tile_stop := self._check_prefill_tile_budget(trunc_len)
+                ) is not None:
+                    return tile_stop
 
-            assert req.prefix_len == 0
-            req.extend_end = req.prefix_len + trunc_len
-            self.can_run_list.append(req)
-            self.new_chunked_req = req
-            self._update_prefill_budget(
-                0,
-                trunc_len,
-                0,
-                req.retracted_stain,
-                state_slots=self._state_slots_for_req(req),
-                request_slot_reserve=self._request_slot_reserve_for_req(
-                    req, extend_input_len=trunc_len
-                ),
-                # A budget that admitted the whole request commits the rest.
-                unfinished_input_len=cand_extend_input_len - trunc_len,
-                deferred_max_new_tokens=min(
-                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-                ),
-                admitted_chunk_limit=chunk_limit,
-            )
+                # Reserve after the tile gate so rejected requests consume no scratch.
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=0, extend_len=trunc_len
+                ):
+                    return AddReqResult.OTHER
 
-        return self.budget_state()
+                assert req.prefix_len == 0
+                req.extend_end = req.prefix_len + trunc_len
+                self.can_run_list.append(req)
+                self.new_chunked_req = req
+                self._update_prefill_budget(
+                    0,
+                    trunc_len,
+                    0,
+                    req.retracted_stain,
+                    state_slots=self._state_slots_for_req(req),
+                    request_slot_reserve=self._request_slot_reserve_for_req(
+                        req, extend_input_len=trunc_len
+                    ),
+                    # A budget that admitted the whole request commits the rest.
+                    unfinished_input_len=cand_extend_input_len - trunc_len,
+                    deferred_max_new_tokens=min(
+                        req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+                    ),
+                    admitted_chunk_limit=chunk_limit,
+                )
+
+            if capacity is not None:
+                capacity.commit_to(req)
+            return self.budget_state()
 
     def _defer_staged_for_capacity_if_idle(self, req: Req, *, pool: str) -> None:
         # Running work, admitted prefills (including continuing chunks) and KV
@@ -1619,135 +1654,160 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            # Reserve sharded scratch before any load-back is queued: a load
-            # must be consumed by this batch, whose prefix gather waits on it.
-            if self.kv_shard_scratch_spec is not None:
-                scratch_mark = (
-                    self.kv_shard_block_bound_pages,
-                    self.kv_shard_chunk_pages,
-                )
-                reserved_for = (admission.prefix_len, admission.extend_len)
-                if not self._kv_shard_reserve_scratch(
-                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
-                ):
-                    return AddReqResult.OTHER
-
-            if req.needs_host_load_back():
-                load_max_new = min(max_new, admission.max_new_tokens)
-                # Reclaim can write back device victims and evict host leaves.
-                # Pin the selected host/aux match until load-back owns its locks.
-                with (
-                    self._lock_node(req.best_match_node, lock_host=True)
-                    if isinstance(self.tree_cache, UnifiedRadixCache)
-                    else nullcontext()
-                ):
-                    full_load_tokens = req.host_hit_length
-                    if (
-                        self.memory_budget.load_back_needs_full_tokens
-                        and isinstance(self.tree_cache, UnifiedRadixCache)
-                        and self.tree_cache.buffer_pipeline is None
-                        and not (
-                            self.tree_cache.linker is not None
-                            and self.tree_cache.linker.has_hit(req.rid)
-                        )
+            with self.memory_budget.capacity_scope(
+                req,
+                prefix_tokens=admission.prefix_len,
+                end_tokens=admission.prefix_len + admission.extend_len,
+                load_tokens=req.host_hit_length if req.needs_host_load_back() else 0,
+                can_wait=not self.can_run_list,
+            ) as capacity:
+                if capacity is not None and not capacity.ready:
+                    return AddReqResult.NO_TOKEN
+                # Reserve sharded scratch before any load-back is queued: a load
+                # must be consumed by this batch, whose prefix gather waits on it.
+                if self.kv_shard_scratch_spec is not None:
+                    scratch_mark = (
+                        self.kv_shard_block_bound_pages,
+                        self.kv_shard_chunk_pages,
+                    )
+                    reserved_for = (admission.prefix_len, admission.extend_len)
+                    if not self._kv_shard_reserve_scratch(
+                        prefix_len=admission.prefix_len, extend_len=admission.extend_len
                     ):
-                        full_load_tokens = self.tree_cache.full_load_back_tokens(
-                            req.best_match_node
-                        )
-                    load_budget = dict(
-                        state_slots=state_slots,
-                        full_tokens=(
-                            full_load_tokens
-                            + admission.extend_len
-                            + load_max_new
-                            + self.page_size
-                        ),
-                        extend_input_len=admission.extend_len,
-                        max_new_tokens=load_max_new,
-                        window_host_hit_lengths=req.window_host_hit_lengths,
-                        chunk_limit=admission.chunk_limit,
-                    )
-                    if not self.memory_budget.prepare_load_back(**load_budget):
-                        self._defer_staged_for_capacity_if_idle(
-                            req, pool="load_back_budget"
-                        )
-                        return AddReqResult.NO_TOKEN
-                    promised_host_hit = req.host_hit_length
-                    with self.memory_budget.load_back_scope(**load_budget):
-                        loaded = self.tree_cache.init_load_back(
-                            InitLoadBackParams(
-                                best_match_node=req.best_match_node,
-                                host_hit_length=req.host_hit_length,
-                                req=req,
+                        return AddReqResult.OTHER
+
+                if req.needs_host_load_back():
+                    load_max_new = min(max_new, admission.max_new_tokens)
+                    # Reclaim can write back device victims and evict host leaves.
+                    # Pin the selected host/aux match until load-back owns its locks.
+                    with (
+                        self._lock_node(req.best_match_node, lock_host=True)
+                        if isinstance(self.tree_cache, UnifiedRadixCache)
+                        else nullcontext()
+                    ):
+                        full_load_tokens = req.host_hit_length
+                        if (
+                            self.memory_budget.load_back_needs_full_tokens
+                            and isinstance(self.tree_cache, UnifiedRadixCache)
+                            and self.tree_cache.buffer_pipeline is None
+                            and not (
+                                self.tree_cache.linker is not None
+                                and self.tree_cache.linker.has_hit(req.rid)
                             )
+                        ):
+                            full_load_tokens = self.tree_cache.full_load_back_tokens(
+                                req.best_match_node
+                            )
+                        load_budget = dict(
+                            state_slots=state_slots,
+                            full_tokens=(
+                                full_load_tokens
+                                + admission.extend_len
+                                + load_max_new
+                                + self.page_size
+                            ),
+                            extend_input_len=admission.extend_len,
+                            max_new_tokens=load_max_new,
+                            window_host_hit_lengths=req.window_host_hit_lengths,
+                            chunk_limit=admission.chunk_limit,
                         )
-                if loaded is None:
-                    return AddReqResult.OTHER
-                req.host_loaded_length, req.last_node = loaded
-                state_slots = self._state_slots_for_req(req)
-                if 0 < req.host_loaded_length < promised_host_hit:
-                    raise RuntimeError(
-                        "HiCache load-back must commit all promised FULL tokens or none: "
-                        f"req={req.rid} promised={promised_host_hit} "
-                        f"loaded={req.host_loaded_length}"
-                    )
-                if req.host_loaded_length > promised_host_hit:
-                    # A load can expose resident FULL behind host-only aux state; its
-                    # H2D is queued, so keep the approved budget and shrink the work.
-                    prefix_len = req.prefix_len + req.host_loaded_length
-                    extend_len = admission.extend_len
-                    if self.dllm_config is None:
-                        extend_len = min(
-                            extend_len, len(req.full_untruncated_fill_ids) - prefix_len
+                        if not self.memory_budget.prepare_load_back(**load_budget):
+                            self._defer_staged_for_capacity_if_idle(
+                                req, pool="load_back_budget"
+                            )
+                            return AddReqResult.NO_TOKEN
+                        promised_host_hit = req.host_hit_length
+                        with self.memory_budget.load_back_scope(**load_budget):
+                            loaded = self.tree_cache.init_load_back(
+                                InitLoadBackParams(
+                                    best_match_node=req.best_match_node,
+                                    host_hit_length=req.host_hit_length,
+                                    req=req,
+                                )
+                            )
+                    if loaded is None:
+                        return AddReqResult.OTHER
+                    req.host_loaded_length, req.last_node = loaded
+                    state_slots = self._state_slots_for_req(req)
+                    if 0 < req.host_loaded_length < promised_host_hit:
+                        raise RuntimeError(
+                            "HiCache load-back must commit all promised FULL tokens or none: "
+                            f"req={req.rid} promised={promised_host_hit} "
+                            f"loaded={req.host_loaded_length}"
                         )
-                    is_chunked = admission.is_chunked and (
-                        prefix_len + extend_len < len(req.full_untruncated_fill_ids)
-                    )
-                    max_new_tokens = admission.max_new_tokens
-                    if admission.is_chunked and not is_chunked:
-                        max_new_tokens = min(
-                            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+                    if req.host_loaded_length > promised_host_hit:
+                        # A load can expose resident FULL behind host-only aux state; its
+                        # H2D is queued, so keep the approved budget and shrink the work.
+                        prefix_len = req.prefix_len + req.host_loaded_length
+                        extend_len = admission.extend_len
+                        if self.dllm_config is None:
+                            extend_len = min(
+                                extend_len,
+                                len(req.full_untruncated_fill_ids) - prefix_len,
+                            )
+                        is_chunked = admission.is_chunked and (
+                            prefix_len + extend_len < len(req.full_untruncated_fill_ids)
                         )
-                    admission = _PrefillAdmission(
-                        prefix_len,
-                        extend_len,
-                        max_new_tokens,
-                        is_chunked,
-                        self._replay_len(req, prefix_len),
-                        admission.chunk_limit,
-                    )
-                elif req.host_loaded_length < promised_host_hit:
-                    # No FULL was loaded; recomputation may no longer fit.
-                    admission = self._select_prefill_admission(
-                        req,
-                        total_tokens=total_tokens,
-                        state_slots=state_slots,
-                        host_hit_length=0,
-                        window_host_hit_lengths={},
-                        truncation_align_size=truncation_align_size,
-                        has_chunked_req=has_chunked_req,
-                    )
-                    if isinstance(admission, AddReqResult):
-                        return admission
-                req.prefix_len += req.host_loaded_length
-                if self.tree_cache.load_back_is_cache_owned():
-                    req.kv.protect_prefix(req.prefix_len)
+                        max_new_tokens = admission.max_new_tokens
+                        if admission.is_chunked and not is_chunked:
+                            max_new_tokens = min(
+                                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+                            )
+                        admission = _PrefillAdmission(
+                            prefix_len,
+                            extend_len,
+                            max_new_tokens,
+                            is_chunked,
+                            self._replay_len(req, prefix_len),
+                            admission.chunk_limit,
+                        )
+                    elif req.host_loaded_length < promised_host_hit:
+                        if capacity is not None:
+                            capacity._refund()
+                        # No FULL was loaded; recomputation may no longer fit.
+                        admission = self._select_prefill_admission(
+                            req,
+                            total_tokens=total_tokens,
+                            state_slots=state_slots,
+                            host_hit_length=0,
+                            window_host_hit_lengths={},
+                            truncation_align_size=truncation_align_size,
+                            has_chunked_req=has_chunked_req,
+                        )
+                        if isinstance(admission, AddReqResult):
+                            return admission
+                    if capacity is not None:
+                        shape = self.memory_budget.capacity_shape(
+                            req,
+                            prefix_tokens=admission.prefix_len,
+                            end_tokens=admission.prefix_len + admission.extend_len,
+                        )
+                        if not capacity.revise(
+                            shape, require_coverage=req.host_loaded_length > 0
+                        ):
+                            return AddReqResult.NO_TOKEN
+                    req.prefix_len += req.host_loaded_length
+                    if self.tree_cache.load_back_is_cache_owned():
+                        req.kv.protect_prefix(req.prefix_len)
 
-            if (
-                self.kv_shard_scratch_spec is not None
-                and (admission.prefix_len, admission.extend_len) != reserved_for
-            ):
-                # No FULL was loaded (sharded trees have no aux components),
-                # so deferring here leaves no H2D without its consumer.
-                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
-                    scratch_mark
-                )
-                if not self._kv_shard_reserve_scratch(
-                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                if (
+                    self.kv_shard_scratch_spec is not None
+                    and (admission.prefix_len, admission.extend_len) != reserved_for
                 ):
-                    return AddReqResult.OTHER
+                    # No FULL was loaded (sharded trees have no aux components),
+                    # so deferring here leaves no H2D without its consumer.
+                    self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
+                        scratch_mark
+                    )
+                    if not self._kv_shard_reserve_scratch(
+                        prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                    ):
+                        return AddReqResult.OTHER
 
-            self._commit_prefill_admission(req, admission, state_slots)
+                self._commit_prefill_admission(req, admission, state_slots)
+
+                if capacity is not None:
+                    capacity.commit_to(req)
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()

@@ -13,6 +13,7 @@ from typing import (
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -72,6 +73,9 @@ class PoolStats:
     full_token_usage: float
     full_available_size: int
     full_evictable_size: int
+    provider_pages: Optional[dict] = None
+    provider_tree_evictable_tokens: int = 0
+    provider_loads: Optional[dict] = None
 
     is_hybrid_ssm: bool = False
     is_hisparse: bool = False
@@ -193,6 +197,12 @@ class PoolStats:
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
+        if self.provider_pages is not None:
+            stats.kv_provider_pages = self.provider_pages
+            stats.kv_provider_tree_evictable_tokens = (
+                self.provider_tree_evictable_tokens
+            )
+            stats.kv_provider_loads = self.provider_loads
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -267,6 +277,32 @@ class SchedulerPoolStatsObserver:
             pool_stats.mamba_available_size = mamba_stats.mamba_available_size
             pool_stats.mamba_evictable_size = mamba_stats.mamba_evictable_size
 
+        provider = full_provider_of(self.token_to_kv_pool_allocator)
+        if provider is not None:
+            load_stats = getattr(provider, "get_load_stats", None)
+            if load_stats is not None:
+                pool_stats.provider_loads = load_stats()
+            account = provider.accounting()
+            pool_stats.provider_pages = dataclasses.asdict(account)
+            pool_stats.provider_pages.pop("blocked_reclaim_estimate")
+            pool_stats.provider_tree_evictable_tokens = max(
+                0,
+                pool_stats.full_evictable_size
+                - account.blocked_reclaim_estimate
+                * self.token_to_kv_pool_allocator.page_size,
+            )
+            pool_stats.full_evictable_size = 0
+            pool_stats.full_available_size = (
+                account.cached * self.token_to_kv_pool_allocator.page_size
+            )
+            # Tree evictability is a semantic estimate. It is never physical
+            # availability while grants, retire or local I/O can hold the page.
+            pool_stats.full_num_used = (
+                pool_stats.full_capacity - pool_stats.full_available_size
+            )
+            pool_stats.full_token_usage = (
+                pool_stats.full_num_used / pool_stats.full_capacity
+            )
         return pool_stats
 
     def _get_token_info(self, full: SubPoolUsage) -> PoolStats:

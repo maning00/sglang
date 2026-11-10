@@ -3,8 +3,8 @@
 use super::*;
 use crate::cache_action::{
     BackupKV, FreeComponentDeviceSlot, FreeComponentHostSlot, FreeDeviceKV, FreeDeviceKVFullOnly,
-    MambaEvictExcessPathStates, RebuildFullToSwaMapping, RecoverSwaWithLockedFull, SwaRebuild,
-    UpdatePendingBackupOnNodeSplit,
+    MambaEvictExcessPathStates, RebuildFullToSwaMapping, RecoverSwaWithLockedFull, ResidencyAction,
+    SwaRebuild, UpdatePendingBackupOnNodeSplit,
 };
 
 impl FreeDeviceKV {
@@ -12,6 +12,22 @@ impl FreeDeviceKV {
         let tag = self.tag();
         let indices = PyList::new(py, self.indices.into_iter().map(PyTensor))?;
         (tag, indices).into_py_any(py)
+    }
+}
+
+impl ResidencyAction {
+    pub(crate) fn into_py_tagged(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        (
+            self.tag(),
+            self.reason,
+            self.node_id,
+            self.node_revision,
+            self.keys,
+            self.parent_key,
+            PyTensor(self.indices),
+            self.page_ids,
+        )
+            .into_py_any(py)
     }
 }
 

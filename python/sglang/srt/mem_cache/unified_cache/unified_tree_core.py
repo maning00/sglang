@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
+    ResidencyAction,
     UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
@@ -133,6 +134,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        self.residency_revision = 0
+        self.residency_page_ids = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
@@ -501,6 +504,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
+        self.enable_residency = params.kv_memory_provider is not None
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -1022,7 +1026,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node = node
         best_match_device_value_len = 0
         full_kv_hit_length = 0
-        action: Optional[CacheAction | ComponentAction] = None
+        action: list[CacheAction | ComponentAction] = []
         separate_device_match = self.enable_hicache
         validators = self._create_match_validators(
             params, match_device_only=not separate_device_match
@@ -1062,7 +1066,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
-                node, action = self._split_node(child.key, child, prefix_len)
+                node, action = self._split_node_with_actions(
+                    child.key, child, prefix_len
+                )
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
@@ -1163,7 +1169,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
         full_kv_hit_length: int,
-        action: Optional[CacheAction | ComponentAction],
+        action: list[CacheAction | ComponentAction],
         last_visited_node_id: Optional[NodeId],
         device_validators: tuple[Callable[[UnifiedTreeNode], bool], ...],
     ) -> MatchResult:
@@ -1218,7 +1224,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=result.last_device_node.id,
             last_host_node=result.last_host_node.id,
             best_match_node=result.best_match_node.id,
-            cache_actions=[action] if action is not None else [],
+            cache_actions=action,
         )
 
     @property
@@ -1248,6 +1254,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
+    def collect_full_device_page_ids(self, from_node_id, until_node_id):
+        chunks = []
+        node = self.node_by_id(from_node_id)
+        until = self.node_by_id(until_node_id)
+        while node is not until:
+            if node.residency_page_ids is None:
+                return None
+            chunks.append(node.residency_page_ids)
+            node = node.parent
+        return tuple(p for chunk in reversed(chunks) for p in chunk)
+
+    def all_full_device_page_ids(self):
+        pages, stack = [], [self.root_node]
+        while stack:
+            node = stack.pop()
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            if isinstance(value, torch.Tensor) and value.numel():
+                ids = node.residency_page_ids
+                if ids is None or len(ids) * self.page_size != value.numel():
+                    return None
+                pages.extend(ids)
+            stack.extend(reversed(list(node.children.values())))
+        return tuple(pages)
+
+    def node_full_device_page_ids(self, node_id):
+        return self.node_by_id(node_id).residency_page_ids
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
@@ -1263,6 +1296,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if self.is_write_back:
             return False
         node.hit_count += 1
+        if self.enable_residency:
+            return False
 
         if self.enable_external_cache_linker:
             return (
@@ -1431,7 +1466,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Fire-and-forget actions safe to batch until the next barrier."""
         return isinstance(
             action,
-            (FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit),
+            (
+                FreeDeviceKV,
+                FreeDeviceKVFullOnly,
+                UpdatePendingBackupOnNodeSplit,
+                ResidencyAction,
+            ),
         )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
@@ -1449,11 +1489,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         prefix_len = node.key.match(key, page_size=self.page_size)
         if prefix_len < len(node.key):
             suffix = node
-            node, action = self._split_node(node.key, node, prefix_len)
+            node, action = self._split_node_with_actions(node.key, node, prefix_len)
             if suffix_time is not None:
                 suffix.last_access_time = suffix_time
-            if action is not None:
-                step_actions.append(action)
+            step_actions.extend(action)
         node.priority = max(node.priority, state.priority)
 
         if node.evicted:
@@ -1462,6 +1501,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.value[:prefix_len],
                 session_id=state.params.session_id,
             )
+            node.residency_page_ids = state.params.page_ids_for(
+                state.total_prefix_length,
+                state.total_prefix_length + prefix_len,
+                self.page_size,
+            )
+            self._residency_action(node, "restore", step_actions)
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
@@ -1570,6 +1615,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 rotation_base=state.params.rotation_base,
             )
             state.is_new_leaf = True
+            state.target_node.residency_page_ids = state.params.page_ids_for(
+                state.total_prefix_length,
+                state.total_prefix_length + len(state.key),
+                self.page_size,
+            )
+            self._residency_action(state.target_node, "attach", state.pending_actions)
         else:
             state.target_node = state.node
 
@@ -1658,6 +1709,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.rotation_base = child.rotation_base
 
         child.parent = new_node
+        child.residency_revision += 1
+        if child.residency_page_ids is not None:
+            pages = split_len // self.page_size
+            new_node.residency_page_ids = child.residency_page_ids[:pages]
+            child.residency_page_ids = child.residency_page_ids[pages:]
         child.key = child.key[split_len:]
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
@@ -1675,7 +1731,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ack_id = child.write_through_pending_id
         if ack_id is not None:
             new_node.write_through_pending_id = ack_id
-        if ack_id is not None or self.is_host_memory_buffer_only:
+        if (
+            ack_id is not None
+            or self.is_host_memory_buffer_only
+            or self.enable_residency
+        ):
             action = UpdatePendingBackupOnNodeSplit(
                 ack_id=ack_id,
                 old_node_id=child.id,
@@ -1704,6 +1764,86 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Only the new fragment needs qualifying; the child keeps its id.
         self._update_duplicate_tracking(new_node)
         return new_node, action
+
+    def _split_node_with_actions(self, key, child, split_len):
+        node, action = self._split_node(key, child, split_len)
+        actions = [action] if action is not None else []
+        self._residency_action(node, "split", actions)
+        self._residency_action(child, "split", actions)
+        return node, actions
+
+    def _residency_action(self, node, reason, actions):
+        if not self.enable_residency or node.evicted:
+            return
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+        parent = node.parent
+        parent_key = (
+            parent.hash_value[-1] if parent is not None and parent.hash_value else None
+        )
+        actions.append(
+            ResidencyAction(
+                reason,
+                node.id,
+                node.residency_revision,
+                tuple(node.hash_value),
+                parent_key,
+                node.component_data[BASE_COMPONENT_TYPE].value.clone(),
+                node.residency_page_ids,
+            )
+        )
+
+    def residency_snapshot(self, node_id):
+        node = self._node_arena.get(node_id)
+        if (
+            node is None
+            or not self._is_device_leaf(node)
+            or any(cd.session_ref > 0 for cd in node.component_data)
+            or node.load_back_pending_id is not None
+            or node.write_through_pending_id is not None
+            or node.write_back_queued
+            or len(node.key) % self.page_size
+        ):
+            return None
+        value = node.component_data[BASE_COMPONENT_TYPE].value
+        if value.numel() != len(node.key):
+            return None
+        return (
+            node.id,
+            node.residency_revision,
+            tuple(node.hash_value),
+            value.clone(),
+            node.residency_page_ids,
+        )
+
+    def offer_residency_candidates(self, n_pages):
+        if self.has_ongoing_insert():
+            raise RuntimeError("cannot offer during an insert walk")
+        # FULL's existing ordering, without changing the tree or retaining a
+        # walk over a control call. Session-referenced leaves are excluded.
+        full = self.components_by_type[BASE_COMPONENT_TYPE]
+        full.evict_device_start(n_pages * self.page_size)
+        snapshots, tokens = [], 0
+        try:
+            while tokens < n_pages * self.page_size:
+                node_id = full._evict_device_next_node(defaultdict(int), {}, {}, [])
+                if node_id is None:
+                    break
+                snapshot = self.residency_snapshot(node_id)
+                if snapshot is not None:
+                    snapshots.append(snapshot)
+                    tokens += snapshot[3].numel()
+        finally:
+            full.evict_device_end()
+        return snapshots
+
+    def confirm_residency_detach(self, node_id, revision):
+        if self.has_ongoing_insert():
+            raise RuntimeError("cannot detach during an insert walk")
+        snapshot = self.residency_snapshot(node_id)
+        if snapshot is None or snapshot[1] != revision:
+            return None
+        return self.evict_device_leaf(node_id, is_write_back=False)
 
     def _add_new_node(
         self,
@@ -1749,6 +1889,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[ct]
         assert cd.value is None
         cd.value = fresh_value.clone()
+        node.residency_revision += 1
         n = self.components_by_type[ct].reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
@@ -2766,11 +2907,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             if prefix_len < len(node.key):
                 suffix = node
-                node, action = self._split_node(node.key, node, prefix_len)
+                node, action = self._split_node_with_actions(node.key, node, prefix_len)
                 if suffix_time is not None:
                     suffix.last_access_time = suffix_time
-                if action is not None:
-                    cache_actions.append(action)
+                cache_actions.extend(action)
 
             if not self.is_write_back:
                 full_data = node.component_data[BASE_COMPONENT_TYPE]
@@ -3298,13 +3438,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         target = node
         if seg_start > node_start:
-            _, action = self._split_node(target.key, target, seg_start - node_start)
-            if action is not None:
-                actions.append(action)
+            _, action = self._split_node_with_actions(
+                target.key, target, seg_start - node_start
+            )
+            actions.extend(action)
         if seg_start + len(target.key) > seg_end:
-            fragment, action = self._split_node(target.key, target, seg_end - seg_start)
-            if action is not None:
-                actions.append(action)
+            fragment, action = self._split_node_with_actions(
+                target.key, target, seg_end - seg_start
+            )
+            actions.extend(action)
             target = fragment
         self.set_component_device_value(target.id, component_type, values.clone())
 

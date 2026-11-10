@@ -118,6 +118,10 @@ class SchedulerStats:
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
+    # Provider-mode kv_* counts are physical; the tree estimate is separate.
+    kv_provider_pages: Optional[Dict[str, int]] = None
+    kv_provider_tree_evictable_tokens: int = 0
+    kv_provider_loads: Optional[Dict[str, int]] = None
 
     # The same three counts for each window pool, by the window's name.
     window_available_tokens: Dict[str, int] = field(default_factory=dict)
@@ -365,6 +369,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Summary = self._summary_cls or _PromSummary
 
         self.labels = labels
+        # Created only when provider stats first arrive; disabled providers add
+        # no metric resources.
+        self.kv_provider_pages = None
+        self.kv_provider_tree_evictable_tokens = None
+        self.kv_provider_admission = None
+        self.kv_provider_loads = None
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
@@ -1710,7 +1720,116 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 num_write_bytes_per_gpu
             )
 
+    def observe_provider_admission(self, values) -> None:
+        if self.kv_provider_admission is None:
+            from prometheus_client import Counter as _PromCounter
+            from prometheus_client import Gauge as _PromGauge
+            from prometheus_client import Histogram as _PromHistogram
+
+            Counter = self._counter_cls or _PromCounter
+            Gauge = self._gauge_cls or _PromGauge
+            Histogram = self._histogram_cls or _PromHistogram
+            buckets = (
+                1e-6,
+                5e-6,
+                1e-5,
+                5e-5,
+                1e-4,
+                5e-4,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1,
+                5,
+            )
+            self.kv_provider_admission = {
+                "events": Counter(
+                    "sglang:kv_provider_admission_total",
+                    "KV provider admission events.",
+                    labelnames=[*self.labels, "event"],
+                ),
+                "request_wait": Histogram(
+                    "sglang:kv_provider_request_wait_seconds",
+                    "Capacity wait while a request's temporary prefix lock is held.",
+                    labelnames=self.labels.keys(),
+                    buckets=buckets,
+                ),
+                "round_wait": Histogram(
+                    "sglang:kv_provider_round_wait_seconds",
+                    "Accumulated provider capacity wait per scheduling round, including empty rounds.",
+                    labelnames=self.labels.keys(),
+                    buckets=buckets,
+                ),
+                "empty_rounds": Gauge(
+                    "sglang:kv_provider_empty_rounds",
+                    "Consecutive empty scheduling rounds following a provider Short.",
+                    labelnames=self.labels.keys(),
+                    multiprocess_mode="mostrecent",
+                ),
+            }
+        metrics = self.kv_provider_admission
+        for event in (
+            "requests",
+            "prepare",
+            "attempts",
+            "fast",
+            "short",
+            "retire_rounds",
+            "candidates",
+            "detached_pages",
+            "over_detached_pages",
+            "admitted",
+        ):
+            metrics["events"].labels(**self.labels, event=event).inc(
+                values.get(event, 0)
+            )
+        metrics["round_wait"].labels(**self.labels).observe(
+            values.get("wait_ns", 0) / 1e9
+        )
+        for wait in values.get("request_wait_ns", ()):
+            metrics["request_wait"].labels(**self.labels).observe(wait / 1e9)
+        self._log_gauge(metrics["empty_rounds"], values["consecutive_empty_rounds"])
+
     def log_stats(self, stats: SchedulerStats) -> None:
+        if stats.kv_provider_loads is not None:
+            if self.kv_provider_loads is None:
+                from prometheus_client import Gauge as _PromGauge
+
+                Gauge = self._gauge_cls or _PromGauge
+                self.kv_provider_loads = Gauge(
+                    "sglang:kv_provider_loads",
+                    "Process cumulative engine linker operations and completed source pages.",
+                    labelnames=[*self.labels, "kind"],
+                    multiprocess_mode="mostrecent",
+                )
+            for kind, count in stats.kv_provider_loads.items():
+                self.kv_provider_loads.labels(**self.labels, kind=kind).set(count)
+        if stats.kv_provider_pages is not None:
+            if self.kv_provider_pages is None:
+                from prometheus_client import Gauge as _PromGauge
+
+                Gauge = self._gauge_cls or _PromGauge
+                self.kv_provider_pages = Gauge(
+                    "sglang:kv_provider_pages",
+                    "Physical KV pages by provider state.",
+                    labelnames=[*self.labels, "state"],
+                    multiprocess_mode="mostrecent",
+                )
+                self.kv_provider_tree_evictable_tokens = Gauge(
+                    "sglang:kv_provider_tree_evictable_tokens",
+                    "Semantic tree eviction estimate; not available physical capacity.",
+                    labelnames=self.labels.keys(),
+                    multiprocess_mode="mostrecent",
+                )
+            for state, count in stats.kv_provider_pages.items():
+                self.kv_provider_pages.labels(**self.labels, state=state).set(count)
+            self._log_gauge(
+                self.kv_provider_tree_evictable_tokens,
+                stats.kv_provider_tree_evictable_tokens,
+            )
         # Basics
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)

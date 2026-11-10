@@ -71,6 +71,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
 
 fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
     tc.insert(&crate::unified_tree_core::InsertParams {
+        provider_page_ids: None,
         rotation_base: None,
         key,
         namespace: Default::default(),
@@ -911,6 +912,7 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
 fn host_drive_is_a_noop_without_host_leaves() {
     let mut tc = core();
     tc.insert(&crate::unified_tree_core::InsertParams {
+        provider_page_ids: None,
         rotation_base: None,
         key: &vec![1, 2],
         namespace: Default::default(),

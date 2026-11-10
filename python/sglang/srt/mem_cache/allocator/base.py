@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    kv_memory_provider = None
     # Whether every pool takes its rows from one shared memory, so the prefix
     # cache reclaims an allocation's demand as one; else each pool is its own.
     pools_share_memory = False
@@ -317,7 +318,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         pending, self.free_group = self.free_group, None
         if pending:
-            self.free(torch.cat(pending))
+            self.free(self._cat_free_group(pending))
+
+    @staticmethod
+    def _cat_free_group(indices):
+        return torch.cat(indices)
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:

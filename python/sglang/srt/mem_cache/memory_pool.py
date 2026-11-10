@@ -425,6 +425,9 @@ class ReqToTokenPool:
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+        mirror = getattr(self, "_provider_row_mirror", None)
+        if mirror is not None:
+            mirror.write_slice(indices, values)
 
     def available_size(self):
         return len(self.free_slots)

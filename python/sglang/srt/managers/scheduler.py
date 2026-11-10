@@ -37,6 +37,7 @@ from typing import (
     Union,
 )
 
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -4705,6 +4706,10 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if full_provider_of(self.token_to_kv_pool_allocator) is not None:
+            self.metrics_reporter.record_provider_admission_round(
+                adder.memory_budget.provider_admission_stats, len(can_run_list)
+            )
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
@@ -5283,7 +5288,11 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        if self.enable_unified_memory:
+                        if (
+                            self.enable_unified_memory
+                            or full_provider_of(self.token_to_kv_pool_allocator)
+                            is not None
+                        ):
                             # Before copy_to_cpu, so the event covers only the forward.
                             batch_result.unified_forward_done = (
                                 self._record_unified_forward(
@@ -5445,10 +5454,9 @@ class Scheduler(
             if self.uocr_runtime is not None:
                 # Commit the overlap text before the next batch is built from this one.
                 self.uocr_runtime.after_forward(batch, chunked_req=self.chunked_req)
-            if (
-                self.enable_unified_memory
-                and not self.enable_overlap
-                and get_parallel().pp_size > 1
+            if not self.enable_overlap and (
+                (self.enable_unified_memory and get_parallel().pp_size > 1)
+                or full_provider_of(self.token_to_kv_pool_allocator) is not None
             ):
                 # A pipeline stage schedules its next microbatch while this
                 # forward runs; the current stream is the one the forward ran on.
@@ -5493,7 +5501,10 @@ class Scheduler(
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                         can_run_cuda_graph=can_run_cuda_graph,
                     )
-                    if self.enable_unified_memory:
+                    if (
+                        self.enable_unified_memory
+                        or full_provider_of(self.token_to_kv_pool_allocator) is not None
+                    ):
                         # Before copy_to_cpu, so the event covers only the forward.
                         ret.unified_forward_done = self._record_unified_forward(
                             batch=batch,
@@ -6111,35 +6122,51 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
-            self.cur_batch_for_debug = None
-            self.last_batch = None
-            if self.uocr_runtime is not None:
-                # Before the pool clear, which returns the retained windows' KV.
-                self._abort_uocr_doc_windows(
-                    self.uocr_runtime.reset(),
-                    finished_reason={
-                        "type": "abort",
-                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                        "message": "The cache was flushed while this document "
-                        "window waited for the previous one.",
-                    },
+            reset_scope = nullcontext(True)
+            if full_provider_of(self.token_to_kv_pool_allocator) is not None:
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
-            self.req_to_token_pool.reset_aux_cache_allocator()
-            self.grammar_manager.clear()
-            self.metrics_reporter.reset_metrics()
+                reset_scope = storage.reset_scope(
+                    verdict=self.tree_cache.provider_verdict
+                )
+            with reset_scope as ready:
+                if not ready:
+                    logging.warning(
+                        "Cache not flushed because KV provider is busy. #queue-req: %d, #running-req: %d",
+                        len(self.waiting_queue),
+                        len(self.running_batch.reqs),
+                    )
+                    return False
+                self.cur_batch_for_debug = None
+                self.last_batch = None
+                if self.uocr_runtime is not None:
+                    # Before the pool clear, which returns the retained windows' KV.
+                    self._abort_uocr_doc_windows(
+                        self.uocr_runtime.reset(),
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                            "message": "The cache was flushed while this document "
+                            "window waited for the previous one.",
+                        },
+                    )
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+                self.req_to_token_pool.reset_aux_cache_allocator()
+                self.grammar_manager.clear()
+                self.metrics_reporter.reset_metrics()
 
-            if self.draft_worker:
-                self.draft_worker.clear_cache_pool()
+                if self.draft_worker:
+                    self.draft_worker.clear_cache_pool()
 
-            if empty_cache:
-                current_platform.empty_cache()
-            # Per-DP-group leader logs once: ranks within a DP group are
-            # state-synchronous, but DP groups may diverge.
-            if self.metrics_reporter.is_stats_logging_rank:
-                logger.info("Cache flushed successfully!")
+                if empty_cache:
+                    current_platform.empty_cache()
+                # Per-DP-group leader logs once: ranks within a DP group are
+                # state-synchronous, but DP groups may diverge.
+                if self.metrics_reporter.is_stats_logging_rank:
+                    logger.info("Cache flushed successfully!")
             self.invariant_checker.run(CheckPhase.FLUSH)
             success = True
         else:

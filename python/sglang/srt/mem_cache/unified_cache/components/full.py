@@ -504,7 +504,10 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            if storage.available_units(sub_pool) < num_tokens:
+            if getattr(storage, "provider", None) is not None:
+                if storage.available_units(sub_pool) < num_tokens:
+                    raise RuntimeError("FULL load exceeds the request reservation")
+            elif storage.available_units(sub_pool) < num_tokens:
                 self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:

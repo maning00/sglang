@@ -651,6 +651,9 @@ class Resources(_FlagGroupBase):
     semantics kept in the owning modules' accessors (which are thin shims
     over these slots)."""
 
+    kv_memory_providers: dict = msgspec.field(default_factory=dict)
+    # CPU index geometry keyed by storage weak identity; no device ownership.
+    kv_provider_index_mirrors: dict = msgspec.field(default_factory=dict)
     # CUDA graph memory pool shared across the prefill and decode graph
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None

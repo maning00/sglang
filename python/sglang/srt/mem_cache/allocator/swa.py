@@ -62,6 +62,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
+        self.kv_memory_provider = getattr(kvcache, "kv_memory_provider", None)
 
         full_kv_pool = getattr(kvcache, "full_kv_pool", None)
         swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
@@ -89,13 +90,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
-            self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
+            full_allocator_cls = PagedTokenToKVPoolAllocatorClass
+            full_kwargs = {}
+            if self.kv_memory_provider is not None:
+                from sglang.srt.mem_cache.allocator.provider import ProviderPageSource
+
+                full_allocator_cls = ProviderPageSource
+                full_kwargs["provider"] = self.kv_memory_provider
+            self.full_attn_allocator = full_allocator_cls(
                 size,
                 page_size,
                 dtype,
                 device,
                 full_kv_pool,
                 need_sort,
+                **full_kwargs,
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size_swa,
@@ -149,7 +158,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self._swa_ring_cost = 0
 
-        self.clear()
+        self._provider_initializing = True
+        try:
+            self.clear()
+        finally:
+            self._provider_initializing = False
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     @property
@@ -702,6 +715,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return expanded
 
     def resize(self, config) -> None:
+        if self.kv_memory_provider is not None:
+            raise RuntimeError("KV page provider does not support resize")
         size_full = int(config.full_max_total_num_tokens)
         size_swa = int(config.swa_max_total_num_tokens)
         self._size_full = size_full
@@ -717,9 +732,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 alloc.num_pages = int(sz) // self.page_size
         self.clear()
 
-    def clear(self):
+    def clear(self, *, reset_lease=None):
+        if self.kv_memory_provider is not None and not self._provider_initializing:
+            if reset_lease is not None:
+                self.full_attn_allocator.authorize_reset(reset_lease)
+            self.full_attn_allocator.validate_clear()
         self.swa_attn_allocator.clear()
-        self.full_attn_allocator.clear()
+        if self.kv_memory_provider is None or not self._provider_initializing:
+            self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.free_group = None

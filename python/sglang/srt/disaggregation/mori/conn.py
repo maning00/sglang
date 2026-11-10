@@ -369,6 +369,7 @@ class _SubmissionLocal(threading.local):
     """
 
     statuses: Optional[List[TransferStatus]] = None
+    receipt = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -552,6 +553,10 @@ class MoriKVManager(CommonKVManager):
                 self._handle_submission_failure(kv_chunk, exc)
                 continue
             except Exception as exc:
+                if kv_chunk.physical_receipt is not None:
+                    kv_chunk.physical_receipt.seal(
+                        unknown=kv_chunk.physical_receipt.attempts > 0
+                    )
                 failure_reason = f"transfer worker raised: {exc!r}"
                 try:
                     logger.exception(
@@ -624,12 +629,22 @@ class MoriKVManager(CommonKVManager):
     def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> bool:
         room = kv_chunk.room
         if self._should_skip_transfer(room):
+            if kv_chunk.physical_receipt is not None:
+                kv_chunk.physical_receipt.seal()
             return True
 
         if kv_chunk.wait_event is not None:
             kv_chunk.wait_event.synchronize()
+        if kv_chunk.physical_receipt is not None:
+            if kv_chunk.indices_event is not None:
+                kv_chunk.indices_event.synchronize()
+            if not kv_chunk.physical_receipt.wait_ready():
+                kv_chunk.physical_receipt.seal()
+                return True
 
         if self._should_skip_transfer(room):
+            if kv_chunk.physical_receipt is not None:
+                kv_chunk.physical_receipt.seal()
             return True
 
         statuses = self._submit_transfer_chunk(kv_chunk)
@@ -681,7 +696,10 @@ class MoriKVManager(CommonKVManager):
         return failure_reason, is_quiescent
 
     def _submit_transfer_chunk(self, kv_chunk: TransferKVChunk) -> List[TransferStatus]:
-        if not self.enable_deferred_decode_kv_release:
+        if (
+            not self.enable_deferred_decode_kv_release
+            and kv_chunk.physical_receipt is None
+        ):
             return self._submit_kv_transfer(
                 kv_chunk.room,
                 kv_chunk.prefill_kv_indices,
@@ -693,6 +711,7 @@ class MoriKVManager(CommonKVManager):
             )
 
         self._submission_local.statuses = []
+        self._submission_local.receipt = kv_chunk.physical_receipt
         try:
             return self._submit_kv_transfer(
                 kv_chunk.room,
@@ -704,12 +723,32 @@ class MoriKVManager(CommonKVManager):
                 num_kv_tokens=kv_chunk.num_kv_tokens,
             )
         except Exception as exc:
+            if kv_chunk.physical_receipt is not None:
+                kv_chunk.physical_receipt.seal(
+                    unknown=kv_chunk.physical_receipt.attempts > 0
+                )
             raise _MoriTransferSubmissionError(
                 f"Transfer submission failed: {exc}",
                 list(self._submission_local.statuses),
             ) from exc
         finally:
+            if kv_chunk.physical_receipt is not None:
+                kv_chunk.physical_receipt.seal()
+            self._submission_local.receipt = None
             self._submission_local.statuses = None
+
+    def _engine_batch_write(self, *args):
+        receipt = self._submission_local.receipt
+        if receipt is None:
+            return self.engine.batch_write(*args)
+        receipt.before_post()
+        try:
+            statuses = self.engine.batch_write(*args)
+        except BaseException:
+            receipt.seal(unknown=True)
+            raise
+        receipt.posted(statuses)
+        return statuses
 
     def _enqueue_transfer_drain(
         self,
@@ -825,6 +864,15 @@ class MoriKVManager(CommonKVManager):
             return
 
         shard_idx = bootstrap_room % self._num_shards
+        record = (self._send_records or {}).get(bootstrap_room)
+        receipt = (
+            None
+            if record is None or record.receipts is None
+            else record.receipts.pop(record.queued, None)
+        )
+        if receipt is not None:
+            receipt.bind()
+            self.note_send_enqueued(bootstrap_room)
         self._transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -835,6 +883,9 @@ class MoriKVManager(CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 wait_event=wait_event,
+                indices_event=indices_event,
+                send_record=record,
+                physical_receipt=receipt,
             )
         )
 
@@ -1052,6 +1103,15 @@ class MoriKVManager(CommonKVManager):
         The KV cache pool memory is owned by the scheduler and is NOT freed
         here; only mori-side registrations / sockets / engine are released.
         """
+        if (
+            self.physical_send_quiescence is not None
+            and not self.physical_send_quiescence()
+        ):
+            from sglang.srt.mem_cache.kv_memory_provider import ProviderFailStop
+
+            raise ProviderFailStop(
+                "cannot destroy PD registrations with unresolved provider I/O"
+            )
         self._stopped = True
         # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
         # timeout; push a None sentinel per shard to wake and stop them so the
@@ -1265,7 +1325,7 @@ class MoriKVManager(CommonKVManager):
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
-        statuses = self.engine.batch_write(
+        statuses = self._engine_batch_write(
             [src_desc],
             [plan.local_offsets],
             [dst_desc],
@@ -1579,7 +1639,7 @@ class MoriKVManager(CommonKVManager):
             sizes.append([item_len])
             uids.append(self.engine.allocate_transfer_uid())
         statuses = list(
-            self.engine.batch_write(
+            self._engine_batch_write(
                 src_descs, local_offsets, dst_descs, remote_offsets, sizes, uids
             )
         )
@@ -1842,7 +1902,7 @@ class MoriKVManager(CommonKVManager):
 
             for src_offset, dst_offset, size in blocks:
                 transfer_uid = self.engine.allocate_transfer_uid()
-                batch_statuses = self.engine.batch_write(
+                batch_statuses = self._engine_batch_write(
                     [src_desc],
                     [[src_offset]],
                     [dst_desc],

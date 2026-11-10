@@ -368,6 +368,8 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_backend_extra_config",
     "hicache_storage_prefetch_retry_poll_interval",
     "hicache_storage_prefetch_retry_max_attempts",
+    "kv_memory_provider",
+    "kv_memory_provider_config",
     "enable_unified_cache_external_linker",
     "unified_cache_external_linker_backend",
     "enable_hisparse",

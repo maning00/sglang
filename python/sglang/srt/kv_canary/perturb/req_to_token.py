@@ -39,6 +39,10 @@ def run(
     ):
         return
 
+    from sglang.srt.mem_cache.provider_indices import reject_unmirrored_write
+
+    reject_unmirrored_write(req_to_token_pool.req_to_token, "KV canary perturbation")
+
     entries = collect_active_slots(
         maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         req_to_token_pool=req_to_token_pool,

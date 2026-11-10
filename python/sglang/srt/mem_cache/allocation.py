@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import attention_backends, get_parallel, get_schedule
@@ -79,6 +80,14 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
+    mirror = getattr(req_to_token_pool, "_provider_row_mirror", None)
+    if mirror is not None:
+        offset = 0
+        for row, count, prefix in zip(
+            req_pool_indices_cpu.tolist(), extend_lens_cpu.tolist(), prefix_tensors
+        ):
+            mirror.write(row, prefix, out_cache_loc[offset : offset + count])
+            offset += count
     # This writer's one caller is `alloc_for_extend`, so the prefill half
     # decides; the fallback below pays several `.item()` syncs per request.
     prefill_backend, _ = attention_backends()
@@ -336,7 +345,13 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
     # already has its prefix there; a new one reads its match off the tree.
     if req.kv.holds_kv:
         row = batch.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
-        return row[: req.prefix_len].to(torch.int64)
+        prefix = row[: req.prefix_len]
+        converted = prefix.to(torch.int64)
+        if full_provider_of(batch.token_to_kv_pool_allocator) is not None:
+            from sglang.srt.mem_cache.provider_indices import copy_index_metadata
+
+            copy_index_metadata(prefix, converted)
+        return converted
     if req.prefix_len == 0:
         return _EMPTY_PREFIX
     return batch.tree_cache.prefix_device_indices(req)
@@ -453,13 +468,31 @@ def alloc_for_extend(
             alloc_extend_num_tokens = int(
                 (alloc_seq_lens_cpu - alloc_prefix_lens_cpu).sum()
             )
+        last_loc = torch.cat(last_loc)
+        if getattr(storage, "provider", None) is not None:
+            from sglang.srt.mem_cache.provider_indices import (
+                attach_index_cpu,
+                index_cpu,
+            )
+
+            attach_index_cpu(
+                last_loc,
+                torch.cat(
+                    [
+                        index_cpu(t[-1:])
+                        if len(t)
+                        else torch.tensor([-1], dtype=torch.int64)
+                        for t in prefix_tensors
+                    ]
+                ),
+            )
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=alloc_prefix_lens,
             prefix_lens_cpu=alloc_prefix_lens_cpu,
             seq_lens=alloc_seq_lens,
             seq_lens_cpu=alloc_seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
+            last_loc=last_loc,
             extend_num_tokens=alloc_extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
@@ -778,6 +811,9 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    from sglang.srt.mem_cache.provider_indices import reject_unmirrored_write
+
+    reject_unmirrored_write(req_to_token, "raw assign_req_to_token_pool")
     if _is_cpu:
         assign_req_to_token_pool_cpu(
             req_pool_indices,

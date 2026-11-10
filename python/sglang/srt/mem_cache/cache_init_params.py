@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -71,6 +72,10 @@ class CacheInitParams:
     # Draft KV pools that share the target KV slots but are stored apart from it.
     sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
+
+    @property
+    def kv_memory_provider(self):
+        return full_provider_of(self.token_to_kv_pool_allocator)
 
     @property
     def tree_components(self) -> Optional[tuple[ComponentType, ...]]:

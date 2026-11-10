@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.kv.storage import SubPoolUsage
+from sglang.srt.mem_cache.kv_memory_provider import PageAccounting
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolShape
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -96,6 +97,34 @@ def _collector(registry, labels=None):
 
 
 class TestWindowPoolMetrics(CustomTestCase):
+    def test_engine_load_source_counts_reach_existing_prometheus_pipeline(self):
+        observer = _three_window_observer()
+        values = {
+            "completed_LocalDram_pages": 6,
+            "completed_LocalHbm_pages": 2,
+            "prepare_rejected": 1,
+        }
+        observer.token_to_kv_pool_allocator.kv_memory_provider = SimpleNamespace(
+            accounting=lambda: PageAccounting(capacity=1000, cached=600, published=400),
+            get_load_stats=lambda: values,
+        )
+        observer.token_to_kv_pool_allocator.page_size = 1
+        stats = SchedulerStats()
+        observer.get_pool_stats().update_scheduler_stats(stats)
+        self.assertEqual(stats.kv_provider_loads, values)
+        registry = prometheus_client.CollectorRegistry()
+        gauge = prometheus_client.Gauge
+        with mock.patch("prometheus_client.Gauge", partial(gauge, registry=registry)):
+            collector = _collector(registry)
+            collector.log_stats(stats)
+        series = {
+            s.labels["kind"]: s.value
+            for family in registry.collect()
+            for s in family.samples
+            if s.name == "sglang:kv_provider_loads"
+        }
+        self.assertEqual(series, values)
+
     def test_three_windows_report_three_label_values(self):
         stats = _three_window_observer().get_pool_stats()
         # The tree's first window comes first, whatever the storage order.

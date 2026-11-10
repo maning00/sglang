@@ -337,7 +337,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.free_group is None:
-            self._release_page_ids(torch.unique(free_index // self.page_size))
+            self._release_page_ids(self._pages_for_free(free_index))
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
@@ -361,7 +361,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.unique(free_index.cpu() // ps),
             )
 
-        self.free_page_ids(reps // ps)
+        self.free_page_ids(self._pages_for_free(free_index, segment=True))
+
+    def _pages_for_free(self, indices, *, segment=False):
+        return (
+            indices[:: self.page_size] // self.page_size
+            if segment
+            else torch.unique(indices // self.page_size)
+        )
 
     def free_page_ids(self, page_ids: torch.Tensor):
         """Free exactly these pages; no page twice, no dedup."""
@@ -397,7 +404,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         super().free_group_end()
         if self.free_page_ids_group:
-            self._release_page_ids(torch.cat(self.free_page_ids_group))
+            self._release_page_ids(self._cat_free_group(self.free_page_ids_group))
             self.free_page_ids_group = []
         if self.debug_mode:
             # the no-double-free contract can only break across a group's calls

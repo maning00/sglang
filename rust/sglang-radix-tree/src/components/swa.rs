@@ -90,6 +90,8 @@ impl SwaComponent {
         if let Some(action) = action {
             cache_actions.push(Box::new(action));
         }
+        tree_core.residency_action_(new_parent, "split", cache_actions);
+        tree_core.residency_action_(leaf_id, "split", cache_actions);
         Some(new_parent)
     }
 
@@ -299,10 +301,9 @@ impl SwaComponent {
             if !cur_node.has_host_value(SWA) && fill_len > 0 {
                 // Tombstone: split off the in-buffer tail if needed, then fill.
                 if fill_start > node_start {
-                    let (_, action) = tree_core.split_node_(cur, fill_start - node_start);
-                    if let Some(action) = action {
-                        cache_actions.push(Box::new(action));
-                    }
+                    let (_, actions) =
+                        tree_core.split_node_with_actions_(cur, fill_start - node_start);
+                    cache_actions.extend(actions);
                 }
                 self.attach_swa_host_value_(tree_core, cur, slice);
             } else {
@@ -475,11 +476,20 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy());
+            node.residency_revision += 1;
+            let external_id = node.id;
+            tree_core.set_residency_page_ids_(
+                node_id,
+                params,
+                total_prefix_len,
+                total_prefix_len + prefix_len,
+            );
+            tree_core.residency_action_(node_id, "dedup", cache_actions);
             cache_actions.push(Box::new(FreeDeviceKVFullOnly {
                 indices: vec![old_full],
             }));
             cache_actions.push(Box::new(SwaRebuild {
-                node_id: node.id,
+                node_id: external_id,
                 source_value: value_slice,
             }));
             0
@@ -493,10 +503,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let old_full =
                 node.device_value(FULL)
                     .narrow(0, start_idx as i64, (full_len - start_idx) as i64);
-            let (_, action) = tree_core.split_node_(node_id, start_idx);
-            if let Some(action) = action {
-                cache_actions.push(Box::new(action));
-            }
+            let (_, actions) = tree_core.split_node_with_actions_(node_id, start_idx);
+            cache_actions.extend(actions);
             let new_full = value_slice.narrow(0, start_idx as i64, (prefix_len - start_idx) as i64);
             if preserve_full {
                 cache_actions.push(Box::new(RecoverSwaWithLockedFull {
@@ -510,6 +518,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy());
+            node.residency_revision += 1;
+            tree_core.set_residency_page_ids_(
+                node_id,
+                params,
+                swa_evicted_seqlen,
+                total_prefix_len + prefix_len,
+            );
+            tree_core.residency_action_(node_id, "dedup", cache_actions);
             cache_actions.push(Box::new(FreeDeviceKVFullOnly {
                 indices: vec![old_full],
             }));
@@ -552,10 +568,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // entire node is within the SWA window
         } else if swa_evicted_seqlen < total_prefix_len + prefix_len {
             let start_idx = swa_evicted_seqlen - total_prefix_len;
-            let (_, action) = tree_core.split_node_(node_id, start_idx);
-            if let Some(action) = action {
-                cache_actions.push(Box::new(action));
-            }
+            let (_, actions) = tree_core.split_node_with_actions_(node_id, start_idx);
+            cache_actions.extend(actions);
         } else {
             return;
         }
@@ -599,10 +613,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if split_pos > 0 {
                 // Node straddles the boundary: split into an out-of-window parent
                 // (tombstone) and an in-window child; `node` becomes the child.
-                let (_, action) = tree_core.split_node_(node_id, split_pos);
-                if let Some(action) = action {
-                    cache_actions.push(Box::new(action));
-                }
+                let (_, actions) = tree_core.split_node_with_actions_(node_id, split_pos);
+                cache_actions.extend(actions);
             }
         }
         result.record_adopted_range(SWA, node_start.max(params.swa_evicted_seqlen), node_end);

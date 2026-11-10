@@ -2154,6 +2154,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         # first is applied, so list order is a hard contract.
         def make_cache():
             cache = mock.MagicMock()
+            cache.provider = None
             cache.ongoing_write_through = {7: _OngoingWriteThrough(10, None, [5, 10])}
             cache._replace_pending_write_through_node = lambda *args: (
                 UnifiedRadixCache._replace_pending_write_through_node(cache, *args)
@@ -2193,6 +2194,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
 
     def test_split_action_without_ack_still_reaches_full(self):
         cache = mock.MagicMock()
+        cache.provider = None
         component = _component_with_cache(ComponentType.FULL, cache)
         component.apply_component_action = mock.Mock(
             wraps=component.apply_component_action

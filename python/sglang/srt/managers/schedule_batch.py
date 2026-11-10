@@ -264,6 +264,10 @@ class ReqKvInfo:
     # whether any KV is held is `holds_kv` (a row is registered).
     # Match observations and scheduling state stay on the Req itself.
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
+    # Opaque provider ticket, owned by this request instance until batch extend.
+    reservation: Optional[object] = None
+    reservation_revision: int = 0
+    reservation_identity: Optional[str] = None
 
     # The request's own KV is [cache_protected_len, kv_allocated_len). Only the
     # methods below write the lengths.
@@ -2338,6 +2342,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        try:
+            return self._prepare_for_extend()
+        except BaseException:
+            from sglang.srt.mem_cache.kv_memory_provider import (
+                refund_request_reservation,
+            )
+
+            for req in self.reqs:
+                refund_request_reservation(req)
+            raise
+
+    def _prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():

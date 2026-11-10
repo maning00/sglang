@@ -92,6 +92,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
+    ResidencyAction,
     UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
@@ -222,6 +223,8 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    provider = None
+    _insert_allocations = None
 
     def __init__(
         self,
@@ -229,6 +232,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.provider = params.kv_memory_provider
         self.logical_page_size = params.page_size
         if self.token_to_kv_pool_allocator is not None:
             self.logical_page_size = self.token_to_kv_pool_allocator.page_size
@@ -751,6 +755,26 @@ class UnifiedRadixCache(BasePrefixCache):
         self.insert_session_id = params.session_id
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
+            if self.provider is not None:
+                from sglang.srt.mem_cache.kv_memory_provider import allocation_page_ids
+
+                if params.value is None:
+                    raise RuntimeError("provider insert needs allocated FULL indices")
+                incoming = (
+                    params.value
+                    if params.prev_prefix_len == 0
+                    else params.value[params.prev_prefix_len :]
+                )
+                page_ids = getattr(params.value, "_kv_provider_page_ids", None)
+                page_ids = (
+                    tuple(page_ids[params.prev_prefix_len // self.page_size :])
+                    if page_ids is not None
+                    else allocation_page_ids(incoming, self.page_size)
+                )
+                params.provider_page_ids = page_ids
+                self._insert_allocations = self.provider.freeze_allocations(
+                    incoming, page_ids=page_ids
+                )
             step = self.tree_core.begin_insert(params)
             while True:
                 self._apply_cache_actions(step.actions)
@@ -765,6 +789,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._apply_cache_actions(self.tree_core.end_insert())
             finally:
                 self.insert_session_id = None
+                self._insert_allocations = None
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
@@ -1628,6 +1653,10 @@ class UnifiedRadixCache(BasePrefixCache):
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+        if self.provider is not None:
+            from sglang.srt.mem_cache.provider_indices import copy_index_metadata
+
+            copy_index_metadata(kv_indices[:page_aligned_len], values)
 
         insert_params.key = radix_key
         insert_params.value = values
@@ -1786,10 +1815,60 @@ class UnifiedRadixCache(BasePrefixCache):
         self, actions: list[CacheAction | ComponentAction]
     ) -> None:
         # Apply and consume one at a time: a spent list cannot be double-applied.
+        frozen = {}
+        if self.provider is not None:
+            from sglang.srt.mem_cache.kv_memory_provider import (
+                JoinedReceipt,
+                ResidentPage,
+                indices_ready,
+            )
+
+            # Freeze every adoption before ANY free in this step. Looking up a
+            # generation after a free could publish a later user's allocation.
+            for action in actions:
+                if isinstance(action, ResidencyAction):
+                    from sglang.srt.mem_cache.provider_indices import attach_page_ids
+
+                    if action.page_ids is not None:
+                        attach_page_ids(action.indices, action.page_ids, self.page_size)
+                        # Keep geometry on the actual node storage, not only
+                        # the action's immutable device copy (also for tch).
+                        value = self.tree_core.get_component_device_value(
+                            action.node_id, BASE_COMPONENT_TYPE
+                        )
+                        current_pages = self.tree_core.node_full_device_page_ids(
+                            action.node_id
+                        )
+                        if value is not None and current_pages is not None:
+                            attach_page_ids(value, current_pages, self.page_size)
+                    context = self.provider.freeze_allocations(
+                        action.indices,
+                        context=self._insert_allocations,
+                        page_ids=action.page_ids,
+                    )
+                    handles = context.handles()
+                    if len(handles) != len(action.keys):
+                        raise RuntimeError("residency action is not page-exact")
+                    parents = (action.parent_key, *action.keys[:-1])
+                    pages = tuple(
+                        ResidentPage(k, p, h)
+                        for k, p, h in zip(action.keys, parents, handles, strict=True)
+                    )
+                    frozen[id(action)] = (
+                        pages,
+                        JoinedReceipt(
+                            (context.ready(handles), indices_ready(action.indices))
+                        ),
+                    )
         actions.reverse()
         try:
             while actions:
-                self._apply_cache_action(actions.pop())
+                action = actions.pop()
+                if isinstance(action, ResidencyAction):
+                    pages, ready = frozen.pop(id(action))
+                    self.provider.publish(pages, ready=ready)
+                else:
+                    self._apply_cache_action(action)
         finally:
             actions.reverse()
 
@@ -1797,6 +1876,18 @@ class UnifiedRadixCache(BasePrefixCache):
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
+            if self.provider is not None and isinstance(
+                action, UpdatePendingBackupOnNodeSplit
+            ):
+                from sglang.srt.mem_cache.provider_indices import attach_page_ids
+
+                for node_id in (action.new_node_id, action.new_child_node_id):
+                    value = self.tree_core.get_component_device_value(
+                        node_id, BASE_COMPONENT_TYPE
+                    )
+                    pages = self.tree_core.node_full_device_page_ids(node_id)
+                    if value is not None and pages is not None:
+                        attach_page_ids(value, pages, self.page_size)
             if (
                 isinstance(action, UpdatePendingBackupOnNodeSplit)
                 and action.ack_id is not None
@@ -1820,6 +1911,8 @@ class UnifiedRadixCache(BasePrefixCache):
             for indices in action.indices:
                 storage.free_owner_rows(indices)
         elif isinstance(action, BackupKV):
+            if self.provider is not None:
+                raise RuntimeError("provider residency must not use linker offload")
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
             else:
@@ -4267,8 +4360,175 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    def provider_verdict(self, ready):
+        verdict = torch.tensor([int(ready)], dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        return bool(verdict.item())
+
+    def provider_shortage(self, n_pages):
+        value = torch.tensor([n_pages], dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(value, torch.distributed.ReduceOp.MAX)
+        return int(value.item())
+
+    def _provider_gather(self, payload):
+        payloads = [payload]
+        groups = [
+            g
+            for g in (self.attn_cp_group, self.attn_tp_group)
+            if g is not None and torch.distributed.get_world_size(group=g) > 1
+        ]
+        if not groups and self.tp_world_size > 1:
+            groups = [self.tp_group]
+        for group in groups:
+            rows = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(rows, payloads, group=group)
+            payloads = [value for row in rows for value in row]
+        return payloads
+
+    def offer_candidates(self, n_pages):
+        from sglang.srt.mem_cache.kv_memory_provider import DetachCandidate
+
+        candidates = []
+        for (
+            node_id,
+            revision,
+            keys,
+            indices,
+            page_ids,
+        ) in self.tree_core.offer_residency_candidates(n_pages):
+            context = self.provider.freeze_allocations(indices, page_ids=page_ids)
+            candidates.append(
+                DetachCandidate(node_id, revision, keys, context.handles())
+            )
+        identities = [(c.node_id, c.revision, c.keys) for c in candidates]
+        ranks = self._provider_gather(identities)
+        common = set(identities).intersection(*(set(row) for row in ranks))
+        by_id = {
+            identity: candidate for identity, candidate in zip(identities, candidates)
+        }
+        return [by_id[identity] for identity in ranks[0] if identity in common]
+
+    def confirm_detach(self, candidates):
+        from sglang.srt.mem_cache.kv_memory_provider import DetachResult
+
+        valid_mask = []
+        for candidate in candidates:
+            snapshot = self.tree_core.residency_snapshot(candidate.node_id)
+            valid = (
+                snapshot is not None
+                and snapshot[1] == candidate.revision
+                and snapshot[2] == candidate.keys
+            )
+            if valid:
+                page_ids = (
+                    snapshot[4]
+                    if snapshot[4] is not None
+                    else tuple(h.page_id for h in candidate.handles)
+                )
+                context = self.provider.freeze_allocations(
+                    snapshot[3], page_ids=page_ids
+                )
+                valid = context.handles() == candidate.handles
+            valid_mask.append(int(valid))
+        if not candidates:
+            return []
+        verdicts = torch.tensor(valid_mask, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(verdicts, torch.distributed.ReduceOp.MIN)
+        results = []
+        for candidate, valid in zip(candidates, verdicts.tolist()):
+            if not valid:
+                results.append(DetachResult(candidate, "stale"))
+                continue
+            result = self.tree_core.confirm_residency_detach(
+                candidate.node_id, candidate.revision
+            )
+            if result is None:
+                raise RuntimeError("detach candidate changed on the scheduler thread")
+            from sglang.srt.mem_cache.provider_indices import attach_page_ids
+
+            full = result.device_frees.get(BASE_COMPONENT_TYPE, ())
+            if (
+                len(full) == 1
+                and full[0].numel() == len(candidate.handles) * self.page_size
+            ):
+                attach_page_ids(
+                    full[0], (h.page_id for h in candidate.handles), self.page_size
+                )
+            self._drain_device_frees(result.device_frees)
+            self._drain_host_frees(result.host_frees)
+            self._apply_cache_actions(result.cache_actions)
+            results.append(DetachResult(candidate, "detached"))
+        return results
+
+    def check_provider_events(self):
+        if self.provider is None:
+            return
+        self.kv_storage().poll_provider_io()
+        events = list(self.provider.progress())
+        present = torch.tensor([bool(events)], dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(present, torch.distributed.ReduceOp.MAX)
+        if not present.item():
+            return
+        # A node can ask only one attention rank first. Share semantic work,
+        # then use each rank's own handles; independent DP groups never join.
+        work = [
+            (
+                e.kind,
+                e.n_pages,
+                tuple((c.node_id, c.revision, c.keys) for c in e.candidates),
+            )
+            for e in events
+        ]
+        tasks = list(
+            dict.fromkeys(item for rank in self._provider_gather(work) for item in rank)
+        )
+        results = {}
+        for kind, count, identities in tasks:
+            if kind == "offer":
+                result = self.offer_candidates(count)
+            else:
+                from sglang.srt.mem_cache.kv_memory_provider import DetachCandidate
+
+                local = []
+                for node, revision, keys in identities:
+                    snapshot = self.tree_core.residency_snapshot(node)
+                    handles = (
+                        ()
+                        if snapshot is None
+                        else self.provider.freeze_allocations(
+                            snapshot[3], page_ids=snapshot[4]
+                        ).handles()
+                    )
+                    expected = [
+                        c.handles
+                        for e in events
+                        for c in e.candidates
+                        if (c.node_id, c.revision, c.keys) == (node, revision, keys)
+                    ]
+                    if any(value != handles for value in expected):
+                        handles = ()
+                    local.append(DetachCandidate(node, revision, keys, handles))
+                result = self.confirm_detach(local)
+            results[(kind, count, identities)] = result
+        for event, task in zip(events, work):
+            result = results[task]
+            if event.kind == "detach":
+                from sglang.srt.mem_cache.kv_memory_provider import DetachResult
+
+                result = [
+                    DetachResult(original, applied.status)
+                    for original, applied in zip(event.candidates, result)
+                ]
+            self.provider.complete_tree_event(event, result)
+
+    def provider_min_tokens(self, n_tokens):
+        value = torch.tensor([n_tokens], dtype=torch.int64, device="cpu")
+        self._all_reduce_attn_groups(value, torch.distributed.ReduceOp.MIN)
+        return int(value.item())
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self.check_provider_events()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -4747,15 +5007,36 @@ class UnifiedRadixCache(BasePrefixCache):
                 return indices
         root = self.root_node_handle(req.extra_key)
         path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        if self.provider is not None:
+            from sglang.srt.mem_cache.provider_indices import attach_page_ids
+
+            pages = self.tree_core.collect_full_device_page_ids(req.last_node, root)
+            if pages is None:
+                raise RuntimeError("provider tree path is missing CPU page geometry")
+            attach_page_ids(path, pages, self.page_size)
         if self.linker is not None:
             tail = self.linker.private_load_indices.get(req.rid)
             if tail is not None:
-                path = torch.cat([path, tail])
+                if self.provider is not None:
+                    from sglang.srt.mem_cache.provider_indices import cat_indices
+
+                    path = cat_indices([path, tail])
+                else:
+                    path = torch.cat([path, tail])
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
         return path[: req.prefix_len]
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
-        return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
+        root = self.root_node_handle()
+        path = self.tree_core.collect_full_device_indices(node, root)
+        if self.provider is not None:
+            from sglang.srt.mem_cache.provider_indices import attach_page_ids
+
+            pages = self.tree_core.collect_full_device_page_ids(node, root)
+            if pages is None:
+                raise RuntimeError("provider tree path is missing CPU page geometry")
+            attach_page_ids(path, pages, self.page_size)
+        return path
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""

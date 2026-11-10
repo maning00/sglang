@@ -713,6 +713,25 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> _InitializedPools:
         """Initialize the memory pools."""
+        from sglang.srt.mem_cache.kv_memory_provider_factory import (
+            get_or_create_kv_memory_provider,
+            provider_manages_pages,
+        )
+
+        if provider_manages_pages(get_memory()):
+            if (
+                not is_deepseek_v4(self.model_config.hf_config)
+                or self.is_draft_worker
+                or _is_npu
+                or not unified_fp8_for_dsv4_pool(
+                    is_draft_worker=False, spec_algorithm=self.spec_algorithm
+                )
+                or self.model_config.mla_layer_ids
+            ):
+                raise ValueError(
+                    "KV page provider requires the DSv4 unified fp8 target layout"
+                )
+        get_or_create_kv_memory_provider(device=self.device)
         token_to_kv_pool = None
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
@@ -2081,6 +2100,25 @@ class KVCacheConfigurator:
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
             **kv_layout_kwargs,
         )
+        from sglang.srt.mem_cache.kv_memory_provider import (
+            KVMemoryProvider,
+            describe_dsv4_pool,
+        )
+        from sglang.srt.mem_cache.kv_memory_provider_factory import (
+            get_or_create_kv_memory_provider,
+            provider_manages_pages,
+        )
+
+        provider = get_or_create_kv_memory_provider(device=self.device)
+        if provider_manages_pages(get_memory()):
+            if not isinstance(provider, KVMemoryProvider):
+                raise TypeError("page provider lost its lifecycle capabilities")
+            geometry, request_regions = describe_dsv4_pool(
+                token_to_kv_pool,
+                num_pages=full_max_total_num_tokens // self.pool_page_size,
+            )
+            provider.register_pool(geometry, request_regions)
+            token_to_kv_pool.kv_memory_provider = provider
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.

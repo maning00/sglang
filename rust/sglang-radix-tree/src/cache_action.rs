@@ -28,6 +28,17 @@ pub trait CacheAction: Debug + Send {
 
 pub type CacheActions = Vec<Box<dyn CacheAction>>;
 
+#[derive(Debug)]
+pub struct ResidencyAction {
+    pub page_ids: Option<Vec<i64>>,
+    pub reason: &'static str,
+    pub node_id: NodeId,
+    pub node_revision: u64,
+    pub keys: Vec<String>,
+    pub parent_key: Option<String>,
+    pub indices: Tensor,
+}
+
 macro_rules! impl_cache_action {
     ($action:ty, $tag:literal $(, insert_barrier = $barrier:expr)? $(,)?) => {
         impl $crate::cache_action::CacheAction for $action {
@@ -138,6 +149,7 @@ pub struct BackupKV {
 }
 
 self::impl_cache_action!(FreeDeviceKV, "free_device_kv", insert_barrier = false);
+self::impl_cache_action!(ResidencyAction, "residency", insert_barrier = false);
 self::impl_cache_action!(
     FreeDeviceKVFullOnly,
     "free_device_kv_full_only",

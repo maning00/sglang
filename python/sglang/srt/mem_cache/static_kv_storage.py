@@ -11,6 +11,8 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
+import time
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
@@ -33,6 +35,7 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 from sglang.srt.mem_cache.kv.storage import ResumeUnits, SubPoolUsage, window_tail_len
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.utils import is_npu
 
 # The static pools' one window pool: `BaseSWAKVPool.WINDOW_SUB_POOL`.
@@ -151,6 +154,12 @@ class StaticKVStorage:
     ):
         self.requests = req_to_token_pool
         self._allocator = token_to_kv_pool_allocator
+        self.provider = full_provider_of(token_to_kv_pool_allocator)
+        if self.provider is not None:
+            from sglang.srt.mem_cache.provider_indices import ensure_row_mirror
+
+            ensure_row_mirror(req_to_token_pool)
+        self._provider_io = []
         self._shape = shape
         self._draft_token_to_kv_pool = draft_token_to_kv_pool
         self._num_hidden_layers = num_hidden_layers
@@ -190,6 +199,8 @@ class StaticKVStorage:
     def adopt_bindings(self, other: StaticKVStorage) -> None:
         """Keep what ``other``, the same pools' storage over another request
         table, was told at startup."""
+        if self.provider is not None:
+            self._provider_io = other._provider_io
         self._shape = other._shape
         self._window_retention = other._window_retention
         self.bind_transfer_draft(
@@ -256,7 +267,17 @@ class StaticKVStorage:
         )
 
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
-        return acquire_rows(self.requests, self._allocator.state, reqs)
+        fresh = (
+            [r.kv.req_pool_idx is None for r in reqs]
+            if self.provider is not None
+            else ()
+        )
+        rows = acquire_rows(self.requests, self._allocator.state, reqs)
+        if rows is not None and self.provider is not None:
+            for row, new in zip(rows, fresh):
+                if new:
+                    self.requests._provider_row_mirror.rows.pop(row, None)
+        return rows
 
     def take_tokens(
         self,
@@ -265,6 +286,8 @@ class StaticKVStorage:
         make_room: Callable[[int], Any],
         receive: bool = False,
     ) -> Optional[torch.Tensor]:
+        if self.provider is not None:
+            raise RuntimeError("provider prefill must consume its request reservation")
         # ``receive`` needs nothing here: static pages never move.
         make_room(num_tokens)
         return self._allocator.alloc(num_tokens)
@@ -291,75 +314,123 @@ class StaticKVStorage:
         # availability floor must cover every request's ceil(K_i/N) rounding,
         # matching the N*ps per-request admission reserve).
         allocator = self._allocator
-        shard_size = page_interleave_shard_size(allocator)
-        conservative_num_tokens = num_tokens + len(seq_lens_cpu) * (
-            allocator.page_size * shard_size
-        )
-        make_room(
-            allocator.get_extend_allocation_demand(
+        scope = nullcontext()
+        if self.provider is not None:
+            if batch is None:
+                raise RuntimeError("provider extend requires its admitted batch")
+            from sglang.srt.layers.cp.base import is_cp_sharded_padded
+
+            if is_cp_sharded_padded():
+                raise ValueError("KV page provider does not support CP padded layout")
+            scope = allocator.full_attn_allocator.batch_reservation_scope(
+                batch.reqs,
                 prefix_lens_cpu,
                 seq_lens_cpu,
-                conservative_num_tokens=conservative_num_tokens,
-                shard_size=shard_size,
             )
-        )
+        with scope:
+            shard_size = page_interleave_shard_size(allocator)
+            conservative_num_tokens = num_tokens + len(seq_lens_cpu) * (
+                allocator.page_size * shard_size
+            )
+            if self.provider is not None:
+                from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-        is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
-        extra_alloc_kwargs = {}
-        kv_shard_rotation_bases = None
-        if shard_size > 1:
-            kv_shard_rotation_bases = _kv_shard_rotation_bases(
-                tree_cache=tree_cache,
-                batch=batch,
-                prefix_lens_cpu=prefix_lens_cpu,
-            )
-            extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
-        if is_dsv4:
-            c128_num_pages = allocator.c128_num_pages_needed(
-                prefix_lens_cpu, seq_lens_cpu
-            )
-            allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
-            extra_alloc_kwargs["req_pool_indices"] = rows
-            # Per-call per-req table for the C128 KV last_loc lookup.
-            if batch is not None:
-                extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+                # FULL is already reserved. The ordinary make_room accepts
+                # token counts and would also evict FULL against this ticket.
+                from sglang.srt.mem_cache.utils import get_num_new_pages
 
-        if window_tails is not None:
-            # A static pool keeps one window.
-            (window_tail,) = window_tails.values()
-            out = allocator.alloc_extend_swa_tail(
-                prefix_lens=prefix_lens,
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                last_loc=last_loc,
-                extend_num_tokens=num_tokens,
-                swa_tail_len=window_tail,
-                **extra_alloc_kwargs,
-            )
-        else:
-            out = allocator.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                num_tokens,
-                **extra_alloc_kwargs,
-            )
-        if is_dsv4:
-            bundle = out
-            out = None if bundle is None else bundle.out_full_loc
-            if batch is not None:
-                batch.out_cache_loc_dsv4 = bundle
+                window_tokens = (
+                    get_num_new_pages(
+                        seq_lens=seq_lens_cpu,
+                        page_size=allocator.page_size,
+                        prefix_lens=prefix_lens_cpu,
+                    )
+                    * allocator.page_size
+                )
+                if window_tails is not None:
+                    (tail,) = window_tails.values()
+                    window_tokens = (
+                        -(-tail // allocator.page_size) * allocator.page_size
+                    )
+                if (
+                    not allocator._swa_req_ring
+                    and allocator.swa_available_size() < window_tokens
+                ):
+                    if tree_cache is None:
+                        raise RuntimeError("provider window reclaim requires the tree")
+                    tree_cache.evict_for_alloc(
+                        KVDemand(
+                            window_tokens=dict.fromkeys(
+                                allocator.window_pool_names(), window_tokens
+                            )
+                        )
+                    )
+            else:
+                make_room(
+                    allocator.get_extend_allocation_demand(
+                        prefix_lens_cpu,
+                        seq_lens_cpu,
+                        conservative_num_tokens=conservative_num_tokens,
+                        shard_size=shard_size,
+                    )
+                )
 
-        if out is not None and kv_shard_rotation_bases is not None:
-            # The allocator resolved None entries (new chains) in place from the
-            # least-full class at each request's turn; record the bases for the
-            # radix insert to stamp onto new tree nodes (UnifiedTreeNode.rotation_base).
-            for req, base in zip(batch.reqs, kv_shard_rotation_bases):
-                req.kv_rotation_base = base
-        return out
+            is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
+            extra_alloc_kwargs = {}
+            kv_shard_rotation_bases = None
+            if shard_size > 1:
+                kv_shard_rotation_bases = _kv_shard_rotation_bases(
+                    tree_cache=tree_cache,
+                    batch=batch,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                )
+                extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
+            if is_dsv4:
+                c128_num_pages = allocator.c128_num_pages_needed(
+                    prefix_lens_cpu, seq_lens_cpu
+                )
+                allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
+                extra_alloc_kwargs["req_pool_indices"] = rows
+                # Per-call per-req table for the C128 KV last_loc lookup.
+                if batch is not None:
+                    extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+
+            if window_tails is not None:
+                # A static pool keeps one window.
+                (window_tail,) = window_tails.values()
+                out = allocator.alloc_extend_swa_tail(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=num_tokens,
+                    swa_tail_len=window_tail,
+                    **extra_alloc_kwargs,
+                )
+            else:
+                out = allocator.alloc_extend(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    num_tokens,
+                    **extra_alloc_kwargs,
+                )
+            if is_dsv4:
+                bundle = out
+                out = None if bundle is None else bundle.out_full_loc
+                if batch is not None:
+                    batch.out_cache_loc_dsv4 = bundle
+
+            if out is not None and kv_shard_rotation_bases is not None:
+                # The allocator resolved None entries (new chains) in place from the
+                # least-full class at each request's turn; record the bases for the
+                # radix insert to stamp onto new tree nodes (UnifiedTreeNode.rotation_base).
+                for req, base in zip(batch.reqs, kv_shard_rotation_bases):
+                    req.kv_rotation_base = base
+            return out
 
     def take_decode(
         self,
@@ -372,6 +443,8 @@ class StaticKVStorage:
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
+        if self.provider is not None:
+            raise RuntimeError("KV page provider does not support decode")
         allocator = self._allocator
         # Over estimate the number of tokens: assume each request needs a new page.
         make_room(len(seq_lens) * allocator.page_size)
@@ -447,6 +520,24 @@ class StaticKVStorage:
     ) -> None:
         """See `KVStorage.record_forward`: static pools never move a row, so
         nothing races a forward."""
+        if self.provider is not None:
+            from sglang.srt.mem_cache.kv_memory_provider import (
+                EventReceipt,
+                ProviderFailStop,
+                allocation_page_ids,
+            )
+
+            if token_writes_unknown or written_tokens is None:
+                raise ProviderFailStop(
+                    "provider needs the exact prefill forward write set"
+                )
+            # The forward can still READ a matched prefix not in the write
+            # set. Reuse of any subsequently freed FULL page also waits for
+            # this main allocator guard, on the same forward stream.
+            self._allocator.full_attn_allocator.set_reuse_guard_event(forward_done)
+            pages = allocation_page_ids(written_tokens, self._allocator.page_size)
+            context = self.provider.freeze_allocations(None, page_ids=pages)
+            self.provider.record_forward(context.handles(), EventReceipt(forward_done))
 
     def move_epoch(self) -> int:
         """See `KVStorage.move_epoch`: static pools never move a row."""
@@ -457,12 +548,138 @@ class StaticKVStorage:
 
     def record_host_transfer(self, signal, transfers, *, writes: bool) -> None:
         """See `KVStorage.record_host_transfer`: no row moves under a copy."""
+        if self.provider is not None:
+            raise RuntimeError("KV page provider uses its linker for transfers")
 
     def record_network_transfer(
         self, req: Req, *, pages, page_size: int, states=(), writes: bool, peer=None
     ) -> None:
         """See `KVStorage.record_network_transfer`: no row moves under a
         transfer, so nothing ever waits for one."""
+        if self.provider is not None:
+            from sglang.srt.mem_cache.provider_indices import index_cpu
+
+            page_ids = (
+                index_cpu(pages).tolist()
+                if isinstance(pages, torch.Tensor)
+                else list(pages)
+            )
+            context = self.provider.freeze_allocations(None, page_ids=page_ids)
+            handles = context.handles()
+            if peer is not None:
+                from sglang.srt.mem_cache.kv_memory_provider import (
+                    CompletedReceipt,
+                    JoinedReceipt,
+                    indices_ready,
+                )
+
+                peer.ready = JoinedReceipt(
+                    (
+                        context.ready(handles),
+                        indices_ready(pages)
+                        if isinstance(pages, torch.Tensor)
+                        else CompletedReceipt(),
+                    )
+                )
+            ticket = self.provider.hold_io(
+                handles, kind="pd-send", writes=writes, receipt=peer
+            )
+            self._provider_io.append((ticket, peer))
+
+    def poll_provider_io(self):
+        pending = []
+        for ticket, receipt in self._provider_io:
+            outcome = receipt.poll() if receipt is not None else "unknown"
+            if outcome is None:
+                pending.append((ticket, receipt))
+            else:
+                self.provider.complete_io(ticket, outcome=outcome)
+        # Rebound request tables share this queue through adopt_bindings.
+        self._provider_io.clear()
+        self._provider_io.extend(pending)
+
+    def bind_network_manager(self, manager):
+        def quiescent():
+            self.poll_provider_io()
+            return (
+                not self._provider_io
+                and not self.provider.has_pending_io
+                and not self.provider.accounting().quarantined
+            )
+
+        # Guard explicit deregistration, too. Keeping a Python engine reference
+        # alone cannot prevent manager.teardown() from destroying native MRs.
+        manager.physical_send_quiescence = quiescent
+
+    @contextmanager
+    def reset_scope(self, *, verdict=lambda ready: ready):
+        if self.provider is None:
+            yield True
+            return
+        from sglang.srt.mem_cache.kv_memory_provider import Busy, ProviderFailStop
+
+        self.poll_provider_io()
+        lease = self.provider.quiesce_reset(
+            deadline_ns=time.monotonic_ns()
+            + int(getattr(self.provider, "reset_timeout_ms", 50) * 1_000_000)
+        )
+        source = self._allocator.full_attn_allocator
+        need_abort = not isinstance(lease, Busy)
+        try:
+            accepted = verdict(not isinstance(lease, Busy))
+            if not accepted:
+                if need_abort:
+                    need_abort = False
+                    self.provider.abort_reset(lease)
+            elif isinstance(lease, Busy):
+                raise ProviderFailStop("reset verdict approved a Busy pool")
+            else:
+                source.authorize_reset(lease)
+        except BaseException as exc:
+            try:
+                if need_abort:
+                    self.provider.abort_reset(lease)
+            except BaseException as abort_exc:
+                raise ProviderFailStop(
+                    "KV provider reset cancellation failed"
+                ) from abort_exc
+            finally:
+                source.finish_reset()
+            raise ProviderFailStop("KV provider reset preparation failed") from exc
+        if not accepted:
+            yield False
+            return
+        try:
+            yield True
+            self.provider.commit_reset(lease)
+        except BaseException as exc:
+            # Local tree mutation may already have happened. Do not reopen the
+            # node's seal and continue serving a partially reset projection.
+            raise ProviderFailStop("KV provider reset did not commit") from exc
+        finally:
+            source.finish_reset()
+
+    def load_back_scope(self, req):
+        if self.provider is None:
+            return nullcontext()
+        source = self._allocator.full_attn_allocator
+        from sglang.srt.mem_cache.kv_memory_provider import reservation_request_id
+
+        if source._active:
+            reservation, purpose = source._active[0]
+            if (
+                purpose != "load"
+                or reservation.shape.request_id != reservation_request_id(req)
+            ):
+                raise RuntimeError("load-back bound to another request's reservation")
+            return nullcontext()
+        if (
+            req.kv.reservation is None
+            or req.kv.reservation.shape.request_id != reservation_request_id(req)
+            or req.kv.reservation.shape.revision != req.kv.reservation_revision
+        ):
+            raise RuntimeError("load-back lacks the request's current reservation")
+        return source.reservation_scope(req.kv.reservation, "load")
 
     def set_network_waiter(self, waiter) -> None:
         """See `KVStorage.set_network_waiter`: nothing ever waits."""
@@ -661,7 +878,11 @@ class StaticKVStorage:
             write_pos[self._allocator.state_ids(sub_pool).ids(slots)] = 0
 
     def accounting_violations(self) -> List[str]:
-        return self._allocator.verify_byte_accounting()
+        errors = self._allocator.verify_byte_accounting()
+        if self.provider is not None:
+            errors += self.provider.accounting().violations()
+            errors += self.provider.accounting_violations()
+        return list(dict.fromkeys(errors))
 
     def usage(self) -> Tuple[SubPoolUsage, ...]:
         shape, allocator = self._shape, self._allocator

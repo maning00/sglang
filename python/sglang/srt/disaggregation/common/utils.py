@@ -38,6 +38,7 @@ class TransferKVChunk:
     # The room's send record this chunk was counted in when queued (a
     # `SendRecord`); the worker reports the chunk finished to it only.
     send_record: Optional[object] = None
+    physical_receipt: Optional[object] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:

@@ -19,7 +19,8 @@ Selection checks do not mutate cache state. Shared-pool load preparation
 realizes the selected reservation before a host transfer pins device rows.
 """
 
-from contextlib import nullcontext
+import time
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Mapping, Optional
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -40,6 +41,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import (
     largest_fitting_chunk,
     window_retirement,
 )
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 
 
 def estimate_swa_kv_tokens(
@@ -130,6 +132,11 @@ class PrefillBudget:
 
     def load_back_scope(self, **kwargs):
         return nullcontext()
+
+    def capacity_scope(
+        self, req, *, prefix_tokens, end_tokens, load_tokens=0, can_wait=True
+    ):
+        return nullcontext(None)
 
     def _available_and_evictable(self):
         evictable = (
@@ -273,6 +280,80 @@ class SWAPrefillBudget(PrefillBudget):
         super().__init__(*args, **kwargs)
         self.all_swa = all_swa
         self.req_ring = is_swa_req_ring(self.allocator)
+        self.provider = full_provider_of(self.allocator)
+        self._capacity = None
+        self.provider_admission_stats = {}
+        self._provider_covered_tokens = 0
+        if self.provider is not None:
+            snapshot = self.provider.accounting()
+            estimate = snapshot.cached * self.page_size + max(
+                0,
+                self.tree_cache.full_evictable_size()
+                - snapshot.blocked_reclaim_estimate * self.page_size,
+            )
+            self._provider_round_capacity = self.tree_cache.provider_min_tokens(
+                estimate
+            )
+            self._provider_round_protected = self.tree_cache.full_protected_size()
+
+    def capacity_shape(self, req, *, prefix_tokens, end_tokens, load_tokens=0):
+        from sglang.srt.mem_cache.kv_memory_provider import (
+            CapacityShape,
+            reservation_request_id,
+        )
+
+        req.kv.reservation_revision += 1
+        page = self.allocator.page_size
+        return CapacityShape(
+            reservation_request_id(req),
+            req.kv.reservation_revision,
+            (load_tokens + page - 1) // page,
+            (end_tokens + page - 1) // page - (prefix_tokens + page - 1) // page,
+            prefix_tokens,
+            end_tokens,
+        )
+
+    @contextmanager
+    def capacity_scope(
+        self, req, *, prefix_tokens, end_tokens, load_tokens=0, can_wait=True
+    ):
+        if self.provider is None:
+            yield None
+            return
+        from sglang.srt.mem_cache.kv_memory_provider import CapacityScope
+
+        shape = self.capacity_shape(
+            req,
+            prefix_tokens=prefix_tokens,
+            end_tokens=end_tokens,
+            load_tokens=load_tokens,
+        )
+        # A single bounded wait across all retire rounds; no current-batch load
+        # is started while this scope is preparing capacity.
+        with CapacityScope(
+            self.provider,
+            self.tree_cache,
+            shape,
+            deadline_ns=time.monotonic_ns()
+            + int(getattr(self.provider, "capacity_timeout_ms", 50) * 1_000_000),
+            verdict=self.tree_cache.provider_verdict,
+            stats=self.provider_admission_stats,
+            can_wait=can_wait,
+        ) as capacity:
+            previous, self._capacity = self._capacity, capacity
+            try:
+                yield capacity
+            finally:
+                self._capacity = previous
+
+    def load_back_scope(self, **kwargs):
+        if self.provider is None:
+            return super().load_back_scope(**kwargs)
+        if self._capacity is None or not self._capacity.ready:
+            raise RuntimeError("load-back without prepared FULL capacity")
+        return self.allocator.full_attn_allocator.reservation_scope(
+            self._capacity.reservation, "load"
+        )
 
     def _window_evictable(self) -> int:
         """Evictable tokens of the static pools' one window."""
@@ -286,6 +367,16 @@ class SWAPrefillBudget(PrefillBudget):
             if is_cp_sharded_padded():
                 global_swa_available_size = from_cp_sharded(global_swa_available_size)
             return global_swa_available_size + self._window_evictable()
+        if self.provider is not None:
+            protected = max(
+                0,
+                self.tree_cache.full_protected_size() - self._provider_round_protected,
+            )
+            return (
+                self._provider_round_capacity
+                - self._provider_covered_tokens
+                - protected
+            )
         global_full_available_size = self.allocator.full_available_size()
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
@@ -484,6 +575,22 @@ class SWAPrefillBudget(PrefillBudget):
             extra_tokens=extra_tokens,
             state_slots=state_slots,
         )
+        if self._capacity is not None and self._capacity.ready:
+            # LOAD was never part of this offset. Only the extend page demand
+            # overlaps it; preserve the conservative extra page and all future
+            # headroom. Partial tails can need fewer pages than ceil(extend).
+            credit = min(
+                self.ceil_paged_tokens(extend_input_len),
+                self._capacity.shape.extend_pages * self.page_size,
+            )
+            self.total_offset -= credit
+            self.current_offset -= credit
+            capacity = self._capacity
+            self._provider_covered_tokens += (
+                capacity.shape.extend_pages
+                + capacity.reservation.remaining("load")
+                + capacity.consumed_load_pages
+            ) * self.page_size
         # A continuation already owns its ring slot.
         if not (self.req_ring and is_chunked_continuation):
             self.swa_offset += self.swa_tokens(

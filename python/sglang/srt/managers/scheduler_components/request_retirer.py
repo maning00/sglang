@@ -83,6 +83,9 @@ class RequestRetirer:
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        from sglang.srt.mem_cache.kv_memory_provider import refund_request_reservation
+
+        refund_request_reservation(req)
         record_exit(req, "release")
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
@@ -102,6 +105,9 @@ class RequestRetirer:
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
+        from sglang.srt.mem_cache.kv_memory_provider import refund_request_reservation
+
+        refund_request_reservation(req)
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
 

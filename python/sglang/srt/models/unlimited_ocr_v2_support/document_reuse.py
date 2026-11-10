@@ -1466,6 +1466,11 @@ class DocReuse:
         batch.seq_lens_sum = None
 
     def _splice_text(self, req, seq_len: int, plan: TextPlan) -> int:
+        from sglang.srt.mem_cache.provider_indices import reject_unmirrored_write
+
+        reject_unmirrored_write(
+            self._cache.req_to_token_pool.req_to_token, "document splice"
+        )
         bs = self._backend.block_size
         row = req.kv.req_pool_idx
         req_to_token = self._cache.req_to_token_pool.req_to_token

@@ -301,14 +301,97 @@ class SendRecord:
     """A room's sends queued for the transfer worker and finished by it, so a
     page move can tell when the engine is done with one send's rows."""
 
-    __slots__ = ("queued", "finished")
+    __slots__ = ("queued", "finished", "receipts")
 
     def __init__(self) -> None:
         self.queued = 0
         self.finished = 0
+        self.receipts = None
+
+
+class PhysicalSendReceipt:
+    """A single send's physical evidence, independent of room/row recycling.
+
+    Unknown retains this receipt, the native engine and all returned statuses
+    through the provider's quarantine. Failed/Wait and room counters cannot
+    establish physical completion.
+    """
+
+    def __init__(self, manager, room, record, sequence):
+        self.manager, self.room = manager, room
+        self.record, self.sequence = record, sequence
+        self.statuses = []
+        self.bound = self.sealed = self.enqueue_finished = False
+        self.uncertain = False
+        self.attempts = 0
+        self.ready = None
+        self._lock = threading.Lock()
+
+    def bind(self):
+        with self._lock:
+            self.bound = True
+
+    def finish_enqueue(self):
+        with self._lock:
+            self.enqueue_finished = True
+            if not self.bound and self.record.receipts is not None:
+                self.record.receipts.pop(self.sequence, None)
+
+    def wait_ready(self):
+        def current():
+            return (
+                self.manager.request_status.get(self.room) != KVPoll.Failed
+                and (self.manager._send_records or {}).get(self.room) is self.record
+            )
+
+        if not current():
+            return False
+        if self.ready is not None and not self.ready.query():
+            self.ready.wait()
+        return current()
+
+    def before_post(self):
+        with self._lock:
+            self.attempts += 1
+
+    def posted(self, statuses):
+        with self._lock:
+            self.statuses.extend(statuses)
+            if not statuses:
+                self.uncertain = True
+
+    def seal(self, *, unknown=False):
+        with self._lock:
+            self.sealed = True
+            self.uncertain |= unknown
+
+    def poll(self):
+        with self._lock:
+            if self.enqueue_finished and not self.bound:
+                return "never_submitted"
+            # A room failure is not the worker's submission outcome. Until
+            # seal, even zero attempts could still become an actual post.
+            if not self.sealed:
+                return None
+            if self.uncertain:
+                return "unknown"
+            if not self.attempts:
+                return "never_submitted"
+            if self.statuses and all(s.Succeeded() for s in self.statuses):
+                return "completed" if self.ready is None or self.ready.query() else None
+            if (
+                any(s.Failed() for s in self.statuses)
+                or self.manager.request_status.get(self.room, KVPoll.Failed)
+                == KVPoll.Failed
+                or (self.manager._send_records or {}).get(self.room) is not self.record
+            ):
+                self.uncertain = True
+                return "unknown"
+            return None
 
 
 class CommonKVManager(BaseKVManager):
+    physical_send_quiescence = None
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
@@ -763,6 +846,16 @@ class CommonKVManager(BaseKVManager):
         """A send of the room was queued for the transfer worker (scheduler
         thread)."""
         self.send_record(bootstrap_room).queued += 1
+
+    def prepare_physical_send(self, room):
+        record = self.send_record(room)
+        if record.receipts is None:
+            record.receipts = {}
+        if record.queued in record.receipts:
+            raise RuntimeError("a physical send is already being prepared")
+        receipt = PhysicalSendReceipt(self, room, record, record.queued)
+        record.receipts[record.queued] = receipt
+        return receipt
 
     def note_send_finished(
         self, bootstrap_room: int, record: Optional[SendRecord] = None

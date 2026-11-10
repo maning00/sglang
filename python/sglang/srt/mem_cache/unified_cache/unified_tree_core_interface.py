@@ -200,6 +200,18 @@ class UnifiedTreeCoreInterface(ABC):
     Tree Core as opaque behind this surface, which grows as tree operations
     migrate onto the TreeCore."""
 
+    def residency_snapshot(self, node_id: NodeId):
+        """Immutable whole-leaf snapshot, or None when it cannot detach."""
+        raise NotImplementedError
+
+    def offer_residency_candidates(self, n_pages: int):
+        """Finish an existing FULL-order walk without changing the tree."""
+        raise NotImplementedError
+
+    def confirm_residency_detach(self, node_id: NodeId, revision: int):
+        """Revalidate under the core's mutation lock, then use normal eviction."""
+        raise NotImplementedError
+
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
     is_eagle: bool
@@ -267,6 +279,17 @@ class UnifiedTreeCoreInterface(ABC):
         stays constructible, and its None means "sharding is off" -- never
         "sharding is on but unknown", which the constructor gate rules out.
         """
+        return None
+
+    def collect_full_device_page_ids(self, from_node_id, until_node_id):
+        """CPU geometry in path order, or None when not tracked."""
+        return None
+
+    def all_full_device_page_ids(self):
+        """CPU geometry of resident FULL nodes, for periodic provider audits."""
+        return None
+
+    def node_full_device_page_ids(self, node_id):
         return None
 
     def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:

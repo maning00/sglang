@@ -95,6 +95,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -336,6 +337,11 @@ class PrefillBootstrapQueue:
         kv_storage_of(
             self.scheduler.req_to_token_pool, self.scheduler.token_to_kv_pool_allocator
         ).set_network_waiter(_send_waiter(self.scheduler))
+        if full_provider_of(self.scheduler.token_to_kv_pool_allocator) is not None:
+            kv_storage_of(
+                self.scheduler.req_to_token_pool,
+                self.scheduler.token_to_kv_pool_allocator,
+            ).bind_network_manager(self.kv_manager)
         self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
@@ -1770,6 +1776,13 @@ class SchedulerDisaggregationPrefillMixin:
         def page_indices_of(kv_indices: torch.Tensor):
             """The pages a send takes, and the same pages for the page-move
             ledger (the device pages, while a host copy is in flight)."""
+            if full_provider_of(self.token_to_kv_pool_allocator) is not None:
+                from sglang.srt.mem_cache.provider_indices import index_cpu
+
+                pages = (index_cpu(kv_indices)[::page_size] // page_size).to(
+                    torch.int32
+                )
+                return (pages if host_indices else pages.numpy()), pages
             if not host_indices:
                 pages = kv_to_page_indices(kv_indices, page_size)
                 return pages, pages
@@ -1987,30 +2000,46 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            send_receipt = None
+            if full_provider_of(self.token_to_kv_pool_allocator) is not None:
+                send_receipt = sender.kv_mgr.prepare_physical_send(
+                    sender.bootstrap_room
+                )
             # The engine reads these rows by physical id until it is done.
             record_network_transfer(
                 kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator),
                 req,
-                peer=_send_peer(sender),
+                peer=send_receipt if send_receipt is not None else _send_peer(sender),
                 writes=False,
                 page_indices=ledger_page_indices,
                 page_size=page_size,
                 state_types=state_types if segment_is_last else (),
                 state_indices=ledger_state_indices if segment_is_last else None,
             )
-            if indices_event is not None:
-                sender.send(
-                    page_indices,
-                    send_state_indices,
-                    num_kv_tokens=seg_end - seg_start,
-                    indices_event=indices_event,
-                )
-            else:
-                sender.send(
-                    page_indices,
-                    send_state_indices,
-                    num_kv_tokens=seg_end - seg_start,
-                )
+            try:
+                if indices_event is not None:
+                    sender.send(
+                        page_indices,
+                        send_state_indices,
+                        num_kv_tokens=seg_end - seg_start,
+                        indices_event=indices_event,
+                    )
+                else:
+                    sender.send(
+                        page_indices,
+                        send_state_indices,
+                        num_kv_tokens=seg_end - seg_start,
+                    )
+            except BaseException:
+                if send_receipt is not None:
+                    # Once enqueued, the worker may still post after this
+                    # scheduler-side exception, even with attempts == 0 now.
+                    send_receipt.seal(unknown=send_receipt.bound)
+                raise
+            finally:
+                if send_receipt is not None:
+                    send_receipt.finish_enqueue()
+
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:

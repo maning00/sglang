@@ -75,6 +75,18 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
+    from sglang.srt.mem_cache.kv_memory_provider_factory import (
+        get_or_create_kv_memory_provider,
+        provider_mem_pool,
+    )
+
+    provider = get_or_create_kv_memory_provider(device=device)
+    if provider is not None:
+        return (
+            True,
+            provider_mem_pool(provider, device),
+            getattr(provider, "pool_type", "provider"),
+        )
     enable_custom_mem_pool = (
         True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
     )

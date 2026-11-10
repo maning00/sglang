@@ -22,6 +22,18 @@ class FreeDeviceKV(msgspec.Struct, frozen=True):
     indices: list[torch.Tensor]
 
 
+class ResidencyAction(msgspec.Struct, frozen=True):
+    """Immutable tree adoption snapshot. Provider supplies allocation handles."""
+
+    reason: str
+    node_id: int
+    node_revision: int
+    keys: tuple[str, ...]
+    parent_key: str | None
+    indices: torch.Tensor
+    page_ids: tuple[int, ...] | None = None
+
+
 class FreeDeviceKVFullOnly(msgspec.Struct, frozen=True):
     """Free the full side only, for a tombstoned node whose SWA peers are gone;
     FreeDeviceKV would release the SWA side twice."""
@@ -119,5 +131,9 @@ class SWARebuild(ComponentAction, frozen=True):
 
 # The cache handles these directly; split updates also reach their component.
 CacheAction = (
-    UpdatePendingBackupOnNodeSplit | FreeDeviceKV | FreeDeviceKVFullOnly | BackupKV
+    UpdatePendingBackupOnNodeSplit
+    | FreeDeviceKV
+    | FreeDeviceKVFullOnly
+    | BackupKV
+    | ResidencyAction
 )

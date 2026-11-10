@@ -70,7 +70,7 @@ _SS = "session/streaming_session.py"
 _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
-    (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
+    (_SB, "ScheduleBatch._prepare_for_extend", "extend_batch_idx"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "set_row_len"): 1,

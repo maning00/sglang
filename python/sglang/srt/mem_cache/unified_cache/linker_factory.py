@@ -8,6 +8,7 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+from sglang.srt.mem_cache.kv_memory_provider_factory import provider_manages_pages
 from sglang.srt.mem_cache.unified_cache.linker_config import (
     UnifiedCacheLinkerConfig,
     parse_linker_load_options,
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 def get_startup_linker_config() -> dict[str, Any] | None:
     """Resolve legacy launch options once, outside the linker implementations."""
     memory = get_memory()
+    if provider_manages_pages(memory):
+        return {}
     config = memory.unified_cache_external_linker_config
     if config is None and memory.unified_cache_external_linker_backend in (
         "mooncake",
@@ -68,6 +71,20 @@ def create_unified_cache_linker(
     components: set[ComponentType],
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
+    if params.kv_memory_provider is not None:
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            UnifiedCacheLinker,
+        )
+
+        linker = params.kv_memory_provider.create_linker(
+            server_args, params, components=components, forward_stream=forward_stream
+        )
+        if (
+            not isinstance(linker, UnifiedCacheLinker)
+            or getattr(linker, "provider", None) is not params.kv_memory_provider
+        ):
+            raise ValueError("provider linker must share the pool's provider instance")
+        return linker
     load_mode, prefetch_policy, backend_config = parse_linker_load_options(config)
     extra_config = backend_config
     if backend == "dynamic":

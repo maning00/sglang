@@ -399,9 +399,10 @@ class SWAComponent(TreeComponent):
         if live_start >= end:
             return None
         if live_start > start:
-            _, action = self.tree_core._split_node(node.key, node, live_start - start)
-            if action is not None:
-                cache_actions.append(action)
+            _, action = self.tree_core._split_node_with_actions(
+                node.key, node, live_start - start
+            )
+            cache_actions.extend(action)
         return live_start
 
     def _publish_window(self, *, node, cache_actions):
@@ -414,7 +415,7 @@ class SWAComponent(TreeComponent):
         )
 
     def _recover_from_incoming(
-        self, *, node, incoming_full, start, end, result, cache_actions
+        self, *, node, incoming_full, start, end, params, result, cache_actions
     ):
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         old_full = full_cd.value
@@ -439,6 +440,11 @@ class SWAComponent(TreeComponent):
             return
         result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
         full_cd.value = incoming_full.clone()
+        node.residency_page_ids = params.page_ids_for(
+            start, end, self.tree_core.page_size
+        )
+        node.residency_revision += 1
+        self.tree_core._residency_action(node, "dedup", cache_actions)
         cache_actions.append(FreeDeviceKVFullOnly([old_full]))
         self._publish_window(node=node, cache_actions=cache_actions)
 
@@ -490,6 +496,7 @@ class SWAComponent(TreeComponent):
                 ],
                 start=live_start,
                 end=end,
+                params=params,
                 result=result,
                 cache_actions=cache_actions,
             )
@@ -606,12 +613,13 @@ class SWAComponent(TreeComponent):
         if page_size > 1 and (split_at % page_size != 0 or leaf_len % page_size != 0):
             return None
 
-        new_parent, action = self.tree_core._split_node(leaf.key, leaf, split_at)
-        assert action is None or action.ack_id is None, (
+        new_parent, action = self.tree_core._split_node_with_actions(
+            leaf.key, leaf, split_at
+        )
+        assert all(getattr(a, "ack_id", None) is None for a in action), (
             "fresh SWA leaf cannot be write-through-pending"
         )
-        if action is not None:
-            cache_actions.append(action)
+        cache_actions.extend(action)
         return new_parent
 
     def redistribute_on_node_split(
@@ -1460,11 +1468,10 @@ class SWAComponent(TreeComponent):
             if cd.host_value is None and fill_len > 0:
                 # Tombstone: split off the in-buffer tail if needed, then fill.
                 if fill_start > node_start:
-                    _, action = self.tree_core._split_node(
+                    _, action = self.tree_core._split_node_with_actions(
                         cur.key, cur, fill_start - node_start
                     )
-                    if action is not None:
-                        cache_actions.append(action)
+                    cache_actions.extend(action)
                 self._attach_swa_host_value(cur, slice_)
             else:
                 # Already has SWA (or empty overlap): drop this slice.

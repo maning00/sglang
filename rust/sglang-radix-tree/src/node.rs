@@ -183,6 +183,8 @@ pub struct Node<K: ChildKeyType> {
     /// Per-page hash chain; None when the node was never hashed.
     /// TODO: Store raw digests and hex-encode only at the Python or storage boundary.
     pub hash_value: Option<Vec<String>>,
+    pub residency_revision: u64,
+    pub residency_page_ids: Option<Vec<i64>>,
     /// Whether this node is available through the direct external-cache linker.
     pub external_cache_stored: bool,
     /// Chain-wide logical-page owner rotation, retained across node splits.
@@ -425,6 +427,8 @@ impl<K: ChildKeyType> Node<K> {
             swa_host_uuid: None,
             full_host_uuid: None,
             hash_value: Some(Vec::new()),
+            residency_revision: 0,
+            residency_page_ids: None,
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
@@ -453,6 +457,8 @@ impl<K: ChildKeyType> Node<K> {
             swa_host_uuid: None,
             full_host_uuid: None,
             hash_value: None,
+            residency_revision: 0,
+            residency_page_ids: None,
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,

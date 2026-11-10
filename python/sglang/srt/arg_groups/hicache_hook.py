@@ -20,6 +20,16 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    from sglang.srt.mem_cache.kv_memory_provider_factory import (
+        provider_manages_pages,
+        validate_provider_args,
+    )
+
+    validate_provider_args(cfg)
+    if provider_manages_pages(cfg):
+        declare_resolution(
+            server_args, "handle_hicache", enable_unified_cache_external_linker=True
+        )
     from sglang.srt.mem_cache.unified_cache.linker_config import (
         UnifiedCacheLinkerConfig,
         parse_linker_load_options,

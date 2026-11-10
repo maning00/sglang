@@ -257,6 +257,17 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Unified Radix Cache
     # -------------------------------------------------------------------------
+    kv_memory_provider: A[
+        Optional[str],
+        Arg(help="Optional KV byte/page provider.", choices=["dynamic", "mooncake"]),
+    ] = None
+    kv_memory_provider_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="JSON provider module, class, kind and options.",
+            type_parser=json.loads,
+        ),
+    ] = None
     enable_unified_cache_external_linker: A[
         bool,
         "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",

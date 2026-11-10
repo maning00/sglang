@@ -77,6 +77,9 @@ def alias_members_prompt_kv(
 ) -> None:
     """One indexed copy for all members, which share leader_row + prompt_len.
     Any tree lock stays the leader's; members never touch the tree."""
+    from sglang.srt.mem_cache.provider_indices import reject_unmirrored_write
+
+    reject_unmirrored_write(req_to_token, "beam alias")
     req_to_token[dst_rows, :prompt_len] = req_to_token[leader_row, :prompt_len]
 
 
@@ -112,6 +115,9 @@ def remap_kv_mapping(
     surviving row references any more."""
     # Rows are length-synchronized, so a survivor's history is exactly its
     # parent's window, including the token just computed at seq_len-1.
+    from sglang.srt.mem_cache.provider_indices import reject_unmirrored_write
+
+    reject_unmirrored_write(req_to_token, "beam remap")
     window = req_to_token[rows, prefix_len:seq_len]
     old_mapping = window.clone()
     new_mapping = old_mapping[parent_idx]

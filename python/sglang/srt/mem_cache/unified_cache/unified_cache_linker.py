@@ -30,7 +30,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv_memory_provider_factory import full_provider_of
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
@@ -216,8 +217,12 @@ class UnifiedCacheLinker(ABC):
 
     @abstractmethod
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
-        """Wait until the batch started as ``counter_index`` stops writing to
-        device memory; True when every layer landed."""
+        """Resolve the batch; True when every layer landed.
+
+        Before returning failure, stop all provable writes. Unknown targets
+        must instead remain isolated, with their I/O resources retained, so
+        aborting the batch cannot make those slots available for reuse.
+        """
 
     @abstractmethod
     def cancel_queued_load(self, rid: str) -> bool:
@@ -645,6 +650,16 @@ class UnifiedCacheLinkerWrapper:
         computed KV after its forward, once :meth:`finish_loads` has confirmed
         the load.
         """
+        scope = (
+            self.cache.kv_storage().load_back_scope(req)
+            if full_provider_of(getattr(self.cache, "token_to_kv_pool_allocator", None))
+            is not None
+            else nullcontext()
+        )
+        with scope:
+            return self._load_back(req)
+
+    def _load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
@@ -684,6 +699,20 @@ class UnifiedCacheLinkerWrapper:
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             raise
+        if (
+            full_provider_of(getattr(cache, "token_to_kv_pool_allocator", None))
+            is not None
+        ):
+            agreed = cache.provider_verdict(queued)
+            if (
+                queued
+                and not agreed
+                and not self.cache_linker.cancel_queued_load(req.rid)
+            ):
+                from sglang.srt.mem_cache.kv_memory_provider import ProviderFailStop
+
+                raise ProviderFailStop("queued provider load could not be cancelled")
+            queued = agreed
         if not queued:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
@@ -908,9 +937,16 @@ class UnifiedCacheLinkerWrapper:
         self._cancel_prefetch(request)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
-        if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
-            self.inflight_load_rids.remove(rid)
-            self.private_load_indices.pop(rid, None)
+        if (
+            rid in self.inflight_load_rids
+            or full_provider_of(getattr(self.cache, "token_to_kv_pool_allocator", None))
+            is not None
+        ):
+            # Drop cached native lookup plans even before a load is queued.
+            if self.cache_linker.cancel_queued_load(rid):
+                if rid in self.inflight_load_rids:
+                    self.inflight_load_rids.remove(rid)
+                self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
         self.cache_linker.close()

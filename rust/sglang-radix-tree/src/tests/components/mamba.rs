@@ -60,6 +60,7 @@ fn insert_params_mamba<'k>(
     mamba_slot: Option<i64>,
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        provider_page_ids: None,
         rotation_base: None,
         key,
         namespace: Default::default(),
